@@ -1,0 +1,1 @@
+//! Future drop pack catalog.

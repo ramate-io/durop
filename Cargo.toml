@@ -1,0 +1,9 @@
+[package]
+name = "durop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[dependencies]
+bevy = { version = "=0.19.1", default-features = false, features = ["std", "async_executor", "bevy_window", "bevy_winit", "x11"] }
