@@ -78,3 +78,34 @@ policy, not decoder capability. Future UI integration should present preparation
 errors before enabling a session. Crash recovery can load a previously prepared
 snapshot using `load_local` on its cache directory, but revision selection and
 persisted active-session configuration are left to application integration.
+
+## Native acceptance checks
+
+In addition to the README's locked checks, run:
+
+```sh
+nix develop --command python3 scripts/catalog-https-acceptance.py
+nix develop --command cargo test --locked catalog::cache_tests::https_public_export_acceptance -- --ignored --exact
+```
+
+The first command requires host Python 3 and OpenSSL (not supplied by the current
+development shell). It creates a temporary, certificate-verified localhost HTTPS
+smart-Git server and root sample pack, with an isolated Git configuration and
+synthetic credential helper. It checks authenticated fetching, unchanged media,
+exact commit revisions, prepared updates, pinned sessions, failed validation,
+unavailable remotes and offline cached loading. Markers verify that pack scripts,
+a configured smudge filter and Git hooks do not execute. The helper records only
+operation names; the fixture never reads account credentials or changes user Git
+configuration. Temporary certificates, helper and repository are removed on exit.
+
+The second command exports an exact public Durop commit over ordinary GitHub
+HTTPS and validates its nested sample pack. Durop's repository root is not itself
+a pack; full HTTPS root-pack cache activation is covered by the localhost fixture.
+These two acceptance tests are ignored by default to keep ordinary unit tests
+independent of network access and host fixture tools.
+
+On Apple Silicon macOS 27.0.1, the twelve regular catalog tests and both HTTPS
+acceptance paths passed through `nix develop`. Authentication coverage exercises
+Git's helper protocol with synthetic credentials, not a provider-specific private
+repository or an OS keychain. Decoder probing, playback and host/session integration
+remain deferred; offline acceptance verifies cached file access, not playback.

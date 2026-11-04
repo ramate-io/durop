@@ -1059,4 +1059,92 @@ mod cache_tests {
                 .contains("symlinks")
         );
     }
+
+    #[test]
+    #[ignore = "network acceptance; run scripts/catalog-https-acceptance.py"]
+    fn https_authenticated_cache_acceptance() {
+        let url = std::env::var("DUROP_TEST_HTTPS_URL").unwrap();
+        let source_path = PathBuf::from(std::env::var_os("DUROP_TEST_REPOSITORY").unwrap());
+        let source = PackSource::HttpsGit {
+            url,
+            reference: "HEAD".into(),
+        };
+        let dir = Temp::new();
+        let mut cache = CatalogCache::new(dir.0.clone()).unwrap();
+        let first = cache.refresh(&source).unwrap();
+        let pin = cache.pin().unwrap();
+        let local = load_local(&source_path).unwrap();
+        let head = || {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&source_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        assert_eq!(first.revision, head());
+        assert_eq!(first.clips[0].identity, local.clips[0].identity);
+        assert_eq!(
+            first.clips[0].decoder_readiness,
+            DecoderReadiness::Unchecked
+        );
+        let media = read(&first.clips[0].asset_path).unwrap();
+        assert_eq!(media, read(&local.clips[0].asset_path).unwrap());
+        assert_eq!(
+            read(&first.clips[0].icon_path).unwrap(),
+            read(&local.clips[0].icon_path).unwrap()
+        );
+        let metadata_path = source_path.join("reactions/chime.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["title"] = serde_json::json!("HTTPS update");
+        fs::write(metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        commit(&source_path);
+        let next = cache.prepare(&source).unwrap();
+        assert_eq!(next.revision, head());
+        assert_ne!(next.revision, first.revision);
+        assert!(Arc::ptr_eq(&cache.pin().unwrap(), &first));
+        cache.refresh(&source).unwrap();
+        assert_eq!(pin.clips[0].metadata.title, "Chime");
+        assert_eq!(cache.pin().unwrap().clips[0].metadata.title, "HTTPS update");
+        fs::write(source_path.join("durop.json"), b"invalid").unwrap();
+        commit(&source_path);
+        assert!(cache.refresh(&source).is_err());
+        assert_eq!(cache.pin().unwrap().revision, next.revision);
+        // Make the served repository unavailable; cached bytes still load offline.
+        fs::rename(source_path.join(".git"), source_path.join("offline.git")).unwrap();
+        assert!(cache.refresh(&source).is_err());
+        assert_eq!(cache.pin().unwrap().revision, next.revision);
+        assert_eq!(read(&pin.clips[0].asset_path).unwrap(), media);
+        assert_eq!(
+            load_local(&pin.root).unwrap().clips[0].identity,
+            local.clips[0].identity
+        );
+    }
+
+    #[test]
+    #[ignore = "requires public GitHub HTTPS access"]
+    fn https_public_export_acceptance() {
+        let staging = Temp::new();
+        let data = staging.0.join("pack");
+        fs::create_dir(&data).unwrap();
+        let expected = "79a70e2421c27350b8e8545a9e50f702b86552fc";
+        let revision = export_git(
+            &staging.0,
+            &data,
+            std::ffi::OsStr::new("https://github.com/ramate-io/durop.git"),
+            expected,
+            false,
+        )
+        .unwrap();
+        assert_eq!(revision, expected);
+        let catalog = load_local(&data.join("examples/sample-pack")).unwrap();
+        assert_eq!(catalog.clips[0].identity, "sample/chime");
+        assert_eq!(
+            catalog.clips[0].decoder_readiness,
+            DecoderReadiness::Unchecked
+        );
+    }
 }
