@@ -6,4 +6,8 @@ rust-version = "1.95"
 license = "MIT"
 
 [dependencies]
-bevy = { version = "=0.19.1", default-features = false, features = ["std", "async_executor", "bevy_window", "bevy_winit", "x11"] }
+bevy = { version = "=0.19.1", default-features = false, features = ["std", "async_executor", "bevy_window", "bevy_winit", "x11", "bevy_asset", "bevy_render", "bevy_camera", "bevy_core_pipeline", "bevy_sprite", "bevy_sprite_render", "bevy_text", "default_font", "png"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+raw-window-handle = "0.6"
