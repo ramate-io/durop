@@ -228,11 +228,10 @@ pub fn load_local(path: &Path) -> Result<Catalog> {
         if metadata.playback.max_duration_ms == 0 || metadata.playback.max_duration_ms > 600_000 {
             return Err(invalid("maxDurationMs must be positive and at most 600000"));
         }
-        if let Some(v) = &metadata.visual {
-            if !v.width_fraction.is_finite() || !(0.0 < v.width_fraction && v.width_fraction <= 1.0)
-            {
-                return Err(invalid("widthFraction must be > 0 and <= 1"));
-            }
+        if let Some(v) = &metadata.visual
+            && !(v.width_fraction.is_finite() && 0.0 < v.width_fraction && v.width_fraction <= 1.0)
+        {
+            return Err(invalid("widthFraction must be > 0 and <= 1"));
         }
         let asset = Path::new(&metadata.asset);
         if asset.as_os_str().is_empty()
@@ -307,6 +306,8 @@ pub fn load_local(path: &Path) -> Result<Catalog> {
         revision: "local-working-directory".into(),
     })
 }
+
+const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -432,5 +433,3 @@ mod tests {
         assert!(load_local(&t.0).unwrap_err().0.contains("cycle"));
     }
 }
-
-const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
