@@ -125,7 +125,9 @@ Run the README formatting/check/test/clippy/build commands first.
 Cloud Linux (Rust 1.95.0) passed `cargo fmt --all -- --check`,
 `cargo check --locked`, `cargo test --locked` (five tests),
 `cargo clippy --all-targets --locked -- -D warnings`, and `cargo build --locked`.
-`git diff --check` also passed. Tests cover command parsing, Retina bounds,
+`git diff --check` also passed. A Linux window smoke was unavailable: the host
+had no DISPLAY/WAYLAND_DISPLAY, X11 socket, Xvfb, or Vulkan ICD. No Linux
+window/rendering runtime result is claimed. Tests cover command parsing, Retina bounds,
 panel close/reopen, terminal loss, and display-removal clearing.
 
 The adapter also passed Apple Silicon cross-check and cross-clippy:
