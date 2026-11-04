@@ -31,6 +31,14 @@ class NetworkTests(unittest.TestCase):
             self.assertNotIn('tailscale_dns_preferences', result['resource'])
             self.assertFalse((base / 'persistent').exists())
 
+    def test_magic_dns_only_when_owned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            synthesize(Settings(policy={}, state_dir=base / 'state', magic_dns=False), str(base / 'out'))
+            result = json.loads((base / 'out/stacks/durop-network/cdk.tf.json').read_text())
+            self.assertFalse(result['resource']['tailscale_dns_preferences']['dns']['magic_dns'])
+            self.assertTrue(result['resource']['tailscale_acl']['policy']['lifecycle']['prevent_destroy'])
+
     def test_invalid_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / 'config.json'
