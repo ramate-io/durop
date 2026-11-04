@@ -32,3 +32,49 @@ playback variants belong in a separate derived cache.
 JSON Schemas in `schemas/` describe authoring shapes; the Rust loader also checks
 filesystem containment, unique IDs, assets and icons. `examples/sample-pack` is
 an independently authored, redistributable example with asset provenance.
+
+## Preparing and pinning cached snapshots
+
+The application calls `CatalogCache::prepare` on a worker with an explicitly
+selected `PackSource`: a local directory, a local Git repository/ref, or HTTPS
+repository/ref. No panel or transport integration is included yet. `refresh`
+prepares and validates first, then changes the active `Arc<Catalog>` in one
+assignment. `pin` retains the old revision and its asset paths for a live session.
+Preparation alone makes an update available without changing the active session.
+Prepared assets are ordinary local files and need no network access at trigger
+time. The application owns the cache directory and must retain pinned snapshots;
+this version deliberately performs no garbage collection.
+
+Git fetch resolves a branch/tag/commit to an exact commit. The Git CLI is invoked
+through argument arrays, with hooks disabled, no interactive prompts, and
+protocols restricted to HTTPS (plus file only for explicit local repositories).
+Objects are exported directly via `ls-tree`/`cat-file`: there is no checkout,
+filter/smudge, LFS fetch, submodule recursion, or execution of pack content.
+Git symlinks and gitlinks/submodules are rejected; local directory symlinks are
+supported only within the root. HTTPS URLs cannot contain credentials, queries,
+fragments or escaped bytes. Existing Git credential helpers may service HTTPS
+requests; manifests and errors never persist supplied tokens or Git stderr.
+References must be literal branch/tag names or commit IDs, without revision
+expressions. Errors omit remote diagnostics to avoid credential disclosure.
+
+Cache directory keys are SHA-256 over length-delimited source identity, immutable
+revision and `catalog-v1` derived-format version. Local directory revisions are
+SHA-256 content digests of copied manifest, metadata, icons and referenced media;
+they are not Git commits and include uncommitted changes. Local source directories
+must be quiescent while preparing; the copied result is revalidated. Keep the
+application-owned cache outside local source packs. Git identities use canonical
+local repository paths or the supplied HTTPS URL. Equivalent URL spellings may
+create separate cache entries. Metadata, icons and original media are staged on
+the same filesystem, validated, and atomically renamed into the snapshot cache.
+Failed preparation removes staging and leaves the active snapshot unchanged.
+
+Limits: each file/Git output is at most 256 MiB, a prepared pack at most 1 GiB,
+local discovery at most 10000 directories/metadata files and depth 64. Each Git
+operation has a 120 second timeout covering the process and output reader. On
+Linux/macOS, timeout cleanup kills the isolated Git process group, including
+helpers that inherit stdout; a helper that deliberately detaches from that group
+is outside this cleanup guarantee. These conservative limits are format/runtime
+policy, not decoder capability. Future UI integration should present preparation
+errors before enabling a session. Crash recovery can load a previously prepared
+snapshot using `load_local` on its cache directory, but revision selection and
+persisted active-session configuration are left to application integration.

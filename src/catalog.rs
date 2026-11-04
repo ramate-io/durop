@@ -2,11 +2,17 @@
 // Integration with the panel/host is intentionally deferred.
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 type Result<T> = std::result::Result<T, CatalogError>;
@@ -308,11 +314,380 @@ pub fn load_local(path: &Path) -> Result<Catalog> {
 }
 
 const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PACK_BYTES: u64 = 1024 * 1024 * 1024;
+const CACHE_VERSION: &str = "catalog-v1";
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// HTTPS sources must contain no credentials, query, fragment or percent escapes.
+/// Local Git repositories are only accepted through the explicit LocalGit variant.
+#[derive(Debug, Clone)]
+pub enum PackSource {
+    LocalDirectory(PathBuf),
+    LocalGit { path: PathBuf, reference: String },
+    HttpsGit { url: String, reference: String },
+}
+/// Cache is application-owned. Do not permit packs to write into this directory.
+/// Call prepare on a worker; pin() gives a session its own immutable Arc.
+pub struct CatalogCache {
+    root: PathBuf,
+    active: Option<Arc<Catalog>>,
+}
+impl CatalogCache {
+    pub fn new(root: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&root)?;
+        Ok(Self {
+            root: fs::canonicalize(root)?,
+            active: None,
+        })
+    }
+    pub fn pin(&self) -> Option<Arc<Catalog>> {
+        self.active.clone()
+    }
+    /// No active state changes on error. Existing pins retain their revision/assets.
+    pub fn refresh(&mut self, source: &PackSource) -> Result<Arc<Catalog>> {
+        let prepared = self.prepare(source)?;
+        self.active = Some(prepared.clone());
+        Ok(prepared)
+    }
+    /// Prepare offline files without activating a new session revision.
+    pub fn prepare(&self, source: &PackSource) -> Result<Arc<Catalog>> {
+        let staging = self.root.join(format!(
+            ".staging-{}-{}",
+            std::process::id(),
+            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&staging)?;
+        let result = self.prepare_in(source, &staging);
+        let _ = fs::remove_dir_all(&staging);
+        result
+    }
+    fn prepare_in(&self, source: &PackSource, staging: &Path) -> Result<Arc<Catalog>> {
+        let data = staging.join("pack");
+        fs::create_dir(&data)?;
+        let (identity, revision) = match source {
+            PackSource::LocalDirectory(path) => {
+                let source_root = fs::canonicalize(path)?;
+                if self.root.starts_with(&source_root) {
+                    return Err(invalid("cache directory must be outside the source pack"));
+                }
+                let original = load_local(path)?;
+                let mut files = BTreeSet::from([PathBuf::from("durop.json")]);
+                for clip in &original.clips {
+                    files.insert(
+                        clip.metadata_path
+                            .strip_prefix(&original.root)
+                            .unwrap()
+                            .into(),
+                    );
+                    // Preserve lexical asset locations even when a contained symlink resolves elsewhere.
+                    files.insert(
+                        clip.metadata_path
+                            .with_extension("png")
+                            .strip_prefix(&original.root)
+                            .unwrap()
+                            .into(),
+                    );
+                    files.insert(
+                        clip.metadata_path
+                            .parent()
+                            .unwrap()
+                            .join(&clip.metadata.asset)
+                            .strip_prefix(&original.root)
+                            .unwrap()
+                            .into(),
+                    );
+                }
+                let mut digest = Sha256::new();
+                let mut total = 0;
+                for relative in files {
+                    let bytes = read(&contained(&original.root, &original.root.join(&relative))?)?;
+                    total += bytes.len() as u64;
+                    if total > MAX_PACK_BYTES {
+                        return Err(invalid("pack exceeds 1 GiB limit"));
+                    }
+                    let name = relative
+                        .to_str()
+                        .ok_or_else(|| invalid("non-UTF-8 pack path"))?;
+                    digest.update((name.len() as u64).to_be_bytes());
+                    digest.update(name.as_bytes());
+                    digest.update((bytes.len() as u64).to_be_bytes());
+                    digest.update(&bytes);
+                    let destination = data.join(relative);
+                    fs::create_dir_all(destination.parent().unwrap())?;
+                    fs::write(destination, bytes)?;
+                }
+                (
+                    format!("local:{}", original.root.display()),
+                    format!("content-{:x}", digest.finalize()),
+                )
+            }
+            PackSource::LocalGit { path, reference } => {
+                let path = fs::canonicalize(path)?;
+                let revision = export_git(staging, &data, path.as_os_str(), reference, true)?;
+                (format!("git-local:{}", path.display()), revision)
+            }
+            PackSource::HttpsGit { url, reference } => {
+                validate_https(url)?;
+                let revision =
+                    export_git(staging, &data, std::ffi::OsStr::new(url), reference, false)?;
+                (format!("git:{url}"), revision)
+            }
+        };
+        // Validate before publication. A pack cannot partially replace an existing snapshot.
+        load_local(&data)?;
+        let mut digest = Sha256::new();
+        for part in [CACHE_VERSION, &identity, &revision] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        let destination = self.root.join(format!("{:x}", digest.finalize()));
+        if !destination.exists() {
+            match fs::rename(&data, &destination) {
+                Ok(()) => (),
+                Err(_) if destination.is_dir() => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let mut catalog = load_local(&destination)?;
+        catalog.revision = revision;
+        Ok(Arc::new(catalog))
+    }
+}
+fn validate_https(url: &str) -> Result<()> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| invalid("Git source must be HTTPS"))?;
+    let (host, path) = rest
+        .split_once('/')
+        .ok_or_else(|| invalid("HTTPS source requires a host and repository path"))?;
+    if host.is_empty()
+        || path.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':')
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-_.~".contains(&b))
+    {
+        return Err(invalid(
+            "invalid HTTPS source: credentials, query strings, fragments and escapes are not accepted",
+        ));
+    }
+    Ok(())
+}
+/// Bounded output and wall time; errors deliberately omit Git stderr/URLs to avoid credential leaks.
+fn git(repo: &Path, args: &[&std::ffi::OsStr], local: bool) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.https.allow=always",
+            "-c",
+            if local {
+                "protocol.file.allow=always"
+            } else {
+                "protocol.file.allow=never"
+            },
+            "-c",
+            "fetch.recurseSubmodules=false",
+            "-c",
+            "credential.interactive=false",
+        ])
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LFS_SKIP_SMUDGE", "1");
+    run_git_command(command, std::time::Duration::from_secs(120))
+}
+fn run_git_command(mut command: Command, timeout: std::time::Duration) -> Result<Vec<u8>> {
+    use std::{
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() > timeout {
+            stop_git(&mut child);
+            return Err(invalid("Git operation timed out"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let remaining = timeout.saturating_sub(start.elapsed());
+    let bytes = match receiver.recv_timeout(remaining) {
+        Ok(result) => result?,
+        Err(_) => {
+            stop_git(&mut child);
+            return Err(invalid("Git output timed out"));
+        }
+    };
+    if !status.success() {
+        return Err(invalid(
+            "Git operation failed (source/ref unavailable or rejected); diagnostics suppressed to protect credentials",
+        ));
+    }
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(invalid("Git object/listing exceeds 256 MiB limit"));
+    }
+    Ok(bytes)
+}
+// Git fetch may spawn remote helpers. Kill its isolated group on Unix, including
+// when the top-level process exited but a helper retained its output pipe.
+fn stop_git(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: std::os::raw::c_int, signal: std::os::raw::c_int) -> std::os::raw::c_int;
+        }
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // SAFETY: Git was spawned in its own process group whose ID is its PID.
+            // SIGKILL is 9 on the supported Linux/macOS targets. No pointers cross FFI.
+            unsafe {
+                kill(-pid, 9);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn export_git(
+    staging: &Path,
+    data: &Path,
+    source: &std::ffi::OsStr,
+    reference: &str,
+    local: bool,
+) -> Result<String> {
+    use std::ffi::OsStr;
+    if reference.is_empty()
+        || reference.starts_with('-')
+        || !reference
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+    {
+        return Err(invalid(
+            "invalid Git reference; select a branch, tag or commit",
+        ));
+    }
+    let repo = staging.join("objects");
+    fs::create_dir(&repo)?;
+    git(
+        &repo,
+        &[
+            OsStr::new("init"),
+            OsStr::new("--bare"),
+            OsStr::new("--template=/dev/null"),
+        ],
+        local,
+    )?;
+    git(
+        &repo,
+        &[
+            OsStr::new("fetch"),
+            OsStr::new("--depth=1"),
+            OsStr::new("--no-tags"),
+            OsStr::new("--no-recurse-submodules"),
+            OsStr::new("--"),
+            source,
+            OsStr::new(reference),
+        ],
+        local,
+    )?;
+    let revision = String::from_utf8(git(
+        &repo,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("FETCH_HEAD^{commit}"),
+        ],
+        local,
+    )?)
+    .map_err(|_| invalid("invalid Git revision"))?
+    .trim()
+    .to_owned();
+    if ![40, 64].contains(&revision.len()) || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid("Git did not resolve an immutable commit"));
+    }
+    let listing = git(
+        &repo,
+        &[
+            OsStr::new("ls-tree"),
+            OsStr::new("-r"),
+            OsStr::new("-z"),
+            OsStr::new(&revision),
+        ],
+        local,
+    )?;
+    let mut total = 0u64;
+    for entry in listing.split(|b| *b == 0).filter(|x| !x.is_empty()) {
+        let entry = std::str::from_utf8(entry).map_err(|_| invalid("Git paths must be UTF-8"))?;
+        let (header, name) = entry
+            .split_once('\t')
+            .ok_or_else(|| invalid("invalid Git tree"))?;
+        let fields: Vec<_> = header.split(' ').collect();
+        if fields.len() != 3 || !["100644", "100755"].contains(&fields[0]) || fields[1] != "blob" {
+            return Err(invalid("Git packs cannot contain symlinks or submodules"));
+        }
+        let path = Path::new(name);
+        if path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+            || name.contains('\\')
+            || path.components().any(|c| c.as_os_str() == ".git")
+        {
+            return Err(invalid("unsafe Git tree path"));
+        }
+        let bytes = git(
+            &repo,
+            &[
+                OsStr::new("cat-file"),
+                OsStr::new("blob"),
+                OsStr::new(fields[2]),
+            ],
+            local,
+        )?;
+        total += bytes.len() as u64;
+        if total > MAX_PACK_BYTES {
+            return Err(invalid("pack exceeds 1 GiB limit"));
+        }
+        let destination = data.join(path);
+        fs::create_dir_all(destination.parent().unwrap())?;
+        fs::write(destination, bytes)?;
+    }
+    Ok(revision)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     pub(super) struct Temp(pub(super) PathBuf);
     impl Temp {
@@ -409,6 +784,56 @@ mod tests {
         assert!(load_local(&t.0).unwrap_err().0.contains("schemaVersion"));
     }
     #[test]
+    fn defaults_format_policy_and_deterministic_order() {
+        let t = fixture();
+        let loaded = load_local(&t.0).unwrap();
+        assert_eq!(loaded.clips[0].metadata.playback.max_duration_ms, 1000);
+        let path = t.0.join("reactions/chime.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        meta.as_object_mut().unwrap().remove("playback");
+        fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert_eq!(
+            load_local(&t.0).unwrap().clips[0]
+                .metadata
+                .playback
+                .max_duration_ms,
+            10000
+        );
+        fs::write(t.0.join("reactions/thing.exe"), b"data").unwrap();
+        meta["asset"] = serde_json::json!("thing.exe");
+        fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert!(
+            load_local(&t.0)
+                .unwrap_err()
+                .0
+                .contains("unsupported media")
+        );
+        meta["asset"] = serde_json::json!("chime.wav");
+        meta["id"] = serde_json::json!("another");
+        fs::write(
+            t.0.join("reactions/aaa.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        fs::copy(
+            t.0.join("reactions/chime.png"),
+            t.0.join("reactions/aaa.png"),
+        )
+        .unwrap();
+        meta["id"] = serde_json::json!("chime");
+        fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let loaded = load_local(&t.0).unwrap();
+        assert_eq!(
+            loaded
+                .clips
+                .iter()
+                .map(|c| c.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sample/another", "sample/chime"]
+        );
+    }
+    #[test]
     fn lfs_rejected() {
         let t = fixture();
         fs::write(
@@ -431,5 +856,207 @@ mod tests {
         fs::remove_file(t.0.join("reactions/chime.wav")).unwrap();
         symlink(&t.0, t.0.join("reactions/cycle")).unwrap();
         assert!(load_local(&t.0).unwrap_err().0.contains("cycle"));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::tests::{Temp, fixture};
+    use super::*;
+    fn repository() -> Temp {
+        let t = fixture();
+        let status = Command::new("git")
+            .args(["-C"])
+            .arg(&t.0)
+            .args(["init", "--template=/dev/null"])
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success());
+        commit(&t.0);
+        t
+    }
+    fn commit(path: &Path) {
+        for args in [
+            vec!["add", "--all"],
+            vec![
+                "-c",
+                "user.name=Catalog Test",
+                "-c",
+                "user.email=catalog@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-m",
+                "Fixture",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+    }
+    #[test]
+    fn local_snapshot_survives_source_deletion_and_failed_refresh() {
+        let t = fixture();
+        let cache_dir = Temp::new();
+        let mut cache = CatalogCache::new(cache_dir.0.clone()).unwrap();
+        let first = cache
+            .refresh(&PackSource::LocalDirectory(t.0.clone()))
+            .unwrap();
+        let pin = cache.pin().unwrap();
+        fs::write(t.0.join("durop.json"), b"bad").unwrap();
+        assert!(
+            cache
+                .refresh(&PackSource::LocalDirectory(t.0.clone()))
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&cache.pin().unwrap(), &first));
+        drop(t);
+        assert!(pin.clips[0].asset_path.is_file());
+        assert!(read(&pin.clips[0].asset_path).is_ok());
+    }
+    #[test]
+    fn git_exact_commits_pin_updates_without_filters_or_hooks() {
+        let repo = repository();
+        let cache_dir = Temp::new();
+        let mut cache = CatalogCache::new(cache_dir.0.clone()).unwrap();
+        // A filter that would fail if any worktree checkout/smudge were attempted.
+        fs::write(repo.0.join(".gitattributes"), "*.wav filter=forbidden\n").unwrap();
+        commit(&repo.0);
+        let source = PackSource::LocalGit {
+            path: repo.0.clone(),
+            reference: "HEAD".into(),
+        };
+        let first = cache.refresh(&source).unwrap();
+        let pin = cache.pin().unwrap();
+        assert_eq!(
+            first.clips[0].identity,
+            load_local(&repo.0).unwrap().clips[0].identity
+        );
+        assert_eq!(first.revision.len(), 40);
+        assert_eq!(
+            read(&first.clips[0].asset_path).unwrap(),
+            read(&repo.0.join("reactions/chime.wav")).unwrap()
+        );
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(repo.0.join("reactions/chime.json")).unwrap())
+                .unwrap();
+        meta["title"] = serde_json::json!("New title");
+        fs::write(
+            repo.0.join("reactions/chime.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        commit(&repo.0);
+        let prepared = cache.prepare(&source).unwrap();
+        assert_ne!(prepared.revision, first.revision);
+        assert!(Arc::ptr_eq(&cache.pin().unwrap(), &first));
+        cache.refresh(&source).unwrap();
+        assert_eq!(pin.clips[0].metadata.title, "Chime");
+        assert_eq!(cache.pin().unwrap().clips[0].metadata.title, "New title");
+        fs::write(
+            repo.0.join("reactions/chime.wav"),
+            b"version https://git-lfs.github.com/spec/v1\n",
+        )
+        .unwrap();
+        commit(&repo.0);
+        assert!(cache.refresh(&source).is_err());
+        assert_eq!(cache.pin().unwrap().revision, prepared.revision);
+        drop(repo);
+        assert!(read(&pin.clips[0].asset_path).is_ok());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn local_contained_symlinks_are_copied_as_independent_files() {
+        let t = fixture();
+        fs::rename(t.0.join("reactions/chime.wav"), t.0.join("original.wav")).unwrap();
+        std::os::unix::fs::symlink("../original.wav", t.0.join("reactions/chime.wav")).unwrap();
+        let dir = Temp::new();
+        let cache = CatalogCache::new(dir.0.clone()).unwrap();
+        let first = cache
+            .prepare(&PackSource::LocalDirectory(t.0.clone()))
+            .unwrap();
+        assert!(
+            !fs::symlink_metadata(&first.clips[0].asset_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::write(t.0.join("original.wav"), b"changed source data").unwrap();
+        let next = cache
+            .prepare(&PackSource::LocalDirectory(t.0.clone()))
+            .unwrap();
+        assert_ne!(first.revision, next.revision);
+        assert_ne!(
+            read(&first.clips[0].asset_path).unwrap(),
+            read(&next.clips[0].asset_path).unwrap()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn timeout_bounds_child_and_inherited_stdout() {
+        for script in ["sleep 30", "sleep 30 &"] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            let start = std::time::Instant::now();
+            assert!(
+                run_git_command(command, std::time::Duration::from_millis(100))
+                    .unwrap_err()
+                    .0
+                    .contains("timed out")
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        }
+    }
+    #[test]
+    fn hostile_urls_and_refs_are_rejected() {
+        for url in [
+            "file:///tmp/repo",
+            "https://token@example.org/a",
+            "https://example.org/a?token=x",
+            "https://example.org/a#x",
+            "https://example.org/%2e%2e/a",
+            "ext::command",
+        ] {
+            assert!(validate_https(url).is_err());
+        }
+        assert!(validate_https("https://example.org/org/pack.git").is_ok());
+        let dir = Temp::new();
+        let cache = CatalogCache::new(dir.0.clone()).unwrap();
+        assert!(
+            cache
+                .prepare(&PackSource::LocalGit {
+                    path: dir.0.clone(),
+                    reference: "--upload-pack=bad".into()
+                })
+                .is_err()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn git_symlinks_rejected_without_following() {
+        let repo = repository();
+        std::os::unix::fs::symlink("chime.wav", repo.0.join("reactions/link.wav")).unwrap();
+        commit(&repo.0);
+        let dir = Temp::new();
+        let cache = CatalogCache::new(dir.0.clone()).unwrap();
+        assert!(
+            cache
+                .prepare(&PackSource::LocalGit {
+                    path: repo.0.clone(),
+                    reference: "HEAD".into()
+                })
+                .unwrap_err()
+                .0
+                .contains("symlinks")
+        );
     }
 }
