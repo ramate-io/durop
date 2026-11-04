@@ -13,7 +13,8 @@ class WrapperTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        # macOS /tmp aliases /private/tmp; production canonicalizes paths.
+        self.base = Path(self.tmp.name).resolve()
         self.config = self.base / 'config.json'
         shutil.copyfile(main.ROOT / 'network.config.example.json', self.config)
         self.state = self.base / 'persistent state'

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class NetworkTests(unittest.TestCase):
     def test_deterministic_complete_policy_and_backend(self):
         with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
+            base = Path(tmp).resolve()
             data = json.loads((ROOT / 'network.config.example.json').read_text())
             data['policy']['ssh'] = [{'action': 'check', 'src': ['autogroup:member'], 'dst': ['autogroup:self'], 'users': ['autogroup:nonroot']}]
             config = base / 'config.json'
@@ -33,7 +33,7 @@ class NetworkTests(unittest.TestCase):
 
     def test_magic_dns_only_when_owned(self):
         with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
+            base = Path(tmp).resolve()
             synthesize(Settings(policy={}, state_dir=base / 'state', magic_dns=False), str(base / 'out'))
             result = json.loads((base / 'out/stacks/durop-network/cdk.tf.json').read_text())
             self.assertFalse(result['resource']['tailscale_dns_preferences']['dns']['magic_dns'])
