@@ -34,6 +34,12 @@ small clean environment, the SDK resolved by `xcrun`, a dedicated
 Cargo's existing native build cache is reused, while every package invocation
 still runs the locked build and mandatory bundle/resource checks.
 
+If a native rustup launcher was installed through Homebrew, select its actual
+official toolchain executable with
+`--cargo "$(rustup which --toolchain 1.95.0 cargo)"`. The packaging CI does this
+explicitly; the launcher/installer's location must not be mistaken for the
+compiler/Cargo used to build the distributable.
+
 The output directory contains the app, a versioned ZIP, its SHA-256 checksum,
 `BUILD-INFO.json` and `VALIDATION.json`. The app contains:
 

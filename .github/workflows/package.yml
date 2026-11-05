@@ -25,6 +25,8 @@ jobs:
           channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal
           rustup target add --toolchain "$channel" aarch64-apple-darwin
+          native_cargo=$(rustup which --toolchain "$channel" cargo)
+          printf 'DUROP_NATIVE_CARGO=%s\n' "$native_cargo" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           key: native-macos-arm64-14-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
