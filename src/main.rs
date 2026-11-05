@@ -1,4 +1,4 @@
-mod catalog;
+pub mod catalog;
 mod commands;
 mod host;
 mod media;

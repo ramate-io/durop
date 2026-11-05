@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "title": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "asset": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "playback": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "retrigger": {
+          "enum": [
+            "restart",
+            "ignore-if-playing",
+            "stack"
+          ],
+          "default": "restart"
+        },
+        "loop": {
+          "type": "boolean",
+          "default": false
+        },
+        "maxDurationMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600000,
+          "default": 10000
+        }
+      },
+      "required": []
+    },
+    "visual": {
+      "anyOf": [
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "anchor": {
+              "enum": [
+                "top-left",
+                "top-right",
+                "bottom-left",
+                "bottom-right",
+                "center"
+              ]
+            },
+            "widthFraction": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1
+            },
+            "fit": {
+              "enum": [
+                "contain",
+                "cover"
+              ]
+            }
+          },
+          "required": [
+            "anchor",
+            "widthFraction",
+            "fit"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "asset"
+  ]
+}

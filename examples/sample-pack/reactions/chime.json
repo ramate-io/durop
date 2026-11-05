@@ -1,0 +1,12 @@
+{
+  "id": "chime",
+  "title": "Chime",
+  "asset": "chime.wav",
+  "tags": [
+    "sample",
+    "positive"
+  ],
+  "playback": {
+    "maxDurationMs": 1000
+  }
+}
