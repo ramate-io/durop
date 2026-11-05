@@ -727,25 +727,85 @@ mod tests {
     }
     #[test]
     fn stalled_consumer_has_one_frame_and_bounded_events() {
-        let worker = MediaWorker::spawn();
-        let mut spec = fixture(1);
-        spec.max_duration = Duration::from_millis(450);
-        worker.prepare(spec).unwrap();
-        wait(&worker, |event| {
-            matches!(event, MediaEventKind::Prepared { .. })
-        });
-        worker.start(1).unwrap();
-        thread::sleep(Duration::from_millis(350));
-        let shared = worker.shared.lock().unwrap();
-        assert!(
-            shared
-                .frame
-                .as_ref()
-                .is_some_and(|frame| frame.rgba.len() == 64)
+        // Exercise the producer/consumer mailbox without a playback deadline:
+        // the real-worker tests above cover start, completion and stop. Sleeping
+        // inside a short clip's lifetime races valid terminal frame cleanup.
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        let worker = MediaWorker {
+            sender,
+            control: Arc::new(Control {
+                selection: Mutex::new(Selection {
+                    generation: 1,
+                    stopped: false,
+                }),
+                shutdown: AtomicBool::new(false),
+            }),
+            shared: Arc::new(Mutex::new(Shared {
+                outstanding: BTreeSet::from([1]),
+                ..Default::default()
+            })),
+        };
+        event(
+            &worker.shared,
+            1,
+            MediaEventKind::Prepared {
+                duration: Duration::from_secs(1),
+                has_video: true,
+            },
         );
-        assert!(shared.events.len() <= 3);
-        drop(shared);
-        worker.stop(1);
-        wait(&worker, |event| *event == MediaEventKind::Stopped);
+        event(&worker.shared, 1, MediaEventKind::Started);
+
+        let mut buffers = Vec::new();
+        for sequence in 1..=1024 {
+            let rgba: Arc<[u8]> = vec![(sequence % 251) as u8; 64].into();
+            buffers.push(Arc::downgrade(&rgba));
+            publish(
+                &worker.shared,
+                &worker.control,
+                DecodedFrame {
+                    generation: 1,
+                    presentation_ns: sequence,
+                    width: 4,
+                    height: 4,
+                    row_stride: 16,
+                    rgba,
+                    alpha: AlphaMode::Straight,
+                    color_space: ColorSpace::Srgb,
+                },
+            );
+            // No frames or events are consumed during this producer burst.
+            assert_eq!(worker.shared.lock().unwrap().events.len(), 2);
+        }
+        assert!(
+            buffers[..1023]
+                .iter()
+                .all(|buffer| buffer.strong_count() == 0)
+        );
+        assert_eq!(buffers[1023].strong_count(), 1);
+
+        let latest = worker.latest_frame().unwrap();
+        assert_eq!(latest.generation, 1);
+        assert_eq!(latest.presentation_ns, 1024);
+        assert_eq!((latest.width, latest.height, latest.row_stride), (4, 4, 16));
+        assert_eq!(&*latest.rgba, &[(1024 % 251) as u8; 64]);
+        assert!(worker.latest_frame().is_none());
+        assert_eq!(
+            worker.drain_events(),
+            [
+                MediaEvent {
+                    generation: 1,
+                    kind: MediaEventKind::Prepared {
+                        duration: Duration::from_secs(1),
+                        has_video: true,
+                    },
+                },
+                MediaEvent {
+                    generation: 1,
+                    kind: MediaEventKind::Started,
+                },
+            ]
+        );
+        drop(latest);
+        assert!(buffers.iter().all(|buffer| buffer.strong_count() == 0));
     }
 }
