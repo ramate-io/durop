@@ -1,0 +1,13 @@
+{
+  "id": "audio",
+  "title": "Flash and beep audio",
+  "asset": "flash-beep.wav",
+  "tags": [
+    "proof"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4000
+  }
+}

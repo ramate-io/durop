@@ -115,14 +115,19 @@ Own the mutable client in a task on the existing Tokio runtime. Use `command(id,
 revision, PlaybackCommand)` for canonical typed outcomes, `catalog()` and `icon(id)`
 for bounded browsing, `refresh_snapshot()` for current state, and `next_update()`
 for typed events or replacement snapshots. The panel can select `next_update()`
-alongside its bounded online UI action channel. `current_snapshot()` supplies the
+alongside its bounded online UI action channel. Await commands and browse calls to
+completion; do not select and cancel those exchanges. Cancelling `next_update()`
+during gap recovery may leave a requested snapshot in flight; the next exchange
+accepts that late snapshot before its correlated reply. `current_snapshot()` supplies the
 session/revision for initial controls; publish host snapshots before related events.
 The client detects event-sequence gaps or its 64-event buffer overflowing and obtains
 a replacement snapshot. Backwards snapshots, a changed session/revision on the same
 connection, malformed packets, and uncorrelated replies fail closed.
 
 Commands and browse requests have five-second deadlines. The client sends bounded
-heartbeats while reading to maintain an idle connection. A timeout or connection
+heartbeats while reading to maintain an idle connection. A matching Pong must arrive
+within five seconds of each ping; a silent blackhole is detected within at most 25
+seconds while the client task continues polling `next_update()`. A timeout or connection
 failure destroys the socket and any pending request; it never reconnects or retries
 button presses. `disconnect()` explicitly closes access. Disable remote actions when
 `is_connected()` becomes false, clear pending UI actions, and require an explicit
