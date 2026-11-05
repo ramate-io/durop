@@ -1,0 +1,15 @@
+{
+  "id": "apollo-liftoff",
+  "title": "Apollo 11: liftoff",
+  "asset": "apollo-liftoff.mp3",
+  "tags": [
+    "liftoff",
+    "go",
+    "apollo 11"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 8100
+  }
+}

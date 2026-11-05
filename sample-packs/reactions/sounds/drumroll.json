@@ -1,0 +1,15 @@
+{
+  "id": "drumroll",
+  "title": "Drum roll, please",
+  "asset": "drumroll.mp3",
+  "tags": [
+    "drumroll",
+    "suspense",
+    "reveal"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4100
+  }
+}

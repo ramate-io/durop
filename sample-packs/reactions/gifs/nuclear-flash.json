@@ -1,0 +1,21 @@
+{
+  "id": "nuclear-flash",
+  "title": "Nuclear test: flash",
+  "asset": "nuclear-flash.gif",
+  "tags": [
+    "escalated",
+    "flash",
+    "nuclear test",
+    "doe"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4300
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}

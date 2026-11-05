@@ -1,0 +1,21 @@
+{
+  "id": "fred-sneeze",
+  "title": "Fred Ott: the sneeze (1894)",
+  "asset": "fred-sneeze.gif",
+  "tags": [
+    "sneeze",
+    "gesundheit",
+    "historic",
+    "edison"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4800
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}

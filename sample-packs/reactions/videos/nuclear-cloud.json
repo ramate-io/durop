@@ -1,0 +1,21 @@
+{
+  "id": "nuclear-cloud",
+  "title": "Nuclear test: mushroom cloud",
+  "asset": "nuclear-cloud.mp4",
+  "tags": [
+    "escalated",
+    "cloud",
+    "nuclear test",
+    "doe"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4300
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}

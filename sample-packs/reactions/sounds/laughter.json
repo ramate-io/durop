@@ -1,0 +1,15 @@
+{
+  "id": "laughter",
+  "title": "Bursting out laughing",
+  "asset": "laughter.mp3",
+  "tags": [
+    "laugh",
+    "funny",
+    "comedy"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4300
+  }
+}

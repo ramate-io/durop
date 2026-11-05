@@ -1,0 +1,20 @@
+{
+  "id": "spinning-dancer",
+  "title": "Spinning Dancer: which way?",
+  "asset": "spinning-dancer.gif",
+  "tags": [
+    "confused",
+    "illusion",
+    "dancer"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 3360
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}

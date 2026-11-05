@@ -1,0 +1,21 @@
+{
+  "id": "bellboy-deadpan",
+  "title": "Keaton: the deadpan look",
+  "asset": "bellboy-deadpan.mp4",
+  "tags": [
+    "keaton",
+    "deadpan",
+    "really",
+    "bell boy"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 3800
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}

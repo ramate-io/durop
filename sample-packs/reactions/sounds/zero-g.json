@@ -1,0 +1,15 @@
+{
+  "id": "zero-g",
+  "title": "Mercury: zero G",
+  "asset": "zero-g.mp3",
+  "tags": [
+    "zero g",
+    "floating",
+    "mercury"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 5500
+  }
+}

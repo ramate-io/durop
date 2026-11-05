@@ -1,0 +1,15 @@
+{
+  "id": "train-horn",
+  "title": "Bluebird train horn",
+  "asset": "train-horn.mp3",
+  "tags": [
+    "horn",
+    "attention",
+    "train"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 1900
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "id": "applause",
+  "title": "Applause and cheers",
+  "asset": "applause.mp3",
+  "tags": [
+    "applause",
+    "cheer",
+    "win"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 5300
+  }
+}

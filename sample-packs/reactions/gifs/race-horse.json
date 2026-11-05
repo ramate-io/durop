@@ -1,0 +1,21 @@
+{
+  "id": "race-horse",
+  "title": "And they are off!",
+  "asset": "race-horse.gif",
+  "tags": [
+    "go",
+    "horse",
+    "running",
+    "muybridge"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 3300
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}
