@@ -1843,8 +1843,8 @@ dependencies = [
  "bevy",
  "futures-util",
  "getrandom 0.4.3",
- "if-addrs",
  "gif",
+ "if-addrs",
  "objc2 0.6.4",
  "objc2-av-foundation",
  "objc2-core-graphics",
@@ -1859,6 +1859,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-tungstenite",
+ "winit",
 ]
 
 [[package]]

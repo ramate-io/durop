@@ -121,6 +121,14 @@ pub struct NetworkState {
     pending: BTreeMap<u64, GuardedRequest>,
 }
 impl NetworkState {
+    #[cfg(test)]
+    pub(crate) fn for_ui_test(snapshot: HostSnapshot) -> Self {
+        make_state(snapshot, &NetworkConfig::default(), Arc::new(|| {}))
+    }
+    #[cfg(test)]
+    pub(crate) fn accept_for_ui_test(&mut self, host: &mut crate::host::Host) {
+        self.accept_pending(host);
+    }
     pub fn queue_local(&self, envelope: Envelope) -> Result<(), QueueError> {
         self.local.try_send(envelope)
     }
