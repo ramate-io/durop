@@ -1,0 +1,21 @@
+name: Conventional Commits
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-title:
+    name: Conventional Commit PR title
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test header validator
+        run: python3 -m unittest discover -s scripts/tests -p 'test_conventional_commits.py' -v
+      - name: Validate pull request title
+        run: python3 scripts/conventional_commits.py --event "$GITHUB_EVENT_PATH"
