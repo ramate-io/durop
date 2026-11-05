@@ -405,7 +405,7 @@ fn make_state(
 fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
     if !runtime.enabled
         || network.session.as_ref().is_some_and(|session| {
-            !session.is_active() || session.session_id != runtime.host.snapshot().session_id
+            !session.is_active() || session.session_id != runtime.snapshot.session_id
         })
     {
         if network.hosting {
@@ -479,7 +479,7 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
             Update::HostEnabled(generation, session)
                 if generation == network.host_generation
                     && runtime.enabled
-                    && session.session_id == runtime.host.snapshot().session_id =>
+                    && session.session_id == runtime.snapshot.session_id =>
             {
                 network.pairing_secret = Some(session.credential.bearer().into());
                 let session = Arc::new(session);

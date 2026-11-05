@@ -28,9 +28,9 @@ pub(crate) struct PlaybackOverlay {
 #[derive(Component)]
 pub struct OverlayWindow;
 #[derive(Component)]
-struct OverlayCamera;
+pub(crate) struct OverlayCamera;
 #[derive(Component)]
-struct Fixture;
+pub(crate) struct Fixture;
 #[derive(Component)]
 pub(super) struct NativeReady;
 #[derive(Resource, Default)]
@@ -198,6 +198,10 @@ fn read_controls(controls: Option<Res<Controls>>, mut pending: ResMut<PendingCon
         );
     }
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy declares independent window and control resources as system parameters"
+)]
 pub(crate) fn apply_controls(
     mut pending: ResMut<PendingControls>,
     mut state: ResMut<OverlayState>,
@@ -206,6 +210,7 @@ pub(crate) fn apply_controls(
     mut close: MessageReader<WindowCloseRequested>,
     primary: Single<Entity, With<PrimaryWindow>>,
     mut exit: MessageWriter<AppExit>,
+    reopen: Option<Res<crate::app::ReopenSupport>>,
 ) {
     let mut displays: Vec<_> = monitors.iter().collect();
     displays.sort_by_key(|(entity, _)| entity.to_bits());
@@ -213,7 +218,8 @@ pub(crate) fn apply_controls(
         state.visible = false;
         state.animation = None;
         if request.window == *primary {
-            panel.visible = state.terminal_closed;
+            panel.visible =
+                state.terminal_closed && !reopen.as_ref().is_some_and(|support| support.0);
         }
     }
     for control in pending.0.drain(..) {
@@ -281,6 +287,10 @@ pub(crate) fn apply_controls(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Overlay synchronization reads native readiness and display/render resources together"
+)]
 pub(crate) fn sync_overlay(
     mut state: ResMut<OverlayState>,
     monitors: Query<(Entity, &Monitor, Has<PrimaryMonitor>)>,
@@ -335,8 +345,12 @@ pub(crate) fn sync_overlay(
     } else {
         fixture.1.scale = Vec3::ONE;
     }
-    let playback_visible = playback.as_ref().is_some_and(|p|p.visible);
-    *fixture.2 = if state.visible { Visibility::Visible } else { Visibility::Hidden };
+    let playback_visible = playback.as_ref().is_some_and(|p| p.visible);
+    *fixture.2 = if state.visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
     let visible = (state.visible || playback_visible) && selected.is_some() && window.1;
     if window.0.visible != visible {
         window.0.visible = visible;
@@ -348,7 +362,9 @@ pub(crate) fn sync_overlay(
         assets.load_state(&fixture.0.image),
         bevy::asset::LoadState::Loading | bevy::asset::LoadState::NotLoaded
     );
-    let active = loading || (visible && state.animation.is_some()) || playback.as_ref().is_some_and(|p|p.busy);
+    let active = loading
+        || (visible && state.animation.is_some())
+        || playback.as_ref().is_some_and(|p| p.busy);
     let mode = if active {
         WinitSettings::continuous()
     } else {
