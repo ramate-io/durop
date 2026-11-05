@@ -1,4 +1,4 @@
-name: Native macOS package
+name: macOS distribution checks
 on:
   workflow_dispatch:
   pull_request:
@@ -16,6 +16,7 @@ permissions:
   contents: read
 jobs:
   package:
+    name: Build, sign and validate app bundle (macOS 14, arm64)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -30,11 +31,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: native-macos-arm64-14-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - name: Test recursive loader validator
+      - name: Test recursive Mach-O dependency validator
         run: python3 -m unittest discover -s packaging/macos -p 'test_*.py' -v
-      - name: Build, bundle, sign and self-check
+      - name: Build app and validate signature, dependencies and bundled resources
         run: packaging/macos/package.sh --output dist/ci-${{ github.sha }}
-      - uses: actions/upload-artifact@v4
+      - name: Upload app archive, checksum and validation reports
+        uses: actions/upload-artifact@v4
         with:
           name: Durop-macos-arm64-${{ github.sha }}
           compression-level: 0
