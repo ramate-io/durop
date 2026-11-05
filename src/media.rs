@@ -22,6 +22,7 @@ mod native;
 const MAX_DIMENSION: u32 = 4096;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DURATION: Duration = Duration::from_secs(600);
+#[cfg(target_os = "macos")]
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone)]
