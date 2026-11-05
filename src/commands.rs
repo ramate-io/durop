@@ -13,12 +13,31 @@ pub struct Envelope {
     pub command: PlaybackCommand,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlaybackCommand {
     Play { clip_id: String },
     Stop { instance_id: String },
     StopAll,
+}
+
+impl<'de> Deserialize<'de> for PlaybackCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Serde's internally tagged unit variant otherwise ignores extra fields.
+        // Decode StopAll as an empty struct variant while retaining the public API.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictCommand {
+            Play { clip_id: String },
+            Stop { instance_id: String },
+            StopAll {},
+        }
+        Ok(match StrictCommand::deserialize(deserializer)? {
+            StrictCommand::Play { clip_id } => Self::Play { clip_id },
+            StrictCommand::Stop { instance_id } => Self::Stop { instance_id },
+            StrictCommand::StopAll {} => Self::StopAll,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,5 +162,23 @@ mod tests {
             "\"clip_id\":\"pack/clip\",\"volume\":900",
         );
         assert!(serde_json::from_str::<Envelope>(&invalid).is_err());
+    }
+
+    #[test]
+    fn stop_all_rejects_unknown_payload_fields() {
+        assert_eq!(
+            serde_json::from_str::<PlaybackCommand>(r#"{"type":"stop_all"}"#).unwrap(),
+            PlaybackCommand::StopAll
+        );
+        assert!(
+            serde_json::from_str::<PlaybackCommand>(
+                r#"{"type":"stop_all","assetPath":"override"}"#
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_string(&PlaybackCommand::StopAll).unwrap(),
+            r#"{"type":"stop_all"}"#
+        );
     }
 }
