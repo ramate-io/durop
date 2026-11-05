@@ -1,63 +1,50 @@
 # Durop
 
-Durop is a Rust/Bevy proof of concept for local media drops and authenticated
-remote control. One application contains the host, controller, catalog panel and
-transparent overlay. Audio/video use AVFoundation on macOS; transparent GIFs use
-a bounded composited timeline. Packs provide author-supplied PNG icons and media.
+Durop plays local media drops through a transparent macOS overlay, with a searchable
+pack catalog and optional authenticated remote control over Tailscale.
 
-The first runtime target is Apple Silicon macOS. Normal-desktop compositing and
-native decoding have measured evidence; native fullscreen overlay presentation
-was absent in the tested TextEdit Space and remains unsupported there. Audible
-output, recorded A/V synchronization, games/controllers/mixed displays and
-installed two-Mac operation still require device acceptance. See the
-[media decision](docs/media-backend.md) and [overlay evidence](docs/overlay-proof.md).
+The POC targets Apple Silicon macOS 14+. Normal desktop playback is supported;
+native fullscreen overlays remain unsupported. See the [acceptance record](docs/acceptance.md)
+for remaining audio, recording, input-focus and two-Mac qualification.
 
-## Use the app
+## Run
 
-The [native package guide](docs/packaging.md) builds one ad-hoc-signed `.app` and
-ZIP with bundled samples, notices and recursive loader validation. Its declared
-POC minimum is macOS 14.0 on Apple Silicon; actual runtime evidence currently
-comes from macOS 27.0.1. A developer toolchain is not required for bundled/local
-playback. Git pack refresh needs usable external Git; remote control needs
-separately installed/configured Tailscale. No release has been published by the
-packaging workflow.
-
-Launch the app, select **This Mac**, choose a display and click a clip. **STOP
-ALL** is the safety control. Use **Remote host** plus an explicit tailnet address
-and a private session credential for another Mac. Read the
-[session runbook](docs/session-runbook.md) for local/host/controller modes,
-pack configuration, recording with system audio, shutdown and troubleshooting.
-The user performs the second-Mac acceptance.
-
-## Development
-
-Install Nix with flakes enabled. On macOS, select Xcode or Command Line Tools
-with `xcode-select`; the Apple SDK/linker is required for native builds.
-From a checkout:
+Install Nix with flakes enabled and select Xcode or Command Line Tools with
+`xcode-select`. From this repository's root:
 
 ```sh
 nix develop
-cargo run --locked
-cargo fmt --all -- --check
-cargo check --locked
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
-cargo build --locked
+cargo run -p durop --bin durop --locked
 ```
 
-Rust, Bevy and dependencies are pinned through `rust-toolchain.toml`, Cargo.lock
-and flake.lock. Use `nix develop --command COMMAND` for individual checks. Nix
-supplies developer/admin tools, not the distributable runtime. Native packaging
-uses a separate clean Cargo/Apple-SDK path. No hooks or Git configuration are
-installed automatically. See [CONTRIBUTING.md](CONTRIBUTING.md).
+This opens the local catalog with bundled samples. Select **This Mac**, choose a
+display, and click a clip; **STOP ALL** stops playback. `cargo run --locked` also
+works from the workspace root. Without entering the shell first:
 
-The default and smaller `nix develop .#infrastructure` shells include the locked
-Python/uv/Node/OpenTofu tooling used by
-[the Tailscale infrastructure runbook](infra/cdktn/tailscale/README.md). Those
-admin tools are not bundled in Durop. No live tailnet policy is changed by
-application builds or CI.
+```sh
+nix develop --command cargo run -p durop --bin durop --locked
+```
 
-- [Versioned packs, cache and credentials](docs/packs.md)
-- [Host state and command policy](docs/host.md)
-- [Transport, pairing and network diagnostics](docs/transport.md)
-- [Native media fixtures and reproduction](fixtures/media/README.md)
+For a standalone `.app`, follow [packaging](docs/packaging.md). For arguments,
+pack sources, host/controller modes and pairing, see the [session guide](docs/session-runbook.md).
+
+## Work
+
+| Track | Open work |
+| --- | --- |
+| [Upcoming Events](https://github.com/ramate-io/durop/issues?q=is%3Aissue%20state%3Aopen%20label%3Aevent%20label%3Apriority%3Ahigh%2Cpriority%3Aurgent) | Dated demos and acceptance milestones. |
+| [Release Candidates](https://github.com/ramate-io/durop/issues?q=is%3Aissue%20state%3Aopen%20label%3Arelease-candidate%20label%3Apriority%3Ahigh%2Cpriority%3Aurgent) | Usable versions delivering those events. |
+| [Features & Bugs](https://github.com/ramate-io/durop/issues?q=is%3Aissue%20state%3Aopen%20label%3Afeature%2Cbug%2Cproposal%20label%3Apriority%3Ahigh%2Cpriority%3Aurgent) | High-priority implementation, fixes and research. |
+
+The [planning standard](docs/planning.md) links features and bugs to release
+candidates, and candidates to events. [Contributing](CONTRIBUTING.md) covers
+workspace checks, symbol documentation and Conventional Commits.
+
+## Organization
+
+- [`src/`](src/): the `durop` executable, UI and application adapters.
+- [`crates/`](crates/): protocol, catalog, host, media and transport libraries; see [architecture](docs/architecture.md).
+- [`docs/`](docs/): operator guides and measured acceptance evidence.
+- [`infra/`](infra/): optional Tailscale administration; see the [runbook](infra/cdktn/tailscale/README.md).
+
+Durop is [MIT licensed](LICENSE).

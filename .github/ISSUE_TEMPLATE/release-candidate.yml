@@ -1,0 +1,48 @@
+name: "Release candidate"
+description: "Define a usable version and its acceptance gates."
+title: "Release Candidate: "
+labels: [release-candidate]
+body:
+  - type: markdown
+    attributes:
+      value: "Follow the planning standard in docs/planning.md. A maintainer applies the chosen priority label during triage."
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - "priority:low"
+        - "priority:medium"
+        - "priority:high"
+        - "priority:urgent"
+      default: 1
+    validations:
+      required: true
+  - type: textarea
+    id: events
+    attributes:
+      label: "Events"
+      description: "Link the event issues this candidate supports; describe any unscheduled dependency."
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: "Summary"
+      description: "Describe the usable version and its intended audience."
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: "Features and bugs"
+      description: "Link the implementation and defect issues included in this candidate."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: "Acceptance gates"
+      description: "List required automated checks, device evidence, known limitations and release blockers."
+    validations:
+      required: true

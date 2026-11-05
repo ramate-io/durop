@@ -105,7 +105,9 @@ samples to make p95 useful, retaining count/max and all failed/rejected attempts
 
 An explicit ignored test exercises the real native client, authenticated loopback
 WebSocket, idle-waking adapter, and shared host policy. Loopback enable/connect helpers
-exist only under `cfg(test)`; production still rejects loopback/wildcard/LAN targets.
+exist only under `cfg(test)` or the default-off `durop-transport/test-support` feature
+used by application test dependencies; normal production builds still reject
+loopback/wildcard/LAN targets.
 It sends StopAll against an empty host to measure policy acknowledgments, not playback.
 
 ```sh

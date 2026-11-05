@@ -1,8 +1,27 @@
 # Contributing
 
-Use the commands in the README before submitting changes. CI runs formatting, locked checking, tests and a native build on macOS and Linux. Keep Cargo.lock and flake.lock committed when dependencies change. Shell entry does not install hooks or change Git configuration; there is no required hook setup.
+Use the [README run commands](README.md#run) to launch the app. From the repository root inside `nix develop`, validate every workspace member:
 
-The first runtime target is Apple Silicon macOS. The current single executable contains the catalog panel, transparent overlay, bounded AVFoundation audio/video bridge, composited GIF timelines, host command state and authenticated Tailscale controller transport. Keep those boundaries within their issue scopes. Linux CI checks portable code and does not validate native AppKit/AVFoundation behavior. Audio/video controls and system codecs are qualified on macOS; GIF and state/transport logic have portable tests.
+```sh
+cargo fmt --all -- --check
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --workspace --locked
+python3 -m unittest discover -s scripts/tests -v
+```
+
+CI runs the Rust checks on macOS and Linux. Keep Cargo.lock and flake.lock committed when dependencies change. Shell entry does not install hooks or change Git configuration; there is no required hook setup.
+
+The first runtime target is Apple Silicon macOS. One executable assembles separate protocol, catalog, host, media and transport crates. Follow the [dependency boundaries](docs/architecture.md); application/UI dependencies stay out of those libraries. Linux CI checks portable code and does not validate native AppKit/AVFoundation behavior. Audio/video controls and system codecs are qualified on macOS; GIF and state/transport logic have portable tests.
+
+## Planning and Rust style
+
+Follow the [events → release candidates → features/bugs standard](docs/planning.md), using the issue templates and one priority label per issue. Research uses `proposal`; link its result to implementation work when ready.
+
+Document public types, fields, variants, traits and methods with rustdoc that explains behavior, ownership, failure and cancellation contracts where relevant. Give private symbols a short purpose or invariant comment; preserve safety explanations at native boundaries. Leave a blank line between declarations, functions and implementation blocks. Do not replace useful explanations with comments that merely repeat a symbol's name.
+
+Prefer methods and constructors on the type that owns the behavior. Free functions remain appropriate for Bevy systems, foreign callbacks and small utilities with no natural owner. Introduce traits at real interchangeable boundaries, use them from production call sites, and test alternate implementations against the same contract. Use typestate to restrict meaningful lifecycle operations to valid stages, keeping runtime checks for asynchronous or external failure. Avoid types or traits that only rename one helper.
 
 The shell includes the X11 libraries needed by the chosen Bevy window backend on Linux. Apple builds need the platform SDK and developer tools as described in the README. Do not add machine-specific SDK or Homebrew paths.
 
@@ -59,7 +78,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_conventional_commits.py' 
 
 ## Reference provenance
 
-The pinned nixpkgs and rust-overlay revisions and the idea of a Rust toolchain file were informed by Maybraid at commit `0d25b9777709253f572d22f74e227c630abf7353`. Maybraid's `LICENSE.md` is a source-available license, not an MIT license. No Maybraid source or documentation was copied; this implementation is independently written and Durop retains its MIT license. The shell deliberately has no automatic Git setup, game tooling, or deployment target overrides.
+The pinned nixpkgs and rust-overlay revisions, Rust toolchain file, crate boundaries and issue-planning conventions were informed by Maybraid at commit `0d25b9777709253f572d22f74e227c630abf7353`. Maybraid's `LICENSE.md` is a source-available license, not an MIT license. No Maybraid source or documentation was copied; this implementation is independently written and Durop retains its MIT license. The shell deliberately has no automatic Git setup, game tooling, or deployment target overrides.
 
 ## Infrastructure checks
 

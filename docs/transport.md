@@ -136,7 +136,7 @@ fresh snapshot. The UI must not persist pairing input or its online action queue
 
 ## Validation and remaining acceptance
 
-Run `nix develop --command cargo test --locked transport::tests`, followed by the
+Run `nix develop --command cargo test -p durop-transport --locked`, followed by the
 repository's formatting, locked check/test, and clippy commands. Real loopback sockets
 exercise successful authentication, rejection of credentials/origin/path/version,
 bounded connections and rates, malformed/oversized messages, catalog/icon scoping,

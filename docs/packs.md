@@ -85,7 +85,7 @@ In addition to the README's locked checks, run:
 
 ```sh
 nix develop --command python3 scripts/catalog-https-acceptance.py
-nix develop --command cargo test --locked catalog::cache_tests::https_public_export_acceptance -- --ignored --exact
+nix develop --command cargo test -p durop-catalog --locked cache_tests::https_public_export_acceptance -- --ignored --exact
 ```
 
 The first command requires host Python 3 and OpenSSL (not supplied by the current
