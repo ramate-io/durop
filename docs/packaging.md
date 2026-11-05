@@ -123,3 +123,20 @@ from Maybraid's packaging README; no Maybraid source or documentation was copied
 
 See [the session runbook](session-runbook.md) for local/host/controller operation
 and outstanding second-Mac acceptance.
+
+## Native validation record
+
+On November 4, 2026, the native path built the assembled app on an M4 Pro Mac
+mini running macOS 27.0.1, using official Rust 1.95.0 and Apple SDK 15.5, outside
+Nix. The first complete bundle passed ad-hoc signing/strict verification,
+recursive arm64/Mach-O validation (21 Apple/system dependencies, zero external
+non-system dependencies), and the clean-environment `--self-check` from `/tmp`,
+which reported the bundled Resources directory and four sample clips. The ZIP
+was approximately 21 MiB. Dependency notices covered 366 locked native-target
+packages plus the Rust standard library. Three native validator regressions and
+the runtime Git/Tailscale discovery tests passed.
+
+This records build, loader, signature and resource evidence. It does not claim
+Finder/GPU/audio playback, the oldest declared OS, a development-free second Mac,
+Gatekeeper acceptance, or live Tailscale connectivity. Final artifact hashes and
+source revision are supplied in each output's BUILD-INFO/VALIDATION/checksum files.

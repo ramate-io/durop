@@ -12,7 +12,7 @@ desktop; do not infer fullscreen-game support from desktop compositing.
    GIF, video-with-audio and alpha-video fixtures. Select **This Mac** and ensure
    the local host is running.
 2. Search titles/tags/categories, then click a clip. Its state/readiness and any
-   individual failure appear in the panel. Choose the target with **Display →**.
+   individual failure appear in the panel. Choose the target with **Display >**.
    Folder names supply initial categories; identity is independent of folder moves.
 3. Use per-instance Stop or **STOP ALL**. Escape stops all when focus is outside
    a text field; while editing, Escape first exits the field. Do not rely on a

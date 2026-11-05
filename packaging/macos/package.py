@@ -100,6 +100,8 @@ def main():
         # ICNS ic08 stores the existing 256px PNG verbatim. Native iconutil
         # decoding is covered separately; no pixel editing or borrowed artwork.
         icon=(ROOT / "assets/overlay-proof.png").read_bytes()
+        if len(icon)<24 or icon[:8]!=b"\x89PNG\r\n\x1a\n" or struct.unpack(">II",icon[16:24])!=(256,256):
+            raise RuntimeError("ICNS source must remain the authored 256px PNG")
         (resources / "Durop.icns").write_bytes(struct.pack(">4sI4sI",b"icns",16+len(icon),b"ic08",8+len(icon))+icon)
         plist = {
             "CFBundleIdentifier": BUNDLE_ID, "CFBundleName": "Durop", "CFBundleDisplayName": "Durop",
@@ -140,7 +142,12 @@ def main():
         # Cargo/asset-root/developer-path requirements without launching a GUI.
         smoke_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(staging / "smoke-home")}
         Path(smoke_env["HOME"]).mkdir()
-        run([executable, "--self-check"], cwd="/private/tmp", env=smoke_env, timeout=30)
+        smoke=capture([executable, "--self-check"], cwd="/private/tmp", env=smoke_env, timeout=30)
+        if f"resources={resources}" not in smoke or not re.search(r"clips=[1-9][0-9]*",smoke):
+            raise RuntimeError("self-check did not confirm the bundled resource root and nonempty sample pack")
+        if any(Path(smoke_env["HOME"]).iterdir()):
+            raise RuntimeError("read-only self-check unexpectedly wrote to its empty HOME")
+        print(smoke)
         run(["/usr/bin/codesign", "--verify", "--strict", "--deep", app])
         archive_name = f"Durop-{version}-macos-arm64.zip"
         archive = staging / archive_name
