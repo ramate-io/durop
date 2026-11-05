@@ -27,7 +27,7 @@ async fn fixture() -> Fixture {
         serde_json::json!({"clips":[{"id":"applause"}]}),
         BTreeMap::from([(
             "applause".into(),
-            b"\x89PNG\r\n\x1a\ntrusted-test-icon".to_vec(),
+            include_bytes!("../../assets/overlay-proof.png").to_vec(),
         )]),
     )
     .unwrap();
@@ -360,6 +360,38 @@ async fn production_rejects_loopback_wildcard_lan_and_unassigned_tailnet() {
 
 fn pairing_secret(session: &RemoteSession) -> SessionCredential {
     SessionCredential::from_secret(session.credential.bearer().to_string()).unwrap()
+}
+
+#[test]
+fn png_icon_dimensions_are_bounded_before_decode() {
+    let mut png = include_bytes!("../../assets/overlay-proof.png").to_vec();
+    assert!(valid_icon_png(&png));
+    png[16..20].copy_from_slice(&65536u32.to_be_bytes());
+    assert!(!valid_icon_png(&png));
+    assert!(
+        RemoteCatalog::new(
+            serde_json::json!({}),
+            BTreeMap::from([("huge".into(), png)])
+        )
+        .is_err()
+    );
+    assert!(!valid_icon_png(b"\x89PNG\r\n\x1a\n"));
+}
+
+#[tokio::test]
+async fn aborted_listener_task_revokes_observable_session_state() {
+    let fixture = fixture().await;
+    let mut client = connect(&fixture.session).await;
+    fixture.session.task.abort();
+    timeout(Duration::from_secs(2), async {
+        while fixture.session.is_active() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    disconnected(&mut client).await;
+    fixture.session.close().await;
 }
 
 #[tokio::test]

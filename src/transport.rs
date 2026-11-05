@@ -125,6 +125,20 @@ pub struct RemoteCatalog {
     metadata: Value,
     icons: BTreeMap<String, Vec<u8>>,
 }
+/// Bound decoded PNG allocation as well as compressed wire size.
+pub fn valid_icon_png(png: &[u8]) -> bool {
+    png.len() >= 33
+        && png.len() <= 32 * 1024
+        && png.starts_with(b"\x89PNG\r\n\x1a\n")
+        && png[8..12] == 13u32.to_be_bytes()
+        && &png[12..16] == b"IHDR"
+        && [
+            u32::from_be_bytes(png[16..20].try_into().unwrap()),
+            u32::from_be_bytes(png[20..24].try_into().unwrap()),
+        ]
+        .iter()
+        .all(|dimension| (1..=512).contains(dimension))
+}
 impl RemoteCatalog {
     pub fn new(metadata: Value, icons: BTreeMap<String, Vec<u8>>) -> Result<Self, TransportError> {
         if serde_json::to_vec(&metadata)
@@ -132,12 +146,9 @@ impl RemoteCatalog {
             .len()
             > 64 * 1024
             || icons.len() > 256
-            || icons.iter().any(|(id, png)| {
-                id.is_empty()
-                    || id.len() > 256
-                    || png.len() > 32 * 1024
-                    || !png.starts_with(b"\x89PNG\r\n\x1a\n")
-            })
+            || icons
+                .iter()
+                .any(|(id, png)| id.is_empty() || id.len() > 256 || !valid_icon_png(png))
         {
             return Err(TransportError::InvalidConfiguration);
         }
@@ -179,6 +190,9 @@ pub struct RemoteSession {
     task: JoinHandle<()>,
 }
 impl RemoteSession {
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
     pub fn revoke(&self) {
         self.active.store(false, Ordering::Release);
         self.revoke.send_replace(true);
@@ -213,6 +227,15 @@ pub async fn enable(
     )
 }
 
+#[cfg(test)]
+pub(crate) async fn enable_test_loopback(
+    bridge: HostBridge,
+    catalog: RemoteCatalog,
+) -> Result<RemoteSession, TransportError> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    start(listener, vec![], bridge, catalog, BindingGuard::Loopback)
+}
+
 fn start(
     listener: TcpListener,
     origins: Vec<String>,
@@ -237,7 +260,9 @@ fn start(
         catalog,
         session_id: session_id.clone(),
     });
+    let lifetime = ConnectionLifetime(active.clone());
     let task = tokio::spawn(async move {
+        let _lifetime = lifetime;
         let mut connections = JoinSet::new();
         let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let mut check = interval(Duration::from_secs(2));

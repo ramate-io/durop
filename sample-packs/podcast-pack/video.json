@@ -1,0 +1,18 @@
+{
+  "id": "video",
+  "title": "Flash and beep video",
+  "asset": "flash-beep.mp4",
+  "tags": [
+    "proof"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4000
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.25,
+    "fit": "contain"
+  }
+}
