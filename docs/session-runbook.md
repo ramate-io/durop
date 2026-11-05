@@ -38,7 +38,7 @@ remote Git LFS materialization are supported. See [pack format](packs.md).
 ## Host and remote controller
 
 Install and authorize Tailscale separately on both Macs. Durop uses its CLI for bounded read-only verification and discovers the
-standard installed macOS app executable even from Finder. Follow [the Tailscale runbook](../infra/cdktn/tailscale/README.md),
+standard installed macOS app executable even from Finder. Follow [the Tailscale runbook](https://github.com/ramate-io/durop/blob/main/infra/cdktn/tailscale/README.md),
 including its standalone macOS setup. Verify the configured identity/tags
 and narrow ACL policy. Durop does not enroll machines or apply tailnet policy.
 Do not expose the listener on a wildcard/LAN interface or through public

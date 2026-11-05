@@ -1,8 +1,8 @@
 # Independently authored media fixtures
 
 All signals, pixels and fixture generators in this directory and `scripts/media/`
-were authored for Durop. The fixture content is dedicated to the public domain
-under CC0 1.0; the generators remain covered by Durop's MIT license. No third-party
+were authored for Durop. The generated signal/video/GIF content is dedicated to the public domain
+under CC0 1.0; the generators and reused PNG icons retain Durop's MIT license. No third-party
 media was copied. These fixtures may be redistributed with Durop.
 
 This directory is also a schema-v1 pack (`packId: media-proof`) for host/panel

@@ -131,10 +131,12 @@ def main():
         shutil.copy2(rust_legal / "COPYRIGHT-library.html",resources / "notices/RUST-COPYRIGHT-library.html")
         if (rust_legal / "licenses").is_dir():
             shutil.copytree(rust_legal / "licenses",resources / "notices/rust-licenses")
-        for document in ("README.md", "docs/media-backend.md", "docs/packaging.md", "docs/session-runbook.md"):
-            source = ROOT / document
-            if source.is_file():
-                shutil.copy2(source, resources / source.name)
+        for document in ("README.md","CONTRIBUTING.md","LICENSE"):
+            shutil.copy2(ROOT/document,resources/document)
+        (resources/"docs").mkdir()
+        for source in (ROOT/"docs").glob("*.md"):
+            shutil.copy2(source,resources/"docs"/source.name)
+        shutil.copy2(ROOT/"fixtures/media/README.md",resources/"notices/SAMPLE-ASSETS.md")
         run(["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", app])
         validation=capture([sys.executable, ROOT / "packaging/macos/validate.py", app])
         json.loads(validation)
