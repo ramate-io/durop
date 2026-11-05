@@ -99,6 +99,7 @@ struct Model {
     network_initialized: bool,
     saved_preferences: Option<crate::preferences::Preferences>,
     modifiers: u8,
+    raw_modifiers: u8,
 }
 #[derive(Component, Clone)]
 enum UiAction {
@@ -302,6 +303,27 @@ fn buttons(
         }
     }
 }
+enum OrderedInput {
+    Modifiers(u8),
+    Keyboard(KeyboardInput),
+}
+fn ordered_keyboard(
+    events: impl IntoIterator<Item = OrderedInput>,
+    modifiers: &mut u8,
+) -> Vec<(KeyboardInput, bool)> {
+    let mut keys = Vec::new();
+    for event in events {
+        match event {
+            OrderedInput::Modifiers(value) => *modifiers = value,
+            OrderedInput::Keyboard(key) => keys.push((key, *modifiers != 0)),
+        }
+    }
+    keys
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The editor combines ordered raw modifier flags, Bevy IME and window state"
+)]
 fn text_input(
     mut keys: MessageReader<KeyboardInput>,
     mut ime: MessageReader<Ime>,
@@ -310,13 +332,17 @@ fn text_input(
     runtime: Res<Runtime>,
     mut actions: ResMut<Actions>,
     _main: bevy::ecs::system::NonSendMarker,
+    mut raw: MessageReader<bevy::winit::RawWinitWindowEvent>,
+    native: Option<NonSend<bevy::winit::WinitWindows>>,
 ) {
     let (entity, mut window) = primary.into_inner();
     window.ime_enabled = model.focus.is_some();
     if !window.focused {
         model.modifiers = 0;
+        model.raw_modifiers = 0;
         keys.clear();
         ime.clear();
+        raw.clear();
         return;
     }
     let mut committed = false;
@@ -341,7 +367,42 @@ fn text_input(
             _ => (),
         }
     }
-    for key in keys.read() {
+    let native_id = native
+        .as_ref()
+        .and_then(|windows| windows.entity_to_winit.get(&entity))
+        .copied();
+    let mut raw_steps = Vec::new();
+    for event in raw.read() {
+        if Some(event.window_id) != native_id {
+            continue;
+        }
+        match &event.event {
+            winit::event::WindowEvent::ModifiersChanged(modifiers) => {
+                let flags = modifiers.state();
+                raw_steps.push(OrderedInput::Modifiers(
+                    u8::from(flags.super_key()) | u8::from(flags.control_key()) << 2,
+                ));
+            }
+            winit::event::WindowEvent::KeyboardInput { event, .. } => {
+                raw_steps.push(OrderedInput::Keyboard(
+                    bevy::winit::converters::convert_keyboard_input(event, entity),
+                ))
+            }
+            winit::event::WindowEvent::Focused(false) => raw_steps.push(OrderedInput::Modifiers(0)),
+            _ => (),
+        }
+    }
+    let ordered = ordered_keyboard(raw_steps, &mut model.raw_modifiers);
+    let input: Vec<_> = if ordered.is_empty() {
+        keys.read().cloned().map(|key| (key, None)).collect()
+    } else {
+        keys.clear();
+        ordered
+            .into_iter()
+            .map(|(key, modified)| (key, Some(modified)))
+            .collect()
+    };
+    for (key, raw_modified) in input {
         if key.window != entity {
             continue;
         }
@@ -365,7 +426,7 @@ fn text_input(
         if let Some(field) = model.focus {
             // Preserve modifier ordering even if key-down and key-up arrive in
             // one update, when ButtonInput already contains the final state.
-            let modified = model.modifiers != 0;
+            let modified = raw_modified.unwrap_or(model.modifiers != 0);
             let edit = match field {
                 Field::Search => &mut model.query,
                 Field::Pack => &mut model.pack,
@@ -411,7 +472,7 @@ fn text_input(
                 _ => (),
             }
             model.first_row = 0;
-        } else if !key.repeat && model.modifiers == 0 {
+        } else if !key.repeat && !raw_modified.unwrap_or(model.modifiers != 0) {
             match key.logical_key {
                 Key::Escape => actions.0.push_back(Action::StopAll),
                 Key::Space if runtime.destination == Destination::Local => {
@@ -479,7 +540,10 @@ fn render(
     }
     let remote = runtime.destination == Destination::Remote;
     let preferences = crate::preferences::Preferences {
-        pack: runtime.pack_input.clone(),
+        pack: crate::preferences::stored_pack(
+            &runtime.pack_input,
+            &crate::app::resource_root().join("sample-packs/podcast-pack"),
+        ),
         query: model.query.text.clone(),
         display: runtime.display,
     };
@@ -635,6 +699,7 @@ mod tests {
             .init_resource::<ButtonInput<KeyCode>>()
             .add_message::<KeyboardInput>()
             .add_message::<Ime>()
+            .add_message::<bevy::winit::RawWinitWindowEvent>()
             .add_systems(Update, text_input);
         let window = app
             .world_mut()
@@ -720,6 +785,120 @@ mod tests {
         app.update();
         assert_eq!(app.world().resource::<Model>().query.text, "video");
         assert!(app.world().resource::<Actions>().0.is_empty());
+    }
+    #[test]
+    fn flag_only_modifiers_apply_to_the_ordered_key_without_physical_modifier_events() {
+        let entity = Entity::PLACEHOLDER;
+        let key = |text: &str, code| KeyboardInput {
+            window: entity,
+            key_code: code,
+            logical_key: Key::Character(text.into()),
+            text: Some(text.into()),
+            state: ButtonState::Pressed,
+            repeat: false,
+        };
+        let mut flags = 0;
+        let keys = ordered_keyboard(
+            [
+                OrderedInput::Modifiers(1),
+                OrderedInput::Keyboard(key("a", KeyCode::KeyA)),
+                OrderedInput::Modifiers(0),
+                OrderedInput::Keyboard(key("g", KeyCode::KeyG)),
+            ],
+            &mut flags,
+        );
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].1);
+        assert!(!keys[1].1);
+        assert_eq!(flags, 0);
+        let mut query = Editor::default();
+        query.insert("video");
+        for (key, modified) in keys {
+            if modified && key.key_code == KeyCode::KeyA {
+                query.select_all = true;
+            } else if !modified {
+                query.insert(key.text.as_deref().unwrap());
+            }
+        }
+        assert_eq!(query.text, "g");
+    }
+    #[test]
+    fn pressed_stop_all_button_routes_to_shared_host_and_truthful_request_status() {
+        // Exercise UI routing and host policy; native teardown is separately acknowledged.
+        let mut runtime = Runtime::new(&config()).unwrap();
+        let catalog = std::sync::Arc::new(
+            crate::catalog::load_local(
+                &crate::app::resource_root().join("sample-packs/podcast-pack"),
+            )
+            .unwrap(),
+        );
+        runtime.catalog = catalog.clone();
+        runtime.host = crate::host::Host::new("ui-test".into(), catalog.clone());
+        runtime.destination = Destination::Local;
+        let envelope = crate::commands::Envelope {
+            protocol_version: 1,
+            session_id: "ui-test".into(),
+            command_id: "play".into(),
+            catalog_revision: catalog.revision.clone(),
+            command: crate::commands::PlaybackCommand::Play {
+                clip_id: catalog.clips[0].identity.clone(),
+            },
+        };
+        runtime.host.accept(envelope);
+        let token = runtime
+            .host
+            .drain_effects()
+            .into_iter()
+            .find_map(|effect| {
+                if let crate::host::BackendEffect::Prepare { token, .. } = effect {
+                    Some(token)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        for event in [
+            crate::host::BackendEventKind::Prepared,
+            crate::host::BackendEventKind::Started,
+        ] {
+            runtime.host.backend_event(crate::host::BackendEvent {
+                token: token.clone(),
+                event,
+            });
+        }
+        runtime.snapshot = runtime.host.snapshot();
+        let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+        let mut app = App::new();
+        app.insert_resource(runtime)
+            .insert_resource(network)
+            .init_resource::<Model>()
+            .init_resource::<Actions>()
+            .add_systems(Update, buttons);
+        app.world_mut()
+            .spawn((Interaction::Pressed, UiAction::Runtime(Action::StopAll)));
+        app.update();
+        assert!(matches!(
+            app.world_mut().resource_mut::<Actions>().0.pop_front(),
+            Some(Action::StopAll)
+        ));
+        app.world_mut()
+            .resource_scope(|world, mut runtime: Mut<Runtime>| {
+                let mut network = world.resource_mut::<crate::network_app::NetworkState>();
+                runtime.request_stop_all(&mut network);
+                assert!(runtime.status.starts_with("Stop all requested"));
+                network.accept_for_ui_test(&mut runtime.host);
+                assert_eq!(
+                    runtime.host.snapshot().instances[0].state,
+                    crate::commands::InstanceState::Stopping
+                );
+                assert!(
+                    runtime
+                        .host
+                        .drain_effects()
+                        .iter()
+                        .any(|effect| matches!(effect, crate::host::BackendEffect::Stop { .. }))
+                );
+            });
     }
     #[test]
     fn actual_ime_messages_keep_preedit_uncommitted_and_commit_only_once() {

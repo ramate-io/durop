@@ -5,6 +5,32 @@ use std::{
     path::{Path, PathBuf},
 };
 const LIMIT: usize = 16 * 1024;
+const BUNDLED_PACK: &str = "@bundled/podcast-pack";
+fn legacy_bundled_pack(source: &str) -> bool {
+    let path = Path::new(source);
+    path.is_absolute()
+        && path.ends_with("Contents/Resources/sample-packs/podcast-pack")
+        && path
+            .ancestors()
+            .nth(4)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name.to_string_lossy().ends_with(".app"))
+}
+pub fn stored_pack(source: &str, current_default: &Path) -> String {
+    if Path::new(source) == current_default || source == BUNDLED_PACK || legacy_bundled_pack(source)
+    {
+        BUNDLED_PACK.into()
+    } else {
+        source.into()
+    }
+}
+pub fn resolved_pack(source: &str, current_default: &Path) -> PathBuf {
+    if source.is_empty() || source == BUNDLED_PACK || legacy_bundled_pack(source) {
+        current_default.into()
+    } else {
+        source.into()
+    }
+}
 #[derive(Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Preferences {
@@ -93,6 +119,23 @@ fn save_at(path: &Path, preferences: &Preferences) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn relocated_bundle_defaults_follow_current_resources_and_external_packs_stay_exact() {
+        let old = "/tmp/DuropSmoke.app/Contents/Resources/sample-packs/podcast-pack";
+        let current =
+            Path::new("/Applications/Durop.app/Contents/Resources/sample-packs/podcast-pack");
+        assert_eq!(stored_pack(old, current), BUNDLED_PACK);
+        assert_eq!(resolved_pack(old, current), current);
+        assert_eq!(resolved_pack(BUNDLED_PACK, current), current);
+        for external in [
+            "/Users/me/packs/podcast-pack",
+            "/Users/me/Contents/Resources/sample-packs/podcast-pack",
+            "https://example.com/pack.git#main",
+        ] {
+            assert_eq!(stored_pack(external, current), external);
+            assert_eq!(resolved_pack(external, current), Path::new(external));
+        }
+    }
     #[test]
     fn bounded_atomic_preferences_preserve_only_local_settings() {
         let root =
