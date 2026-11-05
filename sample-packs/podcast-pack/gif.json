@@ -1,0 +1,18 @@
+{
+  "id": "gif",
+  "title": "Transparent disposal GIF",
+  "asset": "disposal.gif",
+  "tags": [
+    "proof"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4000
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.25,
+    "fit": "contain"
+  }
+}

@@ -1,0 +1,62 @@
+[
+  {
+    "name": "event",
+    "color": "2ea44f",
+    "description": "A dated demonstration, release or acceptance milestone."
+  },
+  {
+    "name": "release-candidate",
+    "color": "0e8a8a",
+    "description": "A usable version with explicit acceptance criteria and linked events."
+  },
+  {
+    "name": "feature",
+    "color": "a2eeef",
+    "description": "A requested capability linked to a release candidate."
+  },
+  {
+    "name": "bug",
+    "color": "d73a4a",
+    "description": "A reproducible defect linked to a release candidate."
+  },
+  {
+    "name": "proposal",
+    "color": "d4c5f9",
+    "description": "Research or a design decision needed before implementation."
+  },
+  {
+    "name": "docs",
+    "color": "0075ca",
+    "description": "Documentation work."
+  },
+  {
+    "name": "delivery",
+    "color": "bfd4f2",
+    "description": "Build, packaging or distribution work."
+  },
+  {
+    "name": "validation",
+    "color": "c5def5",
+    "description": "Tests, measurements or acceptance evidence."
+  },
+  {
+    "name": "priority:low",
+    "color": "c2e0c6",
+    "description": "Work after higher-priority items."
+  },
+  {
+    "name": "priority:medium",
+    "color": "fbca04",
+    "description": "Normal planned work."
+  },
+  {
+    "name": "priority:high",
+    "color": "f9a03f",
+    "description": "Prioritize ahead of normal planned work."
+  },
+  {
+    "name": "priority:urgent",
+    "color": "b60205",
+    "description": "Immediate work that takes precedence over other priorities."
+  }
+]

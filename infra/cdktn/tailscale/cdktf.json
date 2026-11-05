@@ -1,0 +1,12 @@
+{
+  "language": "python",
+  "app": "uv run --locked --no-sync python main.py synth",
+  "codeMakerOutput": "imports",
+  "terraformProviders": [
+    "tailscale/tailscale@=0.29.2"
+  ],
+  "targetVersions": {
+    "opentofu": ">=1.8.0"
+  },
+  "projectId": "dc9995f4-bbac-4a1b-8e1a-b95e3d42a018"
+}

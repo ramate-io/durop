@@ -1,0 +1,41 @@
+name: "Proposal"
+description: "Investigate a design or uncertain requirement."
+title: ""
+labels: [proposal]
+body:
+  - type: markdown
+    attributes:
+      value: "Follow the planning standard in docs/planning.md. A maintainer applies the chosen priority label during triage."
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - "priority:low"
+        - "priority:medium"
+        - "priority:high"
+        - "priority:urgent"
+      default: 1
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: "Problem"
+      description: "What decision is needed and what constraints matter?"
+    validations:
+      required: true
+  - type: textarea
+    id: candidate
+    attributes:
+      label: "Related work"
+      description: "Link the candidate/event or implementation issues motivating the investigation."
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: "Decision evidence"
+      description: "Describe alternatives, measurements and the document or issue that will record the result."
+    validations:
+      required: true

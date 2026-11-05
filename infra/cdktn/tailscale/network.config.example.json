@@ -1,0 +1,11 @@
+{
+  "policy": {
+    "groups": {"group:durop-controllers": ["cohost@example.com"]},
+    "hosts": {"durop-host": "100.100.0.10"},
+    "grants": [{"src": ["group:durop-controllers"], "dst": ["durop-host"], "ip": ["tcp:48732"]}],
+    "tests": [
+      {"src": "cohost@example.com", "accept": ["durop-host:48732"]},
+      {"src": "unauthorized@example.com", "deny": ["durop-host:48732"]}
+    ]
+  }
+}

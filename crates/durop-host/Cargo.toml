@@ -1,0 +1,11 @@
+[package]
+name = "durop-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+durop-protocol.workspace = true
+durop-catalog.workspace = true
+tokio = { version = "1.48", features = ["sync"] }

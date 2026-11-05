@@ -1,3 +1,18 @@
 /target/
 /.direnv/
 /result
+
+# Infrastructure private inputs, generated output and provider working data.
+**/.venv/
+**/node_modules/
+**/__pycache__/
+**/cdktf.out/
+**/.terraform/
+**/network.config.json
+**/*.tfstate*
+**/*.tfplan
+**/reviewed.json
+**/.env
+
+# Native distributable outputs.
+/dist/

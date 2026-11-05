@@ -1,0 +1,21 @@
+[package]
+name = "durop-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+durop-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3.34", features = ["sink"] }
+getrandom = "0.4.3"
+if-addrs = "0.14"
+subtle = "2.6"

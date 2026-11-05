@@ -1,0 +1,48 @@
+name: "Event"
+description: "Plan a dated demonstration or acceptance milestone."
+title: "Event: "
+labels: [event]
+body:
+  - type: markdown
+    attributes:
+      value: "Follow the planning standard in docs/planning.md. A maintainer applies the chosen priority label during triage."
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - "priority:low"
+        - "priority:medium"
+        - "priority:high"
+        - "priority:urgent"
+      default: 1
+    validations:
+      required: true
+  - type: textarea
+    id: date
+    attributes:
+      label: "Target date"
+      description: "A date in YYYY-MM-DD form, or TBD with the scheduling dependency."
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: "Summary"
+      description: "What must be demonstrated, to whom, and why?"
+    validations:
+      required: true
+  - type: textarea
+    id: candidates
+    attributes:
+      label: "Release candidates"
+      description: "Link the candidate issues supporting this event; use TBD and name the owner if not yet scheduled."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: "Acceptance evidence"
+      description: "List observable success criteria and who records the evidence."
+    validations:
+      required: true

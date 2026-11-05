@@ -1,0 +1,41 @@
+name: "Feature"
+description: "Request behavior for a release candidate."
+title: ""
+labels: [feature]
+body:
+  - type: markdown
+    attributes:
+      value: "Follow the planning standard in docs/planning.md. A maintainer applies the chosen priority label during triage."
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - "priority:low"
+        - "priority:medium"
+        - "priority:high"
+        - "priority:urgent"
+      default: 1
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: "Summary"
+      description: "Describe the requested behavior and why it is needed."
+    validations:
+      required: true
+  - type: textarea
+    id: candidate
+    attributes:
+      label: "Release candidate"
+      description: "Link the candidate issue, or explain the pending scheduling decision."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: "Acceptance criteria"
+      description: "Describe observable success and relevant regression checks."
+    validations:
+      required: true
