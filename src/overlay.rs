@@ -18,39 +18,72 @@ use std::{
 #[path = "overlay_macos.rs"]
 mod macos;
 
+/// Render layer reserved for the control panel.
 pub const PANEL_LAYER: usize = 1;
+
+/// Render layer reserved for transparent playback and proof fixtures.
 pub(crate) const OVERLAY_LAYER: usize = 2;
+
+/// Summarize playback visibility and progress needs for the window adapter.
 #[derive(Resource, Default)]
 pub(crate) struct PlaybackOverlay {
+    /// Whether any playback sprite requires a visible overlay.
     pub visible: bool,
+    /// Whether playback or native callbacks need continued update ticks.
     pub busy: bool,
 }
+
+/// Mark the transparent click-through playback window.
 #[derive(Component)]
 pub struct OverlayWindow;
+
+/// Mark the camera that renders only the overlay layer.
 #[derive(Component)]
 pub(crate) struct OverlayCamera;
+
+/// Mark the built-in compositing proof sprite.
 #[derive(Component)]
 pub(crate) struct Fixture;
+
+/// Mark a window whose platform-specific overlay policy has been installed.
 #[derive(Component)]
 pub(super) struct NativeReady;
+
+/// Collect window/display intents for the next ordered update.
 #[derive(Resource, Default)]
 pub struct PendingControls(pub Vec<Control>);
+
+/// Receive optional proof controls without blocking the render thread.
 #[derive(Resource)]
 pub struct Controls(pub Mutex<Receiver<Control>>);
+
+/// Window and display commands independent of playback policy.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Control {
+    /// Start the timed compositing proof.
     Show,
+    /// Show the proof until explicitly stopped.
     Hold,
+    /// Hide the proof without changing host playback policy.
     Stop,
+    /// Restore the panel window.
     ShowPanel,
+    /// Hide the panel if a safe control path remains.
     HidePanel,
+    /// Cycle to the next currently connected display.
     NextDisplay,
+    /// Print the current display inventory.
     Displays,
+    /// Select a display by its current index.
     Display(usize),
+    /// Request proof-mode exit.
     Quit,
+    /// Record loss of the stdin control path.
     TerminalClosed,
 }
+
 impl Control {
+    /// Parse the exact proof-terminal grammar; reject unknown or malformed commands.
     pub fn parse(line: &str) -> Option<Self> {
         Some(match line.trim() {
             "show" => Self::Show,
@@ -68,14 +101,21 @@ impl Control {
         })
     }
 }
+
+/// Track the selected monitor, proof animation and terminal availability.
 #[derive(Resource, Default)]
 pub(crate) struct OverlayState {
+    /// Selected monitor entity, cleared when unplugged.
     target: Option<Entity>,
+    /// Whether the compositing proof was requested.
     visible: bool,
+    /// Start time of the optional proof animation.
     animation: Option<Instant>,
+    /// Whether stdin can no longer restore a hidden panel.
     terminal_closed: bool,
 }
 
+/// Install display selection, transparent rendering and platform window policy.
 pub struct OverlayPlugin;
 impl Plugin for OverlayPlugin {
     fn build(&self, app: &mut App) {
@@ -95,12 +135,16 @@ impl Plugin for OverlayPlugin {
         app.add_systems(PreUpdate, mark_ready);
     }
 }
+
+/// Sleep until input while the overlay has no animation or playback work.
 fn idle_settings() -> WinitSettings {
     WinitSettings {
         focused_mode: UpdateMode::reactive_low_power(Duration::MAX),
         unfocused_mode: UpdateMode::reactive_low_power(Duration::MAX),
     }
 }
+
+/// Create a hidden nonactivating overlay and its isolated camera/fixture.
 fn setup(mut commands: Commands, assets: Res<AssetServer>) {
     let window = commands
         .spawn((
@@ -143,6 +187,8 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
         Fixture,
     ));
 }
+
+/// Complete the portable window setup when no AppKit policy is needed.
 #[cfg(not(target_os = "macos"))]
 #[expect(
     clippy::type_complexity,
@@ -163,8 +209,10 @@ fn mark_ready(
         commands.entity(window).insert(NativeReady);
     }
 }
+
 // Bevy 0.19 creates Monitor components once, but does not refresh their
 // geometry for an existing native monitor. Refresh from the same backend handles.
+/// Refresh physical monitor bounds after display configuration changes.
 fn refresh_monitor_geometry(
     backend: Res<WinitMonitors>,
     mut monitors: Query<(Entity, &mut Monitor)>,
@@ -187,6 +235,8 @@ fn refresh_monitor_geometry(
         }
     }
 }
+
+/// Drain available terminal controls into the ordered application queue.
 fn read_controls(controls: Option<Res<Controls>>, mut pending: ResMut<PendingControls>) {
     if let Some(controls) = controls {
         pending.0.extend(
@@ -198,6 +248,8 @@ fn read_controls(controls: Option<Res<Controls>>, mut pending: ResMut<PendingCon
         );
     }
 }
+
+/// Apply panel visibility and monitor choices without hiding the only available stop control.
 #[expect(
     clippy::too_many_arguments,
     reason = "Bevy declares independent window and control resources as system parameters"
@@ -287,6 +339,7 @@ pub(crate) fn apply_controls(
     }
 }
 
+/// Reconcile playback/proof visibility, monitor changes and event-loop wake behavior.
 #[expect(
     clippy::too_many_arguments,
     reason = "Overlay synchronization reads native readiness and display/render resources together"
@@ -375,6 +428,8 @@ pub(crate) fn sync_overlay(
         *settings = mode;
     }
 }
+
+/// Reject invalid monitor scale/size and preserve physical pixels in logical geometry.
 fn display_bounds(size: UVec2, scale: f64) -> Option<(UVec2, f32)> {
     (size.x > 0 && size.y > 0 && scale.is_finite() && scale > 0.0 && scale <= f32::MAX as f64)
         .then_some((size, scale as f32))

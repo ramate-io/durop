@@ -20,27 +20,41 @@ use std::{
     time::Duration,
 };
 
+/// Select which application roles are active at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// Run the panel and local playback host.
     Local,
+    /// Run the local host with the panel initially hidden.
     Host,
+    /// Control another host without loading a local media pack.
     Controller,
 }
+
+/// Launch configuration resolved from benign preferences and explicit command-line arguments.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Roles enabled at startup.
     pub mode: Mode,
+    /// Local pack path or encoded Git source.
     pub pack: PathBuf,
+    /// Preferred overlay monitor index.
     pub display: Option<usize>,
+    /// Explicit remote WebSocket endpoint; no credential is embedded.
     pub connect: Option<String>,
+    /// Explicit local Tailscale address for the host listener.
     pub listen: Option<String>,
+    /// New capture file to create, if timing capture is requested.
     pub diagnostics: Option<PathBuf>,
 }
+
 impl Config {
+    /// Parse startup options without accepting session credentials on the command line.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let preferences = crate::preferences::load();
+        let preferences = crate::preferences::Preferences::load();
         let mut config = Self {
             mode: Mode::Local,
-            pack: crate::preferences::resolved_pack(
+            pack: crate::preferences::Preferences::resolved_pack(
                 &preferences.pack,
                 &resource_root().join("sample-packs/podcast-pack"),
             ),
@@ -53,19 +67,30 @@ impl Config {
         while let Some(arg) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
             match arg.as_str() {
-                "--mode" => config.mode=match value()?.as_str(){"local"=>Mode::Local,"host"=>Mode::Host,"controller"=>Mode::Controller,_=>return Err("mode must be local, host or controller".into())},
-                "--pack"=>config.pack=value()?.into(),
-                "--display"=>config.display=Some(value()?.parse().map_err(|_|"display must be a nonnegative index")?),
-                "--connect"=>config.connect=Some(value()?),
-                "--listen-tailscale"=>config.listen=Some(value()?),
-                "--diagnostics"=>config.diagnostics=Some(value()?.into()),
-                "--help"|"-h"=>return Err("durop [--mode local|host|controller] [--pack DIRECTORY] [--display INDEX] [--connect ws://HOST:48732/control] [--listen-tailscale IP:PORT] [--diagnostics NEW_JSONL_FILE]".into()),
-                _=>return Err(format!("unknown option {arg}")),
+                "--mode" => {
+                    config.mode = match value()?.as_str() {
+                        "local" => Mode::Local,
+                        "host" => Mode::Host,
+                        "controller" => Mode::Controller,
+                        _ => return Err("mode must be local, host or controller".into()),
+                    };
+                }
+                "--pack" => config.pack = value()?.into(),
+                "--display" => {
+                    config.display = Some(value()?.parse().map_err(|_| "display must be a nonnegative index")?);
+                }
+                "--connect" => config.connect = Some(value()?),
+                "--listen-tailscale" => config.listen = Some(value()?),
+                "--diagnostics" => config.diagnostics = Some(value()?.into()),
+                "--help" | "-h" => return Err("durop [--mode local|host|controller] [--pack DIRECTORY] [--display INDEX] [--connect ws://HOST:48732/control] [--listen-tailscale IP:PORT] [--diagnostics NEW_JSONL_FILE]".into()),
+                _ => return Err(format!("unknown option {arg}")),
             }
         }
         Ok(config)
     }
 }
+
+/// Locate packaged Resources beside the executable, or the source root during development.
 pub fn resource_root() -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
         && let Some(directory) = exe.parent()
@@ -76,85 +101,141 @@ pub fn resource_root() -> PathBuf {
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
-fn pack_source(value: &str) -> Result<PackSource, String> {
-    if let Some(value) = value.strip_prefix("git+file://") {
-        let (path, reference) = value
-            .rsplit_once('#')
-            .ok_or("local Git pack requires git+file://PATH#REF")?;
-        Ok(PackSource::LocalGit {
-            path: path.into(),
-            reference: reference.into(),
-        })
-    } else if value.starts_with("https://") {
-        let (url, reference) = value.rsplit_once('#').unwrap_or((value, "HEAD"));
-        Ok(PackSource::HttpsGit {
-            url: url.into(),
-            reference: reference.into(),
-        })
-    } else {
-        Ok(PackSource::LocalDirectory(value.into()))
+
+impl Config {
+    /// Interpret a local directory or an explicit Git source and reference.
+    fn pack_source(value: &str) -> Result<PackSource, String> {
+        if let Some(value) = value.strip_prefix("git+file://") {
+            let (path, reference) = value
+                .rsplit_once('#')
+                .ok_or("local Git pack requires git+file://PATH#REF")?;
+            Ok(PackSource::LocalGit {
+                path: path.into(),
+                reference: reference.into(),
+            })
+        } else if value.starts_with("https://") {
+            let (url, reference) = value.rsplit_once('#').unwrap_or((value, "HEAD"));
+            Ok(PackSource::HttpsGit {
+                url: url.into(),
+                reference: reference.into(),
+            })
+        } else {
+            Ok(PackSource::LocalDirectory(value.into()))
+        }
     }
 }
+
+/// Choose the host that receives newly requested playback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Destination {
+    /// Send new playback to this process’s host.
     Local,
+    /// Send new playback to the authenticated remote host.
     Remote,
 }
+
+/// User intent routed through the shared application command path.
 #[derive(Debug, Clone)]
 pub enum Action {
+    /// Request playback of a stable clip identifier.
     Play(String),
+    /// Stop one host occurrence.
     Stop(String),
+    /// Stop all local playback and the selected remote host.
     StopAll,
+    /// Enable or disable remote access to the local host.
     ToggleHost,
+    /// Hide the panel while preserving a usable stop/reopen path.
     Hide,
+    /// Show the control panel.
     Show,
+    /// Stop playback and finish orderly application shutdown.
     Quit,
+    /// Prepare a source asynchronously before replacing the active catalog.
     LoadPack(String),
+    /// Choose the destination for subsequent playback.
     Destination(Destination),
+    /// Cycle the overlay’s selected monitor.
     NextDisplay,
 }
+
+/// Ordered pending user actions collected from the panel and native callbacks.
 #[derive(Resource, Default)]
 pub struct Actions(pub VecDeque<Action>);
+
+/// Track whether the native Dock callback can restore a hidden panel.
 #[derive(Resource, Default)]
 pub struct ReopenSupport(pub bool);
+
+/// Own one occurrence’s decoder, render resources and generation token.
 struct Playback {
+    /// Host generation identity used to reject stale callbacks.
     token: BackendToken,
+    /// Bounded decoder worker for this occurrence.
     worker: MediaWorker,
+    /// Immutable metadata and file paths pinned for this playback.
     clip: Clip,
+    /// Texture handle reused as decoded frames arrive.
     image: Option<Handle<Image>>,
+    /// Overlay entity presenting the current texture.
     sprite: Option<Entity>,
+    /// Deferred preparation/decode failure to report to the host.
     failure: Option<String>,
+    /// Most recently published frame dimensions.
     dimensions: UVec2,
 }
+
+/// Application adapter joining the authoritative host, immutable catalog and per-occurrence media workers.
 #[derive(Resource)]
 pub struct Runtime {
+    /// Authoritative local command and lifecycle state.
     pub host: Host,
+    /// Last published local host view.
     pub snapshot: crate::commands::HostSnapshot,
+    /// Pinned active catalog shared with the host.
     pub catalog: Arc<Catalog>,
+    /// Startup role selection.
     pub mode: Mode,
+    /// Target host for newly requested playback.
     pub destination: Destination,
+    /// Whether the local pack is usable for playback.
     pub enabled: bool,
+    /// Current user-facing application status.
     pub status: String,
+    /// Last playback errors keyed by clip identity.
     pub errors: BTreeMap<String, String>,
+    /// Editable source string displayed in the panel.
     pub pack_input: String,
+    /// Whether a pack refresh is outstanding.
     pub loading: bool,
+    /// Whether stdin can provide a fallback control path.
     pub terminal_active: bool,
+    /// Selected monitor index persisted as a benign preference.
     pub display: Option<usize>,
+    /// Live occurrences and their owned decoder/render resources.
     workers: BTreeMap<String, Playback>,
+    /// Monotonic local command identifier suffix.
     next_command: u64,
+    /// Whether exit is waiting for all playback resources to stop.
     quitting: bool,
+    /// Whether host changes require a new published snapshot.
     snapshot_dirty: bool,
+    /// Receive completed asynchronous catalog preparations.
     load_rx: Mutex<mpsc::Receiver<Result<Arc<Catalog>, String>>>,
+    /// Publish prepared catalogs from the background loader.
     load_tx: mpsc::Sender<Result<Arc<Catalog>, String>>,
 }
-fn private_root() -> PathBuf {
-    crate::preferences::cache_dir()
-}
-fn session_id() -> String {
-    // UUID randomness comes from the OS, never from controller input.
-    bevy::asset::uuid::Uuid::new_v4().to_string()
-}
+
 impl Runtime {
+    /// Generate an unpredictable local host session identifier from operating-system randomness.
+    fn session_id() -> String {
+        // UUID randomness comes from the OS, never from controller input.
+        bevy::asset::uuid::Uuid::new_v4().to_string()
+    }
+}
+
+impl Runtime {
+    /// Initialize the requested role; retain catalog errors as recoverable panel state.
     pub fn new(config: &Config) -> Result<Self, String> {
         let empty = || {
             Arc::new(Catalog {
@@ -171,8 +252,8 @@ impl Runtime {
         let result = if config.mode == Mode::Controller {
             Ok(empty())
         } else {
-            pack_source(&config.pack.to_string_lossy()).and_then(|source| {
-                CatalogCache::new(private_root().join("packs"))
+            Config::pack_source(&config.pack.to_string_lossy()).and_then(|source| {
+                CatalogCache::new(crate::preferences::Preferences::cache_dir().join("packs"))
                     .and_then(|cache| cache.prepare(&source))
                     .map_err(|e| e.to_string())
             })
@@ -180,7 +261,7 @@ impl Runtime {
         let failure = result.as_ref().err().cloned();
         let catalog = result.unwrap_or_else(|_| empty());
         let (load_tx, load_rx) = mpsc::channel();
-        let host = Host::new(session_id(), catalog.clone());
+        let host = Host::new(Runtime::session_id(), catalog.clone());
         let snapshot = host.snapshot();
         Ok(Self {
             host,
@@ -213,6 +294,8 @@ impl Runtime {
             load_tx,
         })
     }
+
+    /// Wrap a local command with the active session/revision and attempt bounded admission.
     fn submit(&mut self, command: PlaybackCommand, network: &mut crate::network_app::NetworkState) {
         self.next_command += 1;
         let envelope = Envelope {
@@ -226,6 +309,8 @@ impl Runtime {
             self.status = format!("Queue admission failed: {reason:?}");
         }
     }
+
+    /// Request local cleanup and, when selected, a remote stop without claiming completion.
     pub(crate) fn request_stop_all(&mut self, network: &mut crate::network_app::NetworkState) {
         self.status = "Stop all requested; waiting for playback resources to stop".into();
         if self.destination == Destination::Remote {
@@ -237,11 +322,14 @@ impl Runtime {
         }
         self.submit(PlaybackCommand::StopAll, network);
     }
+
+    /// Keep the event loop active while playback or orderly shutdown needs progress.
     pub fn busy(&self) -> bool {
         !self.workers.is_empty() || self.quitting
     }
 }
 
+/// Schedule user actions, media callbacks and native reopen support in dependency order.
 pub struct RuntimePlugin;
 impl Plugin for RuntimePlugin {
     fn build(&self, app: &mut App) {
@@ -258,6 +346,8 @@ impl Plugin for RuntimePlugin {
             .add_systems(Update, crate::app_macos::poll.before(actions));
     }
 }
+
+/// Apply queued user intents and asynchronous catalog results on the application thread.
 #[expect(
     clippy::too_many_arguments,
     reason = "Bevy declares independent ECS resources as system parameters"
@@ -379,10 +469,12 @@ pub(crate) fn actions(
                 let tx = runtime.load_tx.clone();
                 let proxy = (**proxy).clone();
                 std::thread::spawn(move || {
-                    let result = pack_source(&path).and_then(|source| {
-                        CatalogCache::new(private_root().join("packs"))
-                            .and_then(|cache| cache.prepare(&source))
-                            .map_err(|e| e.to_string())
+                    let result = Config::pack_source(&path).and_then(|source| {
+                        CatalogCache::new(
+                            crate::preferences::Preferences::cache_dir().join("packs"),
+                        )
+                        .and_then(|cache| cache.prepare(&source))
+                        .map_err(|e| e.to_string())
                     });
                     let _ = tx.send(result);
                     let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
@@ -397,7 +489,7 @@ pub(crate) fn actions(
             runtime.loading = false;
             match result {
                 Ok(catalog) => {
-                    runtime.host = Host::new(session_id(), catalog.clone());
+                    runtime.host = Host::new(Runtime::session_id(), catalog.clone());
                     runtime.snapshot = runtime.host.snapshot();
                     runtime.snapshot_dirty = true;
                     runtime.catalog = catalog;
@@ -413,6 +505,7 @@ pub(crate) fn actions(
     }
 }
 
+/// Translate host effects to decoder work and acknowledge backend lifecycle transitions.
 #[expect(
     clippy::too_many_arguments,
     reason = "The bridge reads host, media and render resources in one serialized update"
@@ -478,16 +571,16 @@ pub(crate) fn media_bridge(
                     data.extend_from_slice(&frame.rgba);
                 }
             } else {
-                let handle = images.add(frame_image(&frame));
+                let handle = images.add(Playback::frame_image(&frame));
                 crate::diagnostics::first_frame_submitted(&playback.token.instance_id);
-                let (size, position) = placement(
+                let (size, position) = Playback::placement(
                     &playback.clip,
                     Vec2::new(frame.width as f32, frame.height as f32),
                     Vec2::new(window.width(), window.height()),
                 );
                 let mut sprite = Sprite::from_image(handle.clone());
                 sprite.custom_size = Some(size);
-                sprite.rect = frame_crop(
+                sprite.rect = Playback::frame_crop(
                     &playback.clip,
                     playback.dimensions.as_vec2(),
                     Vec2::new(window.width(), window.height()),
@@ -507,13 +600,13 @@ pub(crate) fn media_bridge(
         if let Some(entity) = playback.sprite
             && let Ok((mut sprite, mut transform)) = sprites.get_mut(entity)
         {
-            let (size, position) = placement(
+            let (size, position) = Playback::placement(
                 &playback.clip,
                 playback.dimensions.as_vec2(),
                 Vec2::new(window.width(), window.height()),
             );
             sprite.custom_size = Some(size);
-            sprite.rect = frame_crop(
+            sprite.rect = Playback::frame_crop(
                 &playback.clip,
                 playback.dimensions.as_vec2(),
                 Vec2::new(window.width(), window.height()),
@@ -640,63 +733,71 @@ pub(crate) fn media_bridge(
         runtime.status = "No active playback".into();
     }
     overlay.visible = runtime.workers.values().any(|p| p.sprite.is_some());
-    overlay.busy = runtime.busy() || crate::media::needs_updates();
+    overlay.busy = runtime.busy() || crate::media::MediaService::needs_updates();
     if runtime.quitting && runtime.workers.is_empty() {
         exit.write(AppExit::Success);
     }
 }
-fn frame_image(frame: &crate::media::DecodedFrame) -> Image {
-    // Decoder contract is tightly packed straight-alpha sRGB RGBA. A handle and
-    // texture identity are reused per occurrence, with one latest frame retained.
-    Image::new(
-        Extent3d {
-            width: frame.width,
-            height: frame.height,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        frame.rgba.to_vec(),
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    )
-}
-pub fn placement(clip: &Clip, frame: Vec2, viewport: Vec2) -> (Vec2, Vec2) {
-    let fraction = clip
-        .metadata
-        .visual
-        .as_ref()
-        .map_or(0.3, |v| v.width_fraction as f32);
-    let target = Vec2::splat((viewport.x * fraction).min(viewport.y));
-    let fit = clip.metadata.visual.as_ref().map(|v| &v.fit);
-    let ratios = target / frame;
-    let scale = if matches!(fit, Some(Fit::Cover)) {
-        ratios.max_element()
-    } else {
-        ratios.min_element()
-    };
-    let size = if matches!(fit, Some(Fit::Cover)) {
-        target
-    } else {
-        frame * scale
-    };
-    let offset = (viewport - size) * 0.5;
-    let position = match clip.metadata.visual.as_ref().map(|v| &v.anchor) {
-        Some(Anchor::TopLeft) => Vec2::new(-offset.x, offset.y),
-        Some(Anchor::TopRight) => offset,
-        Some(Anchor::BottomLeft) => -offset,
-        Some(Anchor::BottomRight) => Vec2::new(offset.x, -offset.y),
-        _ => Vec2::ZERO,
-    };
-    (size, position)
-}
-fn frame_crop(clip: &Clip, frame: Vec2, viewport: Vec2) -> Option<Rect> {
-    let visual = clip.metadata.visual.as_ref()?;
-    if !matches!(visual.fit, Fit::Cover) {
-        return None;
+
+impl Playback {
+    /// Convert a tightly packed decoder frame into a straight-alpha sRGB Bevy texture.
+    fn frame_image(frame: &crate::media::DecodedFrame) -> Image {
+        // Decoder contract is tightly packed straight-alpha sRGB RGBA. A handle and
+        // texture identity are reused per occurrence, with one latest frame retained.
+        Image::new(
+            Extent3d {
+                width: frame.width,
+                height: frame.height,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            frame.rgba.to_vec(),
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        )
     }
-    let target = Vec2::splat((viewport.x * visual.width_fraction as f32).min(viewport.y));
-    let scale = (target / frame).max_element();
-    Some(Rect::from_center_size(frame * 0.5, target / scale))
+
+    /// Fit and anchor a clip within the current logical viewport without stretching it.
+    fn placement(clip: &Clip, frame: Vec2, viewport: Vec2) -> (Vec2, Vec2) {
+        let fraction = clip
+            .metadata
+            .visual
+            .as_ref()
+            .map_or(0.3, |v| v.width_fraction as f32);
+        let target = Vec2::splat((viewport.x * fraction).min(viewport.y));
+        let fit = clip.metadata.visual.as_ref().map(|v| &v.fit);
+        let ratios = target / frame;
+        let scale = if matches!(fit, Some(Fit::Cover)) {
+            ratios.max_element()
+        } else {
+            ratios.min_element()
+        };
+        let size = if matches!(fit, Some(Fit::Cover)) {
+            target
+        } else {
+            frame * scale
+        };
+        let offset = (viewport - size) * 0.5;
+        let position = match clip.metadata.visual.as_ref().map(|v| &v.anchor) {
+            Some(Anchor::TopLeft) => Vec2::new(-offset.x, offset.y),
+            Some(Anchor::TopRight) => offset,
+            Some(Anchor::BottomLeft) => -offset,
+            Some(Anchor::BottomRight) => Vec2::new(offset.x, -offset.y),
+            _ => Vec2::ZERO,
+        };
+        (size, position)
+    }
+
+    /// Compute a centered source rectangle for cover-fit clips; contain-fit clips remain uncropped.
+    fn frame_crop(clip: &Clip, frame: Vec2, viewport: Vec2) -> Option<Rect> {
+        let visual = clip.metadata.visual.as_ref()?;
+        if !matches!(visual.fit, Fit::Cover) {
+            return None;
+        }
+        let target = Vec2::splat((viewport.x * visual.width_fraction as f32).min(viewport.y));
+        let scale = (target / frame).max_element();
+        Some(Rect::from_center_size(frame * 0.5, target / scale))
+    }
 }
 
 #[cfg(test)]
@@ -753,12 +854,12 @@ mod tests {
     #[test]
     fn git_pack_selection_preserves_explicit_reference() {
         assert!(
-            matches!(pack_source("https://example.com/pack.git#release").unwrap(),PackSource::HttpsGit{url,reference}if url=="https://example.com/pack.git"&&reference=="release")
+            matches!(Config::pack_source("https://example.com/pack.git#release").unwrap(),PackSource::HttpsGit{url,reference}if url=="https://example.com/pack.git"&&reference=="release")
         );
         assert!(
-            matches!(pack_source("git+file:///tmp/pack#main").unwrap(),PackSource::LocalGit{path,reference}if path==std::path::Path::new("/tmp/pack")&&reference=="main")
+            matches!(Config::pack_source("git+file:///tmp/pack#main").unwrap(),PackSource::LocalGit{path,reference}if path==std::path::Path::new("/tmp/pack")&&reference=="main")
         );
-        assert!(pack_source("git+file:///tmp/pack").is_err());
+        assert!(Config::pack_source("git+file:///tmp/pack").is_err());
     }
     #[test]
     fn placement_bounds_width_and_cover_crops_without_stretching() {
@@ -774,15 +875,20 @@ mod tests {
         visual.width_fraction = 0.25;
         visual.anchor = Anchor::BottomRight;
         visual.fit = Fit::Contain;
-        let (size, position) = placement(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.));
+        let (size, position) =
+            Playback::placement(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.));
         assert_eq!(size, Vec2::new(200., 100.));
         assert_eq!(position, Vec2::new(300., -250.));
-        assert!(frame_crop(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.)).is_none());
+        assert!(
+            Playback::frame_crop(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.)).is_none()
+        );
         clip.metadata.visual.as_mut().unwrap().fit = Fit::Cover;
-        let (size, position) = placement(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.));
+        let (size, position) =
+            Playback::placement(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.));
         assert_eq!(size, Vec2::splat(200.));
         assert_eq!(position, Vec2::new(300., -200.));
-        let crop = frame_crop(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.)).unwrap();
+        let crop =
+            Playback::frame_crop(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.)).unwrap();
         assert_eq!(crop.min, Vec2::new(50., 0.));
         assert_eq!(crop.max, Vec2::new(150., 100.));
     }

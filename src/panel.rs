@@ -20,23 +20,41 @@ use std::{
     io::{self, BufRead},
     sync::{Mutex, mpsc},
 };
+
+/// Number of clip tiles shown across the bounded catalog viewport.
 const COLUMNS: usize = 4;
+
+/// Maximum visible tile rows, independent of total catalog size.
 const ROWS: usize = 3;
+
+/// Identify the editor receiving committed keyboard and IME input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
+    /// Catalog text filter.
     Search,
+    /// Local or Git catalog source.
     Pack,
+    /// Remote host endpoint.
     Address,
+    /// Ephemeral pairing credential.
     Secret,
 }
+
+/// Bounded Unicode editor with a byte-boundary cursor and separate IME preedit.
 #[derive(Default, Debug, Clone)]
 struct Editor {
+    /// Committed UTF-8 content.
     text: String,
+    /// Byte index guaranteed to lie on a character boundary.
     cursor: usize,
+    /// IME composition displayed but not yet committed.
     preedit: String,
+    /// Whether insertion/deletion replaces the full committed value.
     select_all: bool,
 }
+
 impl Editor {
+    /// Replace a selection or insert printable text while preserving the character limit.
     fn insert(&mut self, value: &str) {
         if self.select_all {
             self.text.clear();
@@ -51,6 +69,8 @@ impl Editor {
         self.text.insert_str(self.cursor, &value);
         self.cursor += value.len();
     }
+
+    /// Delete the selection or the preceding complete Unicode scalar.
     fn backspace(&mut self) {
         if self.select_all {
             self.text.clear();
@@ -63,6 +83,8 @@ impl Editor {
             self.cursor = i;
         }
     }
+
+    /// Move the cursor to the preceding UTF-8 character boundary.
     fn left(&mut self) {
         self.cursor = self.text[..self.cursor]
             .char_indices()
@@ -70,6 +92,8 @@ impl Editor {
             .map_or(0, |(i, _)| i);
         self.select_all = false;
     }
+
+    /// Move the cursor to the next UTF-8 character boundary.
     fn right(&mut self) {
         self.cursor = self.text[self.cursor..]
             .chars()
@@ -77,6 +101,8 @@ impl Editor {
             .map_or(self.cursor, |c| self.cursor + c.len_utf8());
         self.select_all = false;
     }
+
+    /// Compose display text with the cursor and uncommitted IME preedit.
     fn label(&self) -> String {
         format!(
             "{}|{}{}",
@@ -86,65 +112,100 @@ impl Editor {
         )
     }
 }
+
+/// Panel-only editing, pagination and render invalidation state.
 #[derive(Resource, Default)]
 struct Model {
+    /// Search-field editor.
     query: Editor,
+    /// Pack-source editor.
     pack: Editor,
+    /// Editor currently owning text input.
     focus: Option<Field>,
+    /// First visible row after filtering.
     first_row: usize,
+    /// Last render-state fingerprint used to avoid unnecessary tree rebuilds.
     signature: String,
+    /// Current panel widget subtree.
     root: Option<Entity>,
+    /// Remote endpoint editor.
     address: Editor,
+    /// Transient pairing editor, never included in preferences.
     secret: Editor,
+    /// Whether editor defaults have been copied from network state.
     network_initialized: bool,
+    /// Last persisted benign state, avoiding unchanged disk writes.
     saved_preferences: Option<crate::preferences::Preferences>,
+    /// Modifier state reconstructed from ordered keyboard events.
     modifiers: u8,
+    /// Native modifier flags used when physical key messages are absent.
     raw_modifiers: u8,
 }
+
+/// Attach a semantic action to a rendered button.
 #[derive(Component, Clone)]
 enum UiAction {
+    /// Queue an application lifecycle/playback intent.
     Runtime(Action),
+    /// Move text focus to one editor.
     Focus(Field),
+    /// Move the catalog viewport by a signed number of rows.
     Page(i32),
+    /// Queue an explicit connection or remote command intent.
     Network(crate::network_app::NetworkAction),
 }
+
+/// Cache decoded thumbnail handles and failed loads by clip identity.
 #[derive(Resource, Default)]
 struct Icons(BTreeMap<String, Option<Handle<Image>>>);
+
+/// Maximum encoded thumbnail size read or accepted for decoding.
 const MAX_ICON_BYTES: usize = 1024 * 1024;
-fn icon_image(bytes: &[u8]) -> Result<Image, String> {
-    if bytes.len() > MAX_ICON_BYTES
-        || bytes.len() < 24
-        || !bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-        || &bytes[12..16] != b"IHDR"
-    {
-        return Err("invalid or oversized PNG thumbnail".into());
+impl Icons {
+    /// Validate bounded PNG dimensions before allowing Bevy to decode a thumbnail.
+    fn icon_image(bytes: &[u8]) -> Result<Image, String> {
+        if bytes.len() > MAX_ICON_BYTES
+            || bytes.len() < 24
+            || !bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+            || &bytes[12..16] != b"IHDR"
+        {
+            return Err("invalid or oversized PNG thumbnail".into());
+        }
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        if width == 0 || height == 0 || width > 512 || height > 512 {
+            return Err("thumbnail dimensions exceed 512x512".into());
+        }
+        Image::from_buffer(
+            bytes,
+            bevy::image::ImageType::Extension("png"),
+            bevy::image::CompressedImageFormats::NONE,
+            true,
+            bevy::image::ImageSampler::nearest(),
+            bevy::asset::RenderAssetUsages::default(),
+        )
+        .map_err(|_| "thumbnail decode failed".into())
     }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
-    if width == 0 || height == 0 || width > 512 || height > 512 {
-        return Err("thumbnail dimensions exceed 512x512".into());
+
+    /// Bound the bytes read from a local thumbnail before decoding.
+    fn read_icon(path: &std::path::Path) -> Result<Vec<u8>, std::io::Error> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(MAX_ICON_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
-    Image::from_buffer(
-        bytes,
-        bevy::image::ImageType::Extension("png"),
-        bevy::image::CompressedImageFormats::NONE,
-        true,
-        bevy::image::ImageSampler::nearest(),
-        bevy::asset::RenderAssetUsages::default(),
-    )
-    .map_err(|_| "thumbnail decode failed".into())
 }
-fn read_icon(path: &std::path::Path) -> Result<Vec<u8>, std::io::Error> {
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(MAX_ICON_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
+
+/// Receive optional stdin commands without blocking the UI thread.
 #[derive(Resource)]
 struct Terminal(Mutex<mpsc::Receiver<String>>);
+
+/// Identify the camera rendering only the catalog panel layer.
 #[derive(Resource)]
 struct PanelCamera(Entity);
+
+/// Install the bounded panel UI and its input systems.
 pub struct PanelPlugin;
 impl Plugin for PanelPlugin {
     fn build(&self, app: &mut App) {
@@ -165,6 +226,8 @@ impl Plugin for PanelPlugin {
             );
     }
 }
+
+/// Create the panel camera and restore benign preferences before the first render.
 fn setup(
     mut commands: Commands,
     primary: Single<Entity, With<PrimaryWindow>>,
@@ -183,7 +246,7 @@ fn setup(
     commands.insert_resource(PanelCamera(camera));
     model.pack.text = runtime.pack_input.clone();
     model.pack.cursor = model.pack.text.len();
-    let preferences = crate::preferences::load();
+    let preferences = crate::preferences::Preferences::load();
     model.query.text = preferences.query;
     model.query.cursor = model.query.text.len();
     if let Some(index) = runtime.display {
@@ -212,6 +275,8 @@ fn setup(
     });
     eprintln!("Safety terminal: stop | panel | hide | play PACK/CLIP | quit");
 }
+
+/// Translate available stdin lines into application actions without blocking.
 fn terminal(
     terminal: Res<Terminal>,
     mut actions: ResMut<Actions>,
@@ -243,31 +308,39 @@ fn terminal(
         }
     }
 }
-fn matching(clip: &Clip, query: &str) -> bool {
-    query.to_lowercase().split_whitespace().all(|part| {
-        clip.metadata.title.to_lowercase().contains(part)
-            || clip
-                .category
-                .to_string_lossy()
-                .to_lowercase()
-                .contains(part)
-            || clip
-                .metadata
-                .tags
-                .iter()
-                .any(|tag| tag.to_lowercase().contains(part))
-    })
+
+impl Model {
+    /// Require every search term to match a clip title, category or tag.
+    fn matching(clip: &Clip, query: &str) -> bool {
+        query.to_lowercase().split_whitespace().all(|part| {
+            clip.metadata.title.to_lowercase().contains(part)
+                || clip
+                    .category
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(part)
+                || clip
+                    .metadata
+                    .tags
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(part))
+        })
+    }
+
+    /// Select only the current page of matching catalog entries for rendering.
+    fn visible_indices(clips: &[Clip], query: &str, row: usize) -> Vec<usize> {
+        clips
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| Model::matching(c, query))
+            .skip(row.saturating_mul(COLUMNS))
+            .take(COLUMNS * ROWS)
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
-fn visible_indices(clips: &[Clip], query: &str, row: usize) -> Vec<usize> {
-    clips
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| matching(c, query))
-        .skip(row.saturating_mul(COLUMNS))
-        .take(COLUMNS * ROWS)
-        .map(|(i, _)| i)
-        .collect()
-}
+
+/// Dispatch pressed button intents to application, editor or network state.
 fn buttons(
     mut model: ResMut<Model>,
     buttons: Query<(&Interaction, &UiAction), Changed<Interaction>>,
@@ -303,10 +376,14 @@ fn buttons(
         }
     }
 }
+
+/// Retain raw-window modifier ordering alongside translated key events.
 enum OrderedInput {
     Modifiers(u8),
     Keyboard(KeyboardInput),
 }
+
+/// Merge keyboard events with raw modifier changes in their original event order.
 fn ordered_keyboard(
     events: impl IntoIterator<Item = OrderedInput>,
     modifiers: &mut u8,
@@ -320,6 +397,8 @@ fn ordered_keyboard(
     }
     keys
 }
+
+/// Route keyboard, clipboard and IME input to the focused editor before shortcuts.
 #[expect(
     clippy::too_many_arguments,
     reason = "The editor combines ordered raw modifier flags, Bevy IME and window state"
@@ -476,9 +555,12 @@ fn text_input(
             match key.logical_key {
                 Key::Escape => actions.0.push_back(Action::StopAll),
                 Key::Space if runtime.destination == Destination::Local => {
-                    if let Some(index) =
-                        visible_indices(&runtime.catalog.clips, &model.query.text, model.first_row)
-                            .first()
+                    if let Some(index) = Model::visible_indices(
+                        &runtime.catalog.clips,
+                        &model.query.text,
+                        model.first_row,
+                    )
+                    .first()
                     {
                         actions.0.push_back(Action::Play(
                             runtime.catalog.clips[*index].identity.clone(),
@@ -490,6 +572,8 @@ fn text_input(
         }
     }
 }
+
+/// Advance catalog rows within the number of matching results.
 fn scroll(
     mut wheel: MessageReader<MouseWheel>,
     primary: Single<Entity, With<PrimaryWindow>>,
@@ -505,6 +589,8 @@ fn scroll(
         }
     }
 }
+
+/// Spawn a panel button with its semantic action and common visual style.
 fn button(parent: &mut ChildSpawnerCommands, label: impl Into<String>, action: UiAction) {
     parent
         .spawn((
@@ -524,6 +610,8 @@ fn button(parent: &mut ChildSpawnerCommands, label: impl Into<String>, action: U
             },
         ));
 }
+
+/// Rebuild changed panel content and visible thumbnails while persisting only benign settings.
 fn render(
     mut commands: Commands,
     mut model: ResMut<Model>,
@@ -540,7 +628,7 @@ fn render(
     }
     let remote = runtime.destination == Destination::Remote;
     let preferences = crate::preferences::Preferences {
-        pack: crate::preferences::stored_pack(
+        pack: crate::preferences::Preferences::stored_pack(
             &runtime.pack_input,
             &crate::app::resource_root().join("sample-packs/podcast-pack"),
         ),
@@ -548,7 +636,7 @@ fn render(
         display: runtime.display,
     };
     if model.saved_preferences.as_ref() != Some(&preferences) {
-        let _ = crate::preferences::save(&preferences);
+        let _ = preferences.save();
         model.saved_preferences = Some(preferences);
     }
     let snapshot = if remote {
@@ -615,7 +703,7 @@ fn render(
     };
     let total = clips
         .iter()
-        .filter(|c| matching(c, &model.query.text))
+        .filter(|c| Model::matching(c, &model.query.text))
         .count();
     let max_row = total.div_ceil(COLUMNS).saturating_sub(ROWS);
     model.first_row = model.first_row.min(max_row);
@@ -651,11 +739,11 @@ fn render(
         parent.spawn((Text::new(&network.status),TextFont{font_size:FontSize::Px(12.),..default()}));
         if let Some(secret)=&network.pairing_secret {parent.spawn((Text::new(format!("Pairing secret (private): {secret}")),TextFont{font_size:FontSize::Px(12.),..default()}));}
         parent.spawn((Text::new(&runtime.status),TextFont{font_size:FontSize::Px(13.),..default()},TextColor(Color::srgb(0.85,0.8,0.6))));
-        parent.spawn(Node{display:Display::Grid,grid_template_columns:RepeatedGridTrack::fr(COLUMNS as u16,1.),column_gap:px(8),row_gap:px(8),..default()}).with_children(|grid|{for index in visible_indices(clips,&model.query.text,model.first_row){let clip=&clips[index];let readiness=snapshot.clips.iter().find(|c|c.clip_id==clip.identity).map(|c|format!("{:?}",c.readiness)).unwrap_or_else(||"Unchecked".into());let state=snapshot.instances.iter().rev().find(|i|i.clip_id==clip.identity).map(|i|format!("{:?}",i.state)).unwrap_or_else(||"Idle".into());let error=runtime.errors.get(&clip.identity).cloned().unwrap_or_default();
+        parent.spawn(Node{display:Display::Grid,grid_template_columns:RepeatedGridTrack::fr(COLUMNS as u16,1.),column_gap:px(8),row_gap:px(8),..default()}).with_children(|grid|{for index in Model::visible_indices(clips,&model.query.text,model.first_row){let clip=&clips[index];let readiness=snapshot.clips.iter().find(|c|c.clip_id==clip.identity).map(|c|format!("{:?}",c.readiness)).unwrap_or_else(||"Unchecked".into());let state=snapshot.instances.iter().rev().find(|i|i.clip_id==clip.identity).map(|i|format!("{:?}",i.state)).unwrap_or_else(||"Idle".into());let error=runtime.errors.get(&clip.identity).cloned().unwrap_or_default();
             let key=format!("{}:{}:{}:{}",remote,snapshot.catalog_revision,clip.identity,remote&&network.remote_icons.contains_key(&clip.identity));
             if !icons.0.contains_key(&key){
-                let bytes=if remote{network.remote_icons.get(&clip.identity).cloned()}else{read_icon(&clip.icon_path).ok()};
-                let handle=bytes.and_then(|bytes|icon_image(&bytes).ok()).map(|image|images.add(image));
+                let bytes=if remote{network.remote_icons.get(&clip.identity).cloned()}else{Icons::read_icon(&clip.icon_path).ok()};
+                let handle=bytes.and_then(|bytes|Icons::icon_image(&bytes).ok()).map(|image|images.add(image));
                 if icons.0.len()>=128{let old=icons.0.keys().next().cloned().unwrap();if let Some(Some(handle))=icons.0.remove(&old){images.remove(handle.id());}}
                 icons.0.insert(key.clone(),handle);
             }
@@ -682,14 +770,14 @@ mod tests {
         bytes[16..20].copy_from_slice(&100_000u32.to_be_bytes());
         bytes[20..24].copy_from_slice(&100_000u32.to_be_bytes());
         assert_eq!(
-            icon_image(&bytes).unwrap_err(),
+            Icons::icon_image(&bytes).unwrap_err(),
             "thumbnail dimensions exceed 512x512"
         );
-        assert!(icon_image(&vec![0; MAX_ICON_BYTES + 1]).is_err());
+        assert!(Icons::icon_image(&vec![0; MAX_ICON_BYTES + 1]).is_err());
         let icon =
             std::fs::read(crate::app::resource_root().join("sample-packs/podcast-pack/gif.png"))
                 .unwrap();
-        assert!(icon_image(&icon).is_ok());
+        assert!(Icons::icon_image(&icon).is_ok());
     }
     fn input_app() -> (App, Entity) {
         let mut app = App::new();
@@ -967,12 +1055,12 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            visible_indices(&clips, "sound music", 100).len(),
+            Model::visible_indices(&clips, "sound music", 100).len(),
             COLUMNS * ROWS
         );
-        assert_eq!(visible_indices(&clips, "sound music", 100)[0], 400);
-        assert_eq!(visible_indices(&clips, "Title 9999", 0), vec![9999]);
-        assert!(visible_indices(&clips, "absent", 0).is_empty());
-        assert_eq!(visible_indices(&clips, "", usize::MAX).len(), 0);
+        assert_eq!(Model::visible_indices(&clips, "sound music", 100)[0], 400);
+        assert_eq!(Model::visible_indices(&clips, "Title 9999", 0), vec![9999]);
+        assert!(Model::visible_indices(&clips, "absent", 0).is_empty());
+        assert_eq!(Model::visible_indices(&clips, "", usize::MAX).len(), 0);
     }
 }

@@ -14,46 +14,72 @@ use std::{ffi::c_char, sync::OnceLock};
 
 #[link(name = "objc")]
 unsafe extern "C" {
+    /// Declare the Objective-C runtime entry for a class-local selector override.
     fn class_replaceMethod(
         class: &AnyClass,
         selector: Sel,
         implementation: Imp,
         types: *const c_char,
     ) -> Option<Imp>;
+
+    /// Read the original method ABI encoding before installing an adapter.
     fn method_getTypeEncoding(method: &Method) -> *const c_char;
+
+    /// Associate a non-retaining marker with a live Objective-C window.
     fn objc_setAssociatedObject(
         object: &AnyObject,
         key: *const u8,
         value: &AnyObject,
         policy: usize,
     );
+
+    /// Read the adapter-owned marker from a live Objective-C window.
     fn objc_getAssociatedObject(object: &AnyObject, key: *const u8) -> *mut AnyObject;
 }
 
+/// Unique stable address identifying windows owned by this overlay adapter.
 static OVERLAY_KEY: u8 = 0;
+
+/// Preserve native selector implementations for ordinary, unmarked windows.
 struct Originals {
+    /// Original canBecomeKeyWindow implementation.
     key: Imp,
+    /// Original canBecomeMainWindow implementation.
     main: Imp,
+    /// Original makeKeyAndOrderFront implementation.
     show: Imp,
 }
+
+/// Publish original implementations before installing replacement callbacks.
 static ORIGINALS: OnceLock<Originals> = OnceLock::new();
+
+/// Ensure class-wide selector adapters are installed once on the main thread.
 static INSTALLED: OnceLock<()> = OnceLock::new();
 
+/// Recognize only windows explicitly marked by this adapter.
 fn is_overlay(window: &AnyObject) -> bool {
     // SAFETY: The stable key belongs exclusively to this adapter. An assign
     // association stores the live window itself, without retaining it in a cycle.
     unsafe { std::ptr::eq(objc_getAssociatedObject(window, &OVERLAY_KEY), window) }
 }
+
+/// Mark a live overlay without changing its class or creating a retain cycle.
 unsafe fn mark_overlay(window: &AnyObject) {
     // SAFETY: Both object and value are this live window; policy 0 is ASSIGN.
     unsafe { objc_setAssociatedObject(window, &OVERLAY_KEY, window, 0) };
 }
+
+/// Deny key-window status only for marked overlays.
 extern "C-unwind" fn can_become_key(window: &AnyObject, selector: Sel) -> Bool {
     focus_policy(window, selector, ORIGINALS.get().unwrap().key)
 }
+
+/// Deny main-window status only for marked overlays.
 extern "C-unwind" fn can_become_main(window: &AnyObject, selector: Sel) -> Bool {
     focus_policy(window, selector, ORIGINALS.get().unwrap().main)
 }
+
+/// Apply the overlay focus exception or forward to the original selector.
 fn focus_policy(window: &AnyObject, selector: Sel, original: Imp) -> Bool {
     if is_overlay(window) {
         Bool::NO
@@ -65,6 +91,8 @@ fn focus_policy(window: &AnyObject, selector: Sel, original: Imp) -> Bool {
         unsafe { original(window, selector) }
     }
 }
+
+/// Order overlays without focus while preserving normal panel window behavior.
 extern "C-unwind" fn show(window: &AnyObject, selector: Sel, sender: *mut AnyObject) {
     if is_overlay(window) {
         // SAFETY: orderFront: preserves NSWindow ordering without taking focus.
@@ -79,6 +107,7 @@ extern "C-unwind" fn show(window: &AnyObject, selector: Sel, sender: *mut AnyObj
     }
 }
 
+/// Install ABI-compatible adapters on WinitWindow while preserving inherited NSWindow behavior.
 unsafe fn install(class: &AnyClass) {
     INSTALLED.get_or_init(|| {
         let key = class.instance_method(sel!(canBecomeKeyWindow)).unwrap();
@@ -105,6 +134,7 @@ unsafe fn install(class: &AnyClass) {
     });
 }
 
+/// Apply click-through, nonactivating AppKit policy to newly created overlay windows.
 #[expect(
     clippy::type_complexity,
     reason = "Bevy query filters keep the native window boundary explicit"

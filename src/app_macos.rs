@@ -13,10 +13,15 @@ use std::sync::{
     OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+
+/// Latch Dock reopen callbacks until the Bevy application update handles them.
 static REOPEN: AtomicBool = AtomicBool::new(false);
+
+/// Wake the event loop when an AppKit callback arrives while idle.
 static WAKE: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 #[link(name = "objc")]
 unsafe extern "C" {
+    /// Declare the Objective-C runtime entry used to add the optional reopen selector.
     fn class_addMethod(
         class: &AnyClass,
         selector: Sel,
@@ -24,6 +29,8 @@ unsafe extern "C" {
         types: *const std::ffi::c_char,
     ) -> Bool;
 }
+
+/// Queue a Dock reopen request without retaining native objects beyond the callback.
 extern "C-unwind" fn reopen(_: &AnyObject, _: Sel, _: &AnyObject, _: Bool) -> Bool {
     REOPEN.store(true, Ordering::Release);
     if let Some(wake) = WAKE.get() {
@@ -31,6 +38,8 @@ extern "C-unwind" fn reopen(_: &AnyObject, _: Sel, _: &AnyObject, _: Bool) -> Bo
     }
     Bool::YES
 }
+
+/// Register the optional application delegate selector on the AppKit thread.
 pub fn install(
     proxy: Res<EventLoopProxyWrapper>,
     mut support: ResMut<crate::app::ReopenSupport>,
@@ -65,11 +74,14 @@ pub fn install(
         }
     }
 }
+
+/// Transfer a latched Dock request into the normal application action queue.
 pub fn poll(mut actions: ResMut<crate::app::Actions>) {
     if REOPEN.swap(false, Ordering::AcqRel) {
         actions.0.push_back(crate::app::Action::Show);
     }
 }
+
 /// Read only in response to the focused editor's explicit Cmd/Ctrl+V action.
 pub fn paste_text() -> Option<String> {
     unsafe {
