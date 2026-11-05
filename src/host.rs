@@ -397,6 +397,12 @@ impl Host {
                 .collect(),
         }
     }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
     pub fn drain_events(&mut self) -> Vec<HostEvent> {
         self.events.drain(..).collect()
     }
