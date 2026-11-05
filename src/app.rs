@@ -40,11 +40,10 @@ impl Config {
         let preferences = crate::preferences::load();
         let mut config = Self {
             mode: Mode::Local,
-            pack: if preferences.pack.is_empty() {
-                resource_root().join("sample-packs/podcast-pack")
-            } else {
-                preferences.pack.into()
-            },
+            pack: crate::preferences::resolved_pack(
+                &preferences.pack,
+                &resource_root().join("sample-packs/podcast-pack"),
+            ),
             display: preferences.display,
             connect: None,
             listen: None,
@@ -227,6 +226,17 @@ impl Runtime {
             self.status = format!("Queue admission failed: {reason:?}");
         }
     }
+    pub(crate) fn request_stop_all(&mut self, network: &mut crate::network_app::NetworkState) {
+        self.status = "Stop all requested; waiting for playback resources to stop".into();
+        if self.destination == Destination::Remote {
+            network
+                .actions
+                .push_back(crate::network_app::NetworkAction::RemoteCommand(
+                    PlaybackCommand::StopAll,
+                ));
+        }
+        self.submit(PlaybackCommand::StopAll, network);
+    }
     pub fn busy(&self) -> bool {
         !self.workers.is_empty() || self.quitting
     }
@@ -288,16 +298,7 @@ pub(crate) fn actions(
                     runtime.submit(PlaybackCommand::Stop { instance_id }, &mut network);
                 }
             }
-            Action::StopAll => {
-                if runtime.destination == Destination::Remote {
-                    network
-                        .actions
-                        .push_back(crate::network_app::NetworkAction::RemoteCommand(
-                            PlaybackCommand::StopAll,
-                        ));
-                }
-                runtime.submit(PlaybackCommand::StopAll, &mut network);
-            }
+            Action::StopAll => runtime.request_stop_all(&mut network),
             Action::ToggleHost => {
                 if runtime.mode == Mode::Controller {
                     runtime.status = "Controller mode cannot start a local host".into();
@@ -607,6 +608,15 @@ pub(crate) fn media_bridge(
         network.publish_local(runtime.snapshot.clone(), &events);
     }
     for event in events {
+        if matches!(event.event, crate::commands::EventKind::Stopped)
+            && runtime
+                .snapshot
+                .instances
+                .iter()
+                .all(|instance| instance.state.is_terminal())
+        {
+            runtime.status = "Playback stopped".into();
+        }
         if let crate::commands::EventKind::Failed { message } = event.event {
             let clip_id = runtime
                 .snapshot
@@ -619,6 +629,15 @@ pub(crate) fn media_bridge(
             }
             runtime.status = format!("Playback failed: {message}");
         }
+    }
+    if runtime.status == "Stop all requested; waiting for playback resources to stop"
+        && runtime
+            .snapshot
+            .instances
+            .iter()
+            .all(|instance| instance.state.is_terminal())
+    {
+        runtime.status = "No active playback".into();
     }
     overlay.visible = runtime.workers.values().any(|p| p.sprite.is_some());
     overlay.busy = runtime.busy() || crate::media::needs_updates();
