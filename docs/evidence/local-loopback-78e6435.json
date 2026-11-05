@@ -1,0 +1,161 @@
+{
+  "audioVideoOffsets": null,
+  "environment": {
+    "appBinarySha256": null,
+    "appBuildInfo": null,
+    "appRevision": null,
+    "appVersion": null,
+    "createdUtc": "2026-11-05T02:00:09.794601+00:00",
+    "displays": null,
+    "gameRevisionAndSettings": null,
+    "instrumentedTestExecutableSha256": "d37c14a2fc146c9a95c88ce5665fc768b7f201e32fa27814015282f5fb640a92",
+    "machine": {
+      "architecture": "arm64",
+      "model": "Mac16,11",
+      "os": "Darwin",
+      "osVersion": "27.0.1",
+      "ramBytes": 51539607552
+    },
+    "measurementHarnessRevision": "78e643506f4478bdc32fdab463fe5cd9e07869cd",
+    "measurementMethod": "Debug Rust test: empty-host StopAll policy and authenticated loopback acknowledgments; simulated main-loop poll 1 ms; 30 samples per origin; no window, decoder, playback, recording or game run",
+    "mediaBackend": "Compiled AVFoundation/gif backend; not invoked by this policy-only probe",
+    "mediaDimensionsAndFrameRate": null,
+    "packRevision": {
+      "gitTreeObject": "716944d22eeaaefac75cb3aeefb5a10961747379",
+      "repositoryPath": "sample-packs/podcast-pack",
+      "sourceCommit": "78e643506f4478bdc32fdab463fe5cd9e07869cd"
+    },
+    "recordingSettings": null,
+    "scenarios": {
+      "alpha_video": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "audio_system_recording": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "disconnect_reconnect_no_replay": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "fullscreen_game_input": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "idle_repeated_display_change": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "local_panel_host": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "quit_releases_resources": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "rapid_overlap_stop_all": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "remote_cohost": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "thirty_minute_mixed_recording": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "transparent_gif": {
+        "evidence": [],
+        "status": "unmeasured"
+      },
+      "video_audio": {
+        "evidence": [],
+        "status": "unmeasured"
+      }
+    },
+    "sourceCheckoutRevision": "78e643506f4478bdc32fdab463fe5cd9e07869cd"
+  },
+  "gameFrameMilliseconds": {},
+  "gameP95Comparison": {
+    "active": {
+      "p95IncreasePercent": null,
+      "proposedLimitPercent": 10,
+      "withinProposedLimit": null
+    },
+    "idle": {
+      "p95IncreasePercent": null,
+      "proposedLimitPercent": 5,
+      "withinProposedLimit": null
+    }
+  },
+  "gameP95ComparisonBaseline": "recording",
+  "percentileMethod": "nearest rank: sorted[ceil(p*n)-1]",
+  "physicalOutputClaimsFromCallbacks": false,
+  "processResources": {},
+  "proposedPhysicalTargetsNotProvenBySubmissionMetrics": {
+    "absoluteAVOffsetMs": 50,
+    "controllerAcknowledgmentP95ms": 250,
+    "warmLocalOutputP95ms": 100
+  },
+  "timings": {
+    "loopback": {
+      "complete": true,
+      "lossless": true,
+      "metrics": [
+        {
+          "milliseconds": {
+            "count": 30,
+            "max": 0.014,
+            "p50": 0.001,
+            "p95": 0.005
+          },
+          "observation": "Shared host policy outcome observed; not audible/visible output",
+          "origin": "local",
+          "stage": "command_acknowledged"
+        },
+        {
+          "milliseconds": {
+            "count": 30,
+            "max": 0.151,
+            "p50": 0.054,
+            "p95": 0.113
+          },
+          "observation": "Shared host policy outcome observed; not audible/visible output",
+          "origin": "remote_host_handoff",
+          "stage": "command_acknowledged"
+        },
+        {
+          "milliseconds": {
+            "count": 30,
+            "max": 2.827,
+            "p50": 1.981,
+            "p95": 2.624
+          },
+          "observation": "Controller-local send through correlated host reply; excludes later snapshot recovery",
+          "origin": "controller",
+          "stage": "controller_ack_roundtrip"
+        }
+      ],
+      "summary": {
+        "bytes_before_summary": 16386,
+        "dropped_events": 0,
+        "evicted_traces": 0,
+        "file_capped": false,
+        "stage": "diagnostics_summary",
+        "writer_errors": 0
+      }
+    }
+  },
+  "unmeasuredByThisTool": [
+    "audibility",
+    "displayed pixels",
+    "game input usability",
+    "GPU utilization",
+    "network one-way latency",
+    "recording quality",
+    "two-Mac authorization"
+  ]
+}

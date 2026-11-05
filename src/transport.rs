@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -62,7 +63,7 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidConfiguration => f.write_str("invalid remote session configuration"),
-            Self::TailnetUnavailable => f.write_str("configured Tailscale address is unavailable"),
+            Self::TailnetUnavailable => f.write_str("configured Tailscale address or CLI is unavailable; install/authorize Tailscale and verify this Mac's tailnet address (the macOS app's bundled CLI is supported)"),
             Self::Io(error) => write!(f, "transport I/O: {error}"),
             Self::Random => f.write_str("secure randomness unavailable"),
         }
@@ -571,10 +572,47 @@ async fn verify_tailnet_address(ip: IpAddr) -> Result<(), TransportError> {
     }
     Ok(())
 }
+fn find_tailscale(search: &std::ffi::OsStr, fallbacks: &[PathBuf]) -> Option<PathBuf> {
+    std::env::split_paths(search)
+        .map(|directory| directory.join("tailscale"))
+        .chain(fallbacks.iter().cloned())
+        .find(|path| {
+            if !path.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                path.metadata()
+                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        })
+}
+fn tailscale_command(executable: &Path, arguments: &[&str]) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(executable);
+    // The official macOS app executable doubles as its CLI. Finder's process
+    // environment lacks terminal heuristics; force CLI mode to avoid opening UI.
+    // https://tailscale.com/docs/reference/tailscale-cli?tab=macos
+    command.args(arguments).env("TAILSCALE_BE_CLI", "1");
+    command
+}
 async fn tailscale_output(arguments: &[&str]) -> Result<Vec<u8>, TransportError> {
     use std::process::Stdio;
-    let mut child = tokio::process::Command::new("tailscale")
-        .args(arguments)
+    let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+    #[cfg(target_os = "macos")]
+    let fallbacks = [
+        PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
+        PathBuf::from("/usr/local/bin/tailscale"),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let fallbacks = [];
+    let executable =
+        find_tailscale(&search, &fallbacks).ok_or(TransportError::TailnetUnavailable)?;
+    let mut child = tailscale_command(&executable, arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -624,3 +662,50 @@ mod client;
 #[cfg(test)]
 mod tests;
 pub use client::{ControllerClient, ControllerError, ControllerUpdate};
+
+#[cfg(all(test, unix))]
+mod cli_path_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn finder_fallback_and_cli_mode_do_not_need_shell_aliases() {
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Temp(
+            std::env::temp_dir().join(format!("durop-ts-cli-{}-{unique}", std::process::id())),
+        );
+        std::fs::create_dir(&directory.0).unwrap();
+        let search = std::env::join_paths([directory.0.join("missing")]).unwrap();
+        let app = directory.0.join("Tailscale");
+        std::fs::write(
+            &app,
+            b"this file must never execute in a path-resolution test",
+        )
+        .unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            find_tailscale(&search, std::slice::from_ref(&app)),
+            Some(app.clone())
+        );
+        let command = tailscale_command(&app, &["status", "--json"]);
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == "TAILSCALE_BE_CLI"
+                    && value == Some(std::ffi::OsStr::new("1")))
+        );
+        let preferred = directory.0.join("tailscale");
+        std::fs::copy(&app, &preferred).unwrap();
+        let search = std::env::join_paths([&directory.0]).unwrap();
+        assert_eq!(find_tailscale(&search, &[app]), Some(preferred));
+    }
+}
