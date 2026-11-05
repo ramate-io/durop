@@ -327,12 +327,14 @@ impl ControllerClient {
             catalog_revision,
             command,
         };
+        let roundtrip_started = std::time::Instant::now();
         let packet = self
             .roundtrip(
                 serde_json::json!({"type":"command", "envelope":envelope}),
                 Expected::Outcome(command_id),
             )
             .await?;
+        crate::diagnostics::controller_ack(roundtrip_started.elapsed());
         self.resync_if_needed().await?;
         let Packet::Outcome { outcome, .. } = packet else {
             return Err(ControllerError::Protocol);

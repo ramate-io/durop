@@ -122,7 +122,9 @@ pub struct NetworkState {
 }
 impl NetworkState {
     pub fn queue_local(&self, envelope: Envelope) -> Result<(), QueueError> {
-        self.local.try_send(envelope)
+        self.local.try_send(envelope.clone())?;
+        crate::diagnostics::submitted(&envelope, crate::diagnostics::Origin::Local);
+        Ok(())
     }
     pub fn publish_local(&mut self, snapshot: HostSnapshot, events: &[HostEvent]) {
         if self
@@ -251,8 +253,9 @@ impl NetworkState {
                 .as_ref()
                 .is_some_and(RemoteCommand::is_active)
         });
-        match self.local.try_send_guarded(envelope, ticket, guard) {
+        match self.local.try_send_guarded(envelope.clone(), ticket, guard) {
             Ok(()) => {
+                crate::diagnostics::submitted(&envelope, crate::diagnostics::Origin::Remote);
                 self.pending.insert(ticket, request);
             }
             Err(_) => {
@@ -266,9 +269,14 @@ impl NetworkState {
     }
 }
 impl NetworkState {
-    fn accept_pending(&mut self, host: &mut crate::host::Host) -> Vec<CommandOutcome> {
+    fn accept_pending(
+        &mut self,
+        host: &mut crate::host::Host,
+        session: &str,
+    ) -> Vec<CommandOutcome> {
         let mut local = Vec::new();
         for receipt in self.inbox.drain(host) {
+            crate::diagnostics::acknowledged(session, &receipt.command_id, &receipt.outcome);
             if let Some(ticket) = receipt.ticket {
                 if let Some(request) = self
                     .pending
@@ -535,7 +543,8 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
             _ => {}
         }
     }
-    for outcome in network.accept_pending(&mut runtime.host) {
+    let session_id = runtime.snapshot.session_id.clone();
+    for outcome in network.accept_pending(&mut runtime.host, &session_id) {
         if let CommandOutcome::Rejected { reason } = outcome {
             runtime.status = format!("Command rejected: {reason:?}");
         }
@@ -766,6 +775,95 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    #[ignore = "explicit local timing capture; set DUROP_ACCEPTANCE_OUTPUT to a new private JSONL path"]
+    fn capture_same_mac_policy_and_loopback_acknowledgments() {
+        let path =
+            std::env::var_os("DUROP_ACCEPTANCE_OUTPUT").expect("set DUROP_ACCEPTANCE_OUTPUT");
+        let samples = std::env::var("DUROP_ACCEPTANCE_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(30);
+        assert!((1..=300).contains(&samples));
+        let guard = crate::diagnostics::start(std::path::Path::new(&path)).unwrap();
+        let catalog = Arc::new(
+            crate::catalog::load_local(
+                &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("sample-packs/podcast-pack"),
+            )
+            .unwrap(),
+        );
+        let mut host = crate::host::Host::new("local-acceptance-probe".into(), catalog.clone());
+        let mut network = make_state(host.snapshot(), &NetworkConfig::default(), Arc::new(|| {}));
+        for sample in 0..samples {
+            network
+                .queue_local(Envelope {
+                    protocol_version: crate::commands::PROTOCOL_VERSION,
+                    session_id: "local-acceptance-probe".into(),
+                    command_id: format!("local-{sample}"),
+                    catalog_revision: catalog.revision.clone(),
+                    command: PlaybackCommand::StopAll,
+                })
+                .unwrap();
+            assert!(
+                network
+                    .accept_pending(&mut host, "local-acceptance-probe")
+                    .is_empty()
+            );
+        }
+        network.publish_local(host.snapshot(), &[]);
+        let session = network
+            .runtime
+            .block_on(transport::enable_test_loopback(
+                network.bridge.clone(),
+                catalog_projection(&catalog).unwrap(),
+            ))
+            .unwrap();
+        let address = session.address;
+        let secret = SessionCredential::from_secret(session.credential.bearer().into()).unwrap();
+        let revision = catalog.revision.clone();
+        let (done, completed) = std::sync::mpsc::sync_channel(1);
+        let task = network.runtime.spawn(async move {
+            let mut client = ControllerClient::connect_loopback(address, secret)
+                .await
+                .unwrap();
+            for sample in 0..samples {
+                let outcome = client
+                    .command(
+                        format!("remote-{sample}"),
+                        revision.clone(),
+                        PlaybackCommand::StopAll,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(outcome, CommandOutcome::Accepted { .. }));
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+            client.disconnect().await;
+            done.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            while let Ok(update) = network.updates.try_recv() {
+                if let Update::Remote(request) = update {
+                    network.admit_remote(request);
+                }
+            }
+            network.accept_pending(&mut host, "local-acceptance-probe");
+            if completed.try_recv().is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        network.runtime.block_on(task).unwrap();
+        network.runtime.block_on(session.close());
+        assert!(guard.finish());
+        println!(
+            "Captured {samples} local policy acknowledgments and {samples} real-loopback command round trips; no media presentation or audible output measured"
+        );
+    }
+
+    #[test]
     fn real_client_routes_through_guarded_shared_host_ingress() {
         let catalog = Arc::new(
             crate::catalog::load_local(
@@ -839,7 +937,7 @@ mod tests {
                     network.admit_remote(request);
                 }
             }
-            network.accept_pending(&mut host);
+            network.accept_pending(&mut host, "network-test");
             let events = host.drain_events();
             network.publish_local(host.snapshot(), &events);
             if completed.try_recv().is_ok() {
@@ -935,7 +1033,7 @@ mod tests {
                     _ => {}
                 }
             }
-            network.accept_pending(&mut host);
+            network.accept_pending(&mut host, "network-test");
             let events = host.drain_events();
             network.publish_local(host.snapshot(), &events);
             assert!(

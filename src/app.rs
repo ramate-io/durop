@@ -33,6 +33,7 @@ pub struct Config {
     pub display: Option<usize>,
     pub connect: Option<String>,
     pub listen: Option<String>,
+    pub diagnostics: Option<PathBuf>,
 }
 impl Config {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
@@ -47,6 +48,7 @@ impl Config {
             display: preferences.display,
             connect: None,
             listen: None,
+            diagnostics: None,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -57,7 +59,8 @@ impl Config {
                 "--display"=>config.display=Some(value()?.parse().map_err(|_|"display must be a nonnegative index")?),
                 "--connect"=>config.connect=Some(value()?),
                 "--listen-tailscale"=>config.listen=Some(value()?),
-                "--help"|"-h"=>return Err("durop [--mode local|host|controller] [--pack DIRECTORY] [--display INDEX] [--connect ws://HOST:48732/control]".into()),
+                "--diagnostics"=>config.diagnostics=Some(value()?.into()),
+                "--help"|"-h"=>return Err("durop [--mode local|host|controller] [--pack DIRECTORY] [--display INDEX] [--connect ws://HOST:48732/control] [--listen-tailscale IP:PORT] [--diagnostics NEW_JSONL_FILE]".into()),
                 _=>return Err(format!("unknown option {arg}")),
             }
         }
@@ -475,6 +478,7 @@ pub(crate) fn media_bridge(
                 }
             } else {
                 let handle = images.add(frame_image(&frame));
+                crate::diagnostics::first_frame_submitted(&playback.token.instance_id);
                 let (size, position) = placement(
                     &playback.clip,
                     Vec2::new(frame.width as f32, frame.height as f32),
@@ -596,6 +600,7 @@ pub(crate) fn media_bridge(
         }
     }
     let events = runtime.host.drain_events();
+    crate::diagnostics::observe_events(&events);
     if runtime.snapshot_dirty || callbacks_seen || !events.is_empty() {
         runtime.snapshot = runtime.host.snapshot();
         runtime.snapshot_dirty = false;

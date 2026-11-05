@@ -3,6 +3,7 @@ mod app;
 mod app_macos;
 pub mod catalog;
 pub mod commands;
+mod diagnostics;
 pub mod host;
 pub mod media;
 mod network_app;
@@ -70,6 +71,15 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let diagnostic_guard = config
+        .diagnostics
+        .as_ref()
+        .map(|path| diagnostics::start(path))
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("Cannot start protected diagnostics: {error}");
+            std::process::exit(2);
+        });
     let runtime = match app::Runtime::new(&config) {
         Ok(runtime) => runtime,
         Err(message) => {
@@ -113,4 +123,9 @@ fn main() {
             panel::PanelPlugin,
         ))
         .run();
+    if let Some(guard) = diagnostic_guard
+        && !guard.finish()
+    {
+        eprintln!("Diagnostics did not finish cleanly; treat the file as incomplete");
+    }
 }
