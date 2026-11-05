@@ -118,6 +118,11 @@ fn main() {
                     primary_window: Some(Window {
                         title: "Durop".into(),
                         resolution: (1160, 820).into(),
+                        resize_constraints: bevy::window::WindowResizeConstraints {
+                            min_width: 400.,
+                            min_height: 520.,
+                            ..default()
+                        },
                         visible: config.mode != app::Mode::Host,
                         focused: config.mode != app::Mode::Host,
                         ..default()
