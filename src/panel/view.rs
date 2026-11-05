@@ -193,8 +193,7 @@ impl View<'_> {
         clip: &Clip,
         image: Option<Handle<Image>>,
         dimensions: Option<Vec2>,
-        width: f32,
-        height: f32,
+        layout: GridLayout,
         status: &str,
         stop: Option<&str>,
     ) {
@@ -203,8 +202,8 @@ impl View<'_> {
                 Button,
                 UiAction::Runtime(Action::Play(clip.identity.clone())),
                 Node {
-                    width: px(width),
-                    height: px(height),
+                    width: px(layout.card_width),
+                    height: px(layout.card_height),
                     padding: UiRect::all(px(12)),
                     border: UiRect::all(px(1)),
                     border_radius: BorderRadius::all(px(8)),
@@ -224,8 +223,8 @@ impl View<'_> {
                 card.spawn((
                     Node {
                         width: percent(100),
-                        height: px(172),
-                        min_height: px(172),
+                        height: px(layout.preview_height),
+                        min_height: px(layout.preview_height),
                         align_items: AlignItems::Center,
                         justify_content: JustifyContent::Center,
                         border_radius: BorderRadius::all(px(4)),
@@ -237,7 +236,8 @@ impl View<'_> {
                 .with_children(|preview| {
                     if let Some(image) = image {
                         let dimensions = dimensions.unwrap_or(Vec2::splat(1.));
-                        let scale = ((width - 26.) / dimensions.x).min(172. / dimensions.y);
+                        let scale = ((layout.card_width - 26.) / dimensions.x)
+                            .min(layout.preview_height / dimensions.y);
                         preview.spawn((
                             ImageNode::new(image),
                             Node {
@@ -924,8 +924,7 @@ pub(super) fn render(
                                         clip,
                                         image,
                                         dimensions,
-                                        model.layout.card_width,
-                                        model.layout.card_height,
+                                        model.layout,
                                         status,
                                         active.map(|instance| instance.instance_id.as_str()),
                                     );

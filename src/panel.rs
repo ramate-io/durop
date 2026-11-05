@@ -209,8 +209,10 @@ struct GridLayout {
     rows: usize,
     /// Logical width of each card after gaps and scrollbar reservation.
     card_width: f32,
-    /// Fixed media-card height keeps row virtualization predictable.
+    /// Card height fits a complete title and controls into compact viewports.
     card_height: f32,
+    /// Preview shrinks before the title and controls lose space.
+    preview_height: f32,
 }
 
 impl Default for GridLayout {
@@ -225,14 +227,17 @@ impl GridLayout {
         let available = (width - 78.).max(180.);
         let columns = ((available + 20.) / 250.).floor().clamp(1., 6.) as usize;
         let toolbar_extra = if width < 760. { 80. } else { 0. };
-        let rows = ((height - 276. - toolbar_extra) / 302.)
+        let viewport = (height - 296. - toolbar_extra).max(134.);
+        let card_height = viewport.min(282.);
+        let rows = ((viewport + 20.) / (card_height + 20.))
             .floor()
             .clamp(1., 6.) as usize;
         Self {
             columns,
             rows,
             card_width: (available - 20. * (columns - 1) as f32) / columns as f32,
-            card_height: 282.,
+            card_height,
+            preview_height: card_height - 110.,
         }
     }
 }

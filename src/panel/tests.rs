@@ -582,3 +582,23 @@ fn modal_wheel_scroll_is_clamped_and_does_not_move_catalog_rows() {
     assert_eq!(model.first_row, 3);
     assert_eq!(model.modal.as_ref().unwrap().scroll, 400.);
 }
+
+/// A complete compact card retains its two-line title and action row below the preview.
+#[test]
+fn short_window_cards_fit_titles_and_controls_inside_the_collection() {
+    for (width, height) in [(720., 520.), (400., 520.), (1160., 520.), (1160., 820.)] {
+        let layout = GridLayout::for_window(width, height);
+        let toolbar_extra = if width < 760. { 80. } else { 0. };
+        let available_height = height - 296. - toolbar_extra;
+        assert!(layout.card_height <= available_height);
+        assert!(layout.preview_height >= 24.);
+        // Title 44px + controls 20px + padding/border 26px + two 10px gaps.
+        assert_eq!(
+            layout.preview_height + 44. + 20. + 26. + 20.,
+            layout.card_height
+        );
+        assert_eq!(layout.rows, 1);
+    }
+    assert_eq!(GridLayout::for_window(1160., 820.).preview_height, 172.);
+    assert_eq!(GridLayout::for_window(720., 520.).preview_height, 34.);
+}
