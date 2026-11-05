@@ -127,7 +127,8 @@ impl NetworkState {
     }
     #[cfg(test)]
     pub(crate) fn accept_for_ui_test(&mut self, host: &mut crate::host::Host) {
-        self.accept_pending(host);
+        let session = host.session_id().to_owned();
+        self.accept_pending(host, &session);
     }
     pub fn queue_local(&self, envelope: Envelope) -> Result<(), QueueError> {
         self.local.try_send(envelope.clone())?;
