@@ -330,7 +330,18 @@ impl Recorder {
                     }
                 }
                 WriterCommand::Stop(ack) => {
-                    let mut footer = serde_json::to_vec(&serde_json::json!({"target":"durop_timing","fields":{"stage":"diagnostics_summary","dropped_events":counters.dropped.load(Ordering::Relaxed),"evicted_traces":counters.evicted.load(Ordering::Relaxed),"writer_errors":counters.writer_errors.load(Ordering::Relaxed),"file_capped":counters.capped.load(Ordering::Relaxed),"bytes_before_summary":written}})).unwrap_or_default();
+                    let mut footer = serde_json::to_vec(&serde_json::json!({
+                        "target": "durop_timing",
+                        "fields": {
+                            "stage": "diagnostics_summary",
+                            "dropped_events": counters.dropped.load(Ordering::Relaxed),
+                            "evicted_traces": counters.evicted.load(Ordering::Relaxed),
+                            "writer_errors": counters.writer_errors.load(Ordering::Relaxed),
+                            "file_capped": counters.capped.load(Ordering::Relaxed),
+                            "bytes_before_summary": written
+                        }
+                    }))
+                    .unwrap_or_default();
                     footer.push(b'\n');
                     let ok = written + footer.len() <= limit
                         && file.write_all(&footer).and_then(|_| file.flush()).is_ok();

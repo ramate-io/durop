@@ -51,11 +51,17 @@ pub(super) struct NativeReady;
 
 /// Collect window/display intents for the next ordered update.
 #[derive(Resource, Default)]
-pub struct PendingControls(pub Vec<Control>);
+pub struct PendingControls(
+    /// Intents drained in order by the overlay control system.
+    pub Vec<Control>,
+);
 
 /// Receive optional proof controls without blocking the render thread.
 #[derive(Resource)]
-pub struct Controls(pub Mutex<Receiver<Control>>);
+pub struct Controls(
+    /// Protected receiver polled without blocking the render thread.
+    pub Mutex<Receiver<Control>>,
+);
 
 /// Window and display commands independent of playback policy.
 #[derive(Debug, PartialEq, Eq)]

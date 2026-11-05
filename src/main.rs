@@ -1,20 +1,32 @@
+//! Durop application assembly: one executable over independent domain libraries.
+
+#![deny(missing_docs)]
+
 mod app;
+
 #[cfg(target_os = "macos")]
 mod app_macos;
+
 /// Validated local and Git catalog sources, independent of presentation.
 pub extern crate durop_catalog as catalog;
+
 /// Shared wire commands and host observations.
 pub extern crate durop_protocol as commands;
+
 mod diagnostics;
+
 /// Serialized playback policy and bounded command ingress.
 pub extern crate durop_host as host;
+
 /// Framework-independent GIF and native media workers.
 pub extern crate durop_media as media;
+
 mod media_app;
 mod network_app;
 pub mod overlay;
 mod panel;
 mod preferences;
+
 /// Authenticated Tailscale sessions and controller protocol.
 pub extern crate durop_transport as transport;
 

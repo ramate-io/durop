@@ -318,8 +318,11 @@ impl GitRunner {
             // prompt on a clean Mac. Check selected tools without invoking that stub.
             let mut select = Command::new("/usr/bin/xcode-select");
             select.arg("-p");
-            let bytes = Self::run_command(select, std::time::Duration::from_secs(2))
-            .map_err(|_| CatalogError::new("Git refresh requires usable external Git. Apple's Git launcher has no selected developer tools; Durop will not invoke an installation prompt. Use a local/bundled/cached pack, or configure standalone Git on PATH."))?;
+            let bytes = Self::run_command(select, std::time::Duration::from_secs(2)).map_err(|_| {
+                CatalogError::new(
+                    "Git refresh requires usable external Git. Apple's Git launcher has no selected developer tools; Durop will not invoke an installation prompt. Use a local/bundled/cached pack, or configure standalone Git on PATH.",
+                )
+            })?;
             let directory = String::from_utf8(bytes)
                 .map_err(|_| CatalogError::new("invalid selected developer-tools path"))?;
             return Self::selected_developer_git(Path::new(directory.trim()));
@@ -354,7 +357,11 @@ impl GitRunner {
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_LFS_SKIP_SMUDGE", "1");
-        Self::run_command(command, std::time::Duration::from_secs(120)).map_err(|error| CatalogError::new(format!("Git refresh could not complete; check that Git is usable and the source/ref is available. Local/bundled/cached packs remain usable. {error}")))
+        Self::run_command(command, std::time::Duration::from_secs(120)).map_err(|error| {
+            CatalogError::new(format!(
+                "Git refresh could not complete; check that Git is usable and the source/ref is available. Local/bundled/cached packs remain usable. {error}"
+            ))
+        })
     }
 
     // Drain bounded output concurrently so large objects cannot deadlock a pipe.
