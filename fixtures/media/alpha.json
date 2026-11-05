@@ -1,0 +1,18 @@
+{
+  "id": "alpha",
+  "title": "Transparent HEVC ring",
+  "asset": "alpha-hevc.mov",
+  "tags": [
+    "proof"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4000
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.25,
+    "fit": "contain"
+  }
+}

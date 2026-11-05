@@ -6,8 +6,15 @@ rust-version = "1.95"
 license = "MIT"
 
 [dependencies]
+gif = "0.14"
 bevy = { version = "=0.19.1", default-features = false, features = ["std", "async_executor", "bevy_window", "bevy_winit", "x11", "bevy_asset", "bevy_render", "bevy_camera", "bevy_core_pipeline", "bevy_sprite", "bevy_sprite_render", "bevy_text", "default_font", "png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 raw-window-handle = "0.6"
+objc2-foundation = "0.3.2"
+objc2-av-foundation = { version = "0.3.2", features = ["objc2-core-media", "objc2-core-video"] }
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+objc2-core-image = "0.3.2"
+objc2-core-graphics = "0.3.2"
