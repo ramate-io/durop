@@ -1,6 +1,6 @@
 pub mod catalog;
-mod commands;
-mod host;
+pub mod commands;
+pub mod host;
 mod media;
 mod overlay;
 mod panel;
