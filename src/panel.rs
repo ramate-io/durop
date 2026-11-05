@@ -1,4 +1,11 @@
-//! Bounded catalog UI with an explicit Unicode and IME text editor.
+//! Native controller panel with bounded virtualization and Unicode/IME editing.
+
+pub(crate) mod configuration;
+#[cfg(test)]
+mod tests;
+mod theme;
+mod view;
+
 use crate::{
     app::{Action, Actions, Destination, Mode, Runtime},
     catalog::Clip,
@@ -14,17 +21,24 @@ use bevy::{
     prelude::*,
     window::{Ime, PrimaryWindow, WindowRef},
 };
+use configuration::{
+    CatalogProvider, ConfigurationContext, ConfigurationDraft, ConfigurationIntent, DisplayChoice,
+    HostProvider, Provider,
+};
 use std::{
     collections::BTreeMap,
     io::Read,
     io::{self, BufRead},
     sync::{Mutex, mpsc},
 };
+use theme::Fonts;
 
-/// Number of clip tiles shown across the bounded catalog viewport.
+/// Reference desktop grid width used by contract tests.
+#[cfg(test)]
 const COLUMNS: usize = 4;
 
-/// Maximum visible tile rows, independent of total catalog size.
+/// Reference visible row bound used by contract tests.
+#[cfg(test)]
 const ROWS: usize = 3;
 
 /// Identify the editor receiving committed keyboard and IME input.
@@ -32,16 +46,12 @@ const ROWS: usize = 3;
 enum Field {
     /// Catalog text filter.
     Search,
-    /// Local or Git catalog source.
-    Pack,
-    /// Remote host endpoint.
-    Address,
-    /// Ephemeral pairing credential.
-    Secret,
+    /// Provider-specific editor inside the active configuration dialog.
+    Configuration(usize),
 }
 
 /// Bounded Unicode editor with a byte-boundary cursor and separate IME preedit.
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Clone)]
 struct Editor {
     /// Committed UTF-8 content.
     text: String,
@@ -118,8 +128,6 @@ impl Editor {
 struct Model {
     /// Search-field editor.
     query: Editor,
-    /// Pack-source editor.
-    pack: Editor,
     /// Editor currently owning text input.
     focus: Option<Field>,
     /// First visible row after filtering.
@@ -128,12 +136,18 @@ struct Model {
     signature: String,
     /// Current panel widget subtree.
     root: Option<Entity>,
-    /// Remote endpoint editor.
-    address: Editor,
-    /// Transient pairing editor, never included in preferences.
-    secret: Editor,
-    /// Whether editor defaults have been copied from network state.
-    network_initialized: bool,
+    /// Open provider selector; closed before a configuration dialog appears.
+    dropdown: Option<Dropdown>,
+    /// Pending provider settings; applying is the only path to side effects.
+    modal: Option<Modal>,
+    /// Current responsive grid geometry and scroll bounds.
+    layout: GridLayout,
+    /// Number of filtered clips used to clamp scrolling and scrollbar position.
+    matches: usize,
+    /// Invalidate the view without including credential text in a fingerprint.
+    revision: u64,
+    /// Whether scrollbar dragging has captured the pointer.
+    dragging: bool,
     /// Last persisted benign state, avoiding unchanged disk writes.
     saved_preferences: Option<crate::preferences::Preferences>,
     /// Modifier state reconstructed from ordered keyboard events.
@@ -149,10 +163,319 @@ enum UiAction {
     Runtime(Action),
     /// Move text focus to one editor.
     Focus(Field),
-    /// Move the catalog viewport by a signed number of rows.
-    Page(i32),
-    /// Queue an explicit connection or remote command intent.
-    Network(crate::network_app::NetworkAction),
+    /// Open or close a provider menu.
+    Dropdown(Dropdown),
+    /// Open a new isolated configuration draft.
+    Configure(Provider),
+    /// Discard the draft and its ephemeral credential.
+    Cancel,
+    /// Validate and apply the active provider draft.
+    Apply,
+    /// Advance a finite choice field without accepting arbitrary display indices.
+    Cycle(usize),
+    /// Revoke the selected remote connection immediately.
+    Disconnect,
+    /// Revoke remote access to the local host without hiding the controller.
+    RevokeHost,
+}
+
+/// Header menu whose choices configure a host or catalog provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dropdown {
+    /// Native or authenticated Tailscale control.
+    Host,
+    /// Bundled, directory or Git catalog sources.
+    Catalog,
+}
+
+/// Isolated form edits; dropping this state discards ephemeral credentials.
+struct Modal {
+    /// Provider-owned validation schema and uncommitted values.
+    draft: ConfigurationDraft,
+    /// Unicode edit state corresponding one-to-one with draft fields.
+    editors: Vec<Editor>,
+    /// Validation feedback shown without reflecting credential values.
+    error: Option<String>,
+    /// Logical offset of the bounded form body, preserved across field edits.
+    scroll: f32,
+}
+
+/// Responsive geometry keeps rendered entities bounded independently of catalog size.
+#[derive(Clone, Copy, Debug)]
+struct GridLayout {
+    /// Visible columns based on available logical width.
+    columns: usize,
+    /// Complete visible rows based on available logical height.
+    rows: usize,
+    /// Logical width of each card after gaps and scrollbar reservation.
+    card_width: f32,
+    /// Fixed media-card height keeps row virtualization predictable.
+    card_height: f32,
+}
+
+impl Default for GridLayout {
+    fn default() -> Self {
+        Self::for_window(1160., 820.)
+    }
+}
+
+impl GridLayout {
+    /// Fit large previews while allowing one-column compact windows and six-column wide windows.
+    fn for_window(width: f32, height: f32) -> Self {
+        let available = (width - 78.).max(180.);
+        let columns = ((available + 20.) / 250.).floor().clamp(1., 6.) as usize;
+        let rows = ((height - 276.) / 302.).floor().clamp(1., 6.) as usize;
+        Self {
+            columns,
+            rows,
+            card_width: (available - 20. * (columns - 1) as f32) / columns as f32,
+            card_height: 282.,
+        }
+    }
+}
+
+/// Scrollbar track captures pointer coordinates without creating a node per catalog item.
+#[derive(Component)]
+struct Scrollbar;
+
+/// Scrollable configuration body keeps its heading and action footer available.
+#[derive(Component)]
+struct ModalBody;
+
+/// Reusable hover colors avoid rebuilding the tree while the pointer moves.
+#[derive(Component)]
+struct HoverColors {
+    /// Paper color when the pointer is elsewhere.
+    resting: Color,
+    /// Accent used for hovered and pressed surfaces.
+    hovered: Color,
+}
+
+impl Model {
+    /// Block all background actions while a modal owns interaction, retaining the safety stop.
+    fn allows(&self, action: &UiAction) -> bool {
+        self.modal.is_none()
+            || matches!(
+                action,
+                UiAction::Apply
+                    | UiAction::Cancel
+                    | UiAction::Cycle(_)
+                    | UiAction::Focus(Field::Configuration(_))
+                    | UiAction::RevokeHost
+                    | UiAction::Configure(Provider::Host(HostProvider::TailscaleListener))
+                    | UiAction::Runtime(Action::StopAll | Action::Stop(_))
+            )
+    }
+
+    /// Build provider context from live monitor identities and the current committed application state.
+    fn configuration_context(
+        runtime: &Runtime,
+        network: &crate::network_app::NetworkState,
+        monitors: &Query<(Entity, &bevy::window::Monitor)>,
+    ) -> ConfigurationContext {
+        let mut monitors: Vec<_> = monitors.iter().collect();
+        monitors.sort_by_key(|(entity, _)| entity.to_bits());
+        let (git_url, git_reference, git_directory) = if runtime.pack_input.starts_with("https://")
+        {
+            let (url, revision) = runtime
+                .pack_input
+                .rsplit_once('#')
+                .unwrap_or((&runtime.pack_input, "main"));
+            let (reference, directory) = revision.split_once(':').unwrap_or((revision, ""));
+            (url.to_owned(), reference.to_owned(), directory.to_owned())
+        } else {
+            (
+                "https://github.com/ramate-io/durop.git".into(),
+                "main".into(),
+                "sample-packs/reactions".into(),
+            )
+        };
+        ConfigurationContext {
+            displays: monitors
+                .iter()
+                .enumerate()
+                .map(|(index, (_, monitor))| DisplayChoice {
+                    index,
+                    label: format!(
+                        "{} · {} × {}",
+                        monitor.name.as_deref().unwrap_or("Display"),
+                        monitor.physical_width,
+                        monitor.physical_height
+                    ),
+                })
+                .collect(),
+            current_display: runtime.display,
+            current_endpoint: network.address.clone(),
+            local_pack: runtime.pack_input.clone(),
+            bundled_path: crate::app::Config::bundled_pack(),
+            git_url,
+            git_reference,
+            git_directory,
+        }
+    }
+
+    /// Begin a new provider draft without changing playback or network ownership.
+    fn open(&mut self, provider: Provider, context: &ConfigurationContext) {
+        let draft = ConfigurationDraft::new(provider, context);
+        let editors = draft
+            .fields
+            .iter()
+            .map(|field| Editor {
+                text: field.value.clone(),
+                cursor: field.value.len(),
+                ..default()
+            })
+            .collect();
+        self.modal = Some(Modal {
+            draft,
+            editors,
+            error: None,
+            scroll: 0.,
+        });
+        self.dropdown = None;
+        self.focus = None;
+        self.dragging = false;
+    }
+
+    /// Discard modal state and transient menus; no provider intent is emitted.
+    fn close(&mut self) {
+        if let Some(modal) = self.modal.take() {
+            modal.draft.cancel();
+        }
+        self.dropdown = None;
+        self.focus = None;
+    }
+
+    /// Validate editable values before consuming the draft into a typed application intent.
+    fn apply(&mut self, context: &ConfigurationContext) -> Option<ConfigurationIntent> {
+        let modal = self.modal.as_mut()?;
+        for (field, editor) in modal.draft.fields.iter_mut().zip(&modal.editors) {
+            field.value.clone_from(&editor.text);
+        }
+        if let Err(error) = modal.draft.validate(context) {
+            modal.error = Some(error.message.into());
+            return None;
+        }
+        let modal = self.modal.take()?;
+        self.focus = None;
+        modal.draft.apply(context).ok()
+    }
+
+    /// Retrieve only an editable field; choices and immutable catalog paths do not accept text.
+    fn editor(&mut self, field: Field) -> Option<&mut Editor> {
+        match field {
+            Field::Search => Some(&mut self.query),
+            Field::Configuration(index) => {
+                let modal = self.modal.as_mut()?;
+                let field = modal.draft.fields.get(index)?;
+                if field.read_only || !field.choices.is_empty() {
+                    return None;
+                }
+                modal.editors.get_mut(index)
+            }
+        }
+    }
+
+    /// Trim pasted credentials while leaving ordinary user-entered field values exact.
+    #[cfg(target_os = "macos")]
+    fn is_secret(&self, field: Field) -> bool {
+        match field {
+            Field::Search => false,
+            Field::Configuration(index) => self
+                .modal
+                .as_ref()
+                .and_then(|modal| modal.draft.fields.get(index))
+                .is_some_and(|field| field.secret),
+        }
+    }
+
+    /// Cycle keyboard focus through editable modal fields without leaking input to the catalog.
+    fn focus_next(&mut self) {
+        let Some(modal) = &self.modal else {
+            return;
+        };
+        let fields: Vec<_> = modal
+            .draft
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !field.read_only && field.choices.is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        if fields.is_empty() {
+            return;
+        }
+        let next = match self.focus {
+            Some(Field::Configuration(index)) => fields
+                .iter()
+                .position(|candidate| *candidate == index)
+                .map_or(0, |current| (current + 1) % fields.len()),
+            _ => 0,
+        };
+        self.focus = Some(Field::Configuration(fields[next]));
+    }
+
+    /// Clamp the first virtual row against the complete filtered result count.
+    fn max_row(&self) -> usize {
+        self.matches
+            .div_ceil(self.layout.columns)
+            .saturating_sub(self.layout.rows)
+    }
+
+    /// Include one clipped preview row beyond complete rows without making the last row unreachable.
+    fn visible(&self, clips: &[Clip]) -> Vec<usize> {
+        clips
+            .iter()
+            .enumerate()
+            .filter(|(_, clip)| Self::matching(clip, &self.query.text))
+            .skip(self.first_row.saturating_mul(self.layout.columns))
+            .take(self.layout.columns * (self.layout.rows + 1))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Map a track-relative pointer coordinate to the nearest available row.
+    fn seek_scrollbar(&mut self, fraction: f32) {
+        let total = self.matches.div_ceil(self.layout.columns).max(1);
+        let thumb = (self.layout.rows as f32 / total as f32).min(1.);
+        let progress = ((fraction - thumb * 0.5) / (1. - thumb).max(f32::EPSILON)).clamp(0., 1.);
+        self.first_row = (progress * self.max_row() as f32).round() as usize;
+    }
+}
+
+/// Drag the virtual scrollbar, retaining capture across subtree rebuilds and pointer exits.
+fn scrollbar(
+    mut model: ResMut<Model>,
+    tracks: Query<(&Interaction, &bevy::ui::RelativeCursorPosition), With<Scrollbar>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+) {
+    if !mouse.pressed(MouseButton::Left) || model.modal.is_some() {
+        model.dragging = false;
+        return;
+    }
+    for (interaction, cursor) in &tracks {
+        if *interaction == Interaction::Pressed {
+            model.dragging = true;
+        }
+        if model.dragging
+            && let Some(position) = cursor.normalized
+        {
+            model.seek_scrollbar(position.y + 0.5);
+        }
+    }
+}
+
+/// Apply subtle feedback to interactive paper surfaces without triggering layout churn.
+fn hover(
+    mut widgets: Query<(&Interaction, &HoverColors, &mut BackgroundColor), Changed<Interaction>>,
+) {
+    for (interaction, colors, mut background) in &mut widgets {
+        background.0 = if *interaction == Interaction::None {
+            colors.resting
+        } else {
+            colors.hovered
+        };
+    }
 }
 
 /// Cache decoded thumbnail handles and failed loads by clip identity.
@@ -211,16 +534,17 @@ impl Plugin for PanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Model>()
             .init_resource::<Icons>()
+            .init_resource::<Fonts>()
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
-                (buttons, text_input, scroll, terminal)
+                (buttons, text_input, scroll, scrollbar, hover, terminal)
                     .chain()
                     .before(crate::app::actions),
             )
             .add_systems(
                 Update,
-                render
+                view::render
                     .after(crate::app::media_bridge)
                     .before(crate::overlay::sync_overlay),
             );
@@ -228,6 +552,10 @@ impl Plugin for PanelPlugin {
 }
 
 /// Create the panel camera and restore benign preferences before the first render.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Startup binds the panel camera, assets, preferences and native display controls"
+)]
 fn setup(
     mut commands: Commands,
     primary: Single<Entity, With<PrimaryWindow>>,
@@ -235,7 +563,10 @@ fn setup(
     runtime: Res<Runtime>,
     mut model: ResMut<Model>,
     mut controls: ResMut<crate::overlay::PendingControls>,
+    assets: Res<AssetServer>,
+    mut fonts: ResMut<Fonts>,
 ) {
+    *fonts = Fonts::load(&assets);
     let camera = commands
         .spawn((
             Camera2d,
@@ -244,8 +575,6 @@ fn setup(
         ))
         .id();
     commands.insert_resource(PanelCamera(camera));
-    model.pack.text = runtime.pack_input.clone();
-    model.pack.cursor = model.pack.text.len();
     let preferences = crate::preferences::Preferences::load();
     model.query.text = preferences.query;
     model.query.cursor = model.query.text.len();
@@ -328,6 +657,7 @@ impl Model {
     }
 
     /// Select only the current page of matching catalog entries for rendering.
+    #[cfg(test)]
     fn visible_indices(clips: &[Clip], query: &str, row: usize) -> Vec<usize> {
         clips
             .iter()
@@ -340,38 +670,143 @@ impl Model {
     }
 }
 
-/// Dispatch pressed button intents to application, editor or network state.
+/// Dispatch one pointer press; rebuilding widgets must not repeat a held click.
 fn buttons(
     mut model: ResMut<Model>,
     buttons: Query<(&Interaction, &UiAction), Changed<Interaction>>,
     mut actions: ResMut<Actions>,
     mut network: ResMut<crate::network_app::NetworkState>,
+    runtime: Res<Runtime>,
+    monitors: Query<(Entity, &bevy::window::Monitor)>,
+    mouse: Option<Res<ButtonInput<MouseButton>>>,
 ) {
+    if mouse
+        .as_ref()
+        .is_some_and(|mouse| !mouse.just_pressed(MouseButton::Left))
+    {
+        return;
+    }
     for (interaction, action) in &buttons {
-        if *interaction != Interaction::Pressed {
+        if *interaction != Interaction::Pressed || !model.allows(action) {
             continue;
         }
+        model.revision = model.revision.wrapping_add(1);
         match action {
-            UiAction::Runtime(a) => {
+            UiAction::Runtime(action) => {
                 model.focus = None;
-                actions.0.push_back(a.clone());
+                model.dropdown = None;
+                actions.0.push_back(action.clone());
             }
-            UiAction::Focus(field) => model.focus = Some(*field),
-            UiAction::Page(d) => {
-                model.first_row = if *d < 0 {
-                    model.first_row.saturating_sub(ROWS)
+            UiAction::Focus(field) => {
+                model.focus = Some(*field);
+                model.dropdown = None;
+            }
+            UiAction::Dropdown(menu) => {
+                model.dropdown = if model.dropdown == Some(*menu) {
+                    None
                 } else {
-                    model.first_row + ROWS
+                    Some(*menu)
+                };
+                model.focus = None;
+            }
+            UiAction::Configure(provider) => {
+                let context = Model::configuration_context(&runtime, &network, &monitors);
+                model.open(*provider, &context);
+            }
+            UiAction::Cancel => model.close(),
+            UiAction::Cycle(index) => {
+                if let Some(modal) = &mut model.modal {
+                    let field = &modal.draft.fields[*index];
+                    let editor = &mut modal.editors[*index];
+                    if !field.choices.is_empty() {
+                        let selected = field
+                            .choices
+                            .iter()
+                            .position(|choice| choice.value == editor.text)
+                            .unwrap_or(0);
+                        editor.text = field.choices[(selected + 1) % field.choices.len()]
+                            .value
+                            .clone();
+                        editor.cursor = editor.text.len();
+                    }
                 }
             }
-            UiAction::Network(action) => {
-                network.address = model.address.text.clone();
-                if matches!(action, crate::network_app::NetworkAction::Connect) {
-                    network.secret = std::mem::take(&mut model.secret.text);
-                    model.secret.cursor = 0;
+            UiAction::Apply => {
+                if runtime.mode == Mode::Controller
+                    && let Some(modal) = &mut model.modal
+                {
+                    let restriction = match modal.draft.provider {
+                        Provider::Host(HostProvider::Native | HostProvider::TailscaleListener) => {
+                            Some(
+                                "This launch is controller-only. Restart Durop in local mode to play or share this Mac.",
+                            )
+                        }
+                        Provider::Catalog(_) => Some(
+                            "Catalog is supplied by the remote host. Restart Durop in local mode to use local catalog sources.",
+                        ),
+                        Provider::Host(HostProvider::Tailscale) => None,
+                    };
+                    if let Some(message) = restriction {
+                        modal.error = Some(message.into());
+                        continue;
+                    }
                 }
-                network.actions.push_back(action.clone());
-                model.focus = None;
+                let context = Model::configuration_context(&runtime, &network, &monitors);
+                if let Some(intent) = model.apply(&context) {
+                    let source = intent.source_value();
+                    match intent {
+                        ConfigurationIntent::Native { display } => {
+                            actions.0.push_back(Action::Destination(Destination::Local));
+                            actions.0.push_back(Action::SelectDisplay(display));
+                            if !runtime.enabled {
+                                actions.0.push_back(Action::ToggleHost);
+                            }
+                        }
+                        ConfigurationIntent::Tailscale {
+                            endpoint,
+                            credential,
+                        } => {
+                            network.address = format!("ws://{endpoint}/control");
+                            network.secret = credential.bearer().to_owned();
+                            network
+                                .actions
+                                .push_back(crate::network_app::NetworkAction::Connect);
+                            actions
+                                .0
+                                .push_back(Action::Destination(Destination::Remote));
+                        }
+                        ConfigurationIntent::TailscaleListener { endpoint } => {
+                            network.address = endpoint.to_string();
+                            network
+                                .actions
+                                .push_back(crate::network_app::NetworkAction::EnableHost);
+                            model.open(Provider::Host(HostProvider::Native), &context);
+                        }
+                        ConfigurationIntent::Bundled { path }
+                        | ConfigurationIntent::LocalDirectory { path } => {
+                            actions.0.push_back(Action::Destination(Destination::Local));
+                            actions
+                                .0
+                                .push_back(Action::LoadPack(path.to_string_lossy().into_owned()));
+                        }
+                        ConfigurationIntent::GitHttps { .. } => {
+                            actions.0.push_back(Action::Destination(Destination::Local));
+                            actions.0.push_back(Action::LoadPack(
+                                source.expect("catalog intent has a source"),
+                            ));
+                        }
+                    }
+                }
+            }
+            UiAction::RevokeHost => {
+                network
+                    .actions
+                    .push_back(crate::network_app::NetworkAction::DisableHost);
+            }
+            UiAction::Disconnect => {
+                network
+                    .actions
+                    .push_back(crate::network_app::NetworkAction::Disconnect);
             }
         }
     }
@@ -379,7 +814,9 @@ fn buttons(
 
 /// Retain raw-window modifier ordering alongside translated key events.
 enum OrderedInput {
+    /// Native command/control flags at this point in the event sequence.
     Modifiers(u8),
+    /// Keyboard message paired with the flags active at its position.
     Keyboard(KeyboardInput),
 }
 
@@ -426,14 +863,12 @@ fn text_input(
     }
     let mut committed = false;
     for event in ime.read() {
+        model.revision = model.revision.wrapping_add(1);
         let Some(field) = model.focus else {
             continue;
         };
-        let edit = match field {
-            Field::Search => &mut model.query,
-            Field::Pack => &mut model.pack,
-            Field::Address => &mut model.address,
-            Field::Secret => &mut model.secret,
+        let Some(edit) = model.editor(field) else {
+            continue;
         };
         match event {
             Ime::Preedit { window, value, .. } if *window == entity => edit.preedit = value.clone(),
@@ -502,15 +937,23 @@ fn text_input(
         if key.state != ButtonState::Pressed {
             continue;
         }
+        model.revision = model.revision.wrapping_add(1);
+        if key.logical_key == Key::Escape && (model.modal.is_some() || model.dropdown.is_some()) {
+            model.close();
+            continue;
+        }
+        if key.logical_key == Key::Tab && model.modal.is_some() {
+            model.focus_next();
+            continue;
+        }
         if let Some(field) = model.focus {
             // Preserve modifier ordering even if key-down and key-up arrive in
             // one update, when ButtonInput already contains the final state.
             let modified = raw_modified.unwrap_or(model.modifiers != 0);
-            let edit = match field {
-                Field::Search => &mut model.query,
-                Field::Pack => &mut model.pack,
-                Field::Address => &mut model.address,
-                Field::Secret => &mut model.secret,
+            #[cfg(target_os = "macos")]
+            let secret = model.is_secret(field);
+            let Some(edit) = model.editor(field) else {
+                continue;
             };
             if key.logical_key == Key::Escape {
                 edit.preedit.clear();
@@ -527,20 +970,13 @@ fn text_input(
                 Key::Home => edit.cursor = 0,
                 Key::End => edit.cursor = edit.text.len(),
                 Key::Enter => {
-                    if field == Field::Pack {
-                        actions.0.push_back(Action::LoadPack(edit.text.clone()));
-                    }
                     model.focus = None;
                 }
                 _ if modified && key.key_code == KeyCode::KeyA => edit.select_all = true,
                 #[cfg(target_os = "macos")]
                 _ if modified && key.key_code == KeyCode::KeyV => {
                     if let Some(text) = crate::app_macos::paste_text() {
-                        edit.insert(if field == Field::Secret {
-                            text.trim()
-                        } else {
-                            &text
-                        });
+                        edit.insert(if secret { text.trim() } else { &text });
                     }
                 }
                 _ if !modified && !committed => {
@@ -554,14 +990,12 @@ fn text_input(
         } else if !key.repeat && !raw_modified.unwrap_or(model.modifiers != 0) {
             match key.logical_key {
                 Key::Escape => actions.0.push_back(Action::StopAll),
-                Key::Space if runtime.destination == Destination::Local => {
-                    if let Some(index) = Model::visible_indices(
-                        &runtime.catalog.clips,
-                        &model.query.text,
-                        model.first_row,
-                    )
-                    .first()
-                    {
+                Key::Space
+                    if runtime.destination == Destination::Local
+                        && model.modal.is_none()
+                        && model.dropdown.is_none() =>
+                {
+                    if let Some(index) = model.visible(&runtime.catalog.clips).first() {
                         actions.0.push_back(Action::Play(
                             runtime.catalog.clips[*index].identity.clone(),
                         ));
@@ -573,644 +1007,35 @@ fn text_input(
     }
 }
 
-/// Advance catalog rows within the number of matching results.
+/// Route wheel input to the active form body or bounded collection rows.
 fn scroll(
     mut wheel: MessageReader<MouseWheel>,
     primary: Single<Entity, With<PrimaryWindow>>,
     mut model: ResMut<Model>,
+    mut bodies: Query<(&ComputedNode, &mut ScrollPosition), With<ModalBody>>,
 ) {
     for event in wheel.read() {
-        if event.window == *primary && event.y != 0.0 {
+        if event.window != *primary || event.y == 0.0 {
+            continue;
+        }
+        if let Some(modal) = &mut model.modal {
+            for (node, mut position) in &mut bodies {
+                let maximum =
+                    ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
+                let delta = match event.unit {
+                    bevy::input::mouse::MouseScrollUnit::Line => event.y * 32.,
+                    bevy::input::mouse::MouseScrollUnit::Pixel => event.y,
+                };
+                modal.scroll = (position.y - delta).clamp(0., maximum);
+                position.y = modal.scroll;
+            }
+        } else {
+            model.dropdown = None;
             model.first_row = if event.y > 0.0 {
                 model.first_row.saturating_sub(1)
             } else {
-                model.first_row + 1
+                (model.first_row + 1).min(model.max_row())
             };
         }
-    }
-}
-
-/// Spawn a panel button with its semantic action and common visual style.
-fn button(parent: &mut ChildSpawnerCommands, label: impl Into<String>, action: UiAction) {
-    parent
-        .spawn((
-            Button,
-            action,
-            Node {
-                padding: UiRect::axes(px(10), px(6)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.16, 0.19, 0.23)),
-        ))
-        .with_child((
-            Text::new(label),
-            TextFont {
-                font_size: FontSize::Px(14.),
-                ..default()
-            },
-        ));
-}
-
-/// Rebuild changed panel content and visible thumbnails while persisting only benign settings.
-fn render(
-    mut commands: Commands,
-    mut model: ResMut<Model>,
-    runtime: Res<Runtime>,
-    camera: Res<PanelCamera>,
-    mut icons: ResMut<Icons>,
-    mut images: ResMut<Assets<Image>>,
-    network: Res<crate::network_app::NetworkState>,
-) {
-    if !model.network_initialized {
-        model.address.text = network.address.clone();
-        model.address.cursor = model.address.text.len();
-        model.network_initialized = true;
-    }
-    let remote = runtime.destination == Destination::Remote;
-    let preferences = crate::preferences::Preferences {
-        pack: crate::preferences::Preferences::stored_pack(
-            &runtime.pack_input,
-            &crate::app::resource_root().join("sample-packs/podcast-pack"),
-        ),
-        query: model.query.text.clone(),
-        display: runtime.display,
-    };
-    if model.saved_preferences.as_ref() != Some(&preferences) {
-        let _ = preferences.save();
-        model.saved_preferences = Some(preferences);
-    }
-    let snapshot = if remote {
-        network.snapshot.as_ref().unwrap_or(&runtime.snapshot)
-    } else {
-        &runtime.snapshot
-    };
-    let signature = format!(
-        "{}|{}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}",
-        model.query.label(),
-        model.pack.label(),
-        model.focus,
-        model.first_row,
-        snapshot.sequence,
-        runtime.status,
-        runtime.catalog.revision,
-        runtime.destination,
-        runtime.enabled,
-        network.status,
-        network.connected,
-        network.hosting,
-        model.address.label(),
-        model.secret.text.len(),
-        network.remote_icons.len()
-    );
-    if signature == model.signature {
-        return;
-    }
-    model.signature = signature;
-    let remote_clips: Vec<Clip> = if remote {
-        network
-            .remote_catalog
-            .as_ref()
-            .map(|catalog| {
-                catalog
-                    .clips
-                    .iter()
-                    .map(|clip| Clip {
-                        identity: clip.clip_id.clone(),
-                        category: clip.category.clone().into(),
-                        metadata: crate::catalog::ClipMetadata {
-                            id: clip.clip_id.clone(),
-                            title: clip.title.clone(),
-                            asset: format!("clip.{}", clip.media_type),
-                            tags: clip.tags.clone(),
-                            playback: crate::catalog::Playback::default(),
-                            visual: None,
-                        },
-                        metadata_path: Default::default(),
-                        icon_path: Default::default(),
-                        asset_path: Default::default(),
-                        decoder_readiness: crate::catalog::DecoderReadiness::Unchecked,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let clips = if remote {
-        remote_clips.as_slice()
-    } else {
-        runtime.catalog.clips.as_slice()
-    };
-    let total = clips
-        .iter()
-        .filter(|c| Model::matching(c, &model.query.text))
-        .count();
-    let max_row = total.div_ceil(COLUMNS).saturating_sub(ROWS);
-    model.first_row = model.first_row.min(max_row);
-    if let Some(root) = model.root.take() {
-        commands.entity(root).despawn();
-    }
-    let root = commands
-        .spawn((
-            Node {
-                width: percent(100),
-                height: percent(100),
-                padding: UiRect::all(px(14)),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(8),
-                overflow: Overflow::clip(),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.055, 0.065, 0.08)),
-            UiTargetCamera(camera.0),
-        ))
-        .id();
-    model.root = Some(root);
-    commands.entity(root).with_children(|parent| {
-        parent.spawn((
-            Text::new(format!(
-                "DUROP | {} | {} | display {}",
-                if runtime.destination == Destination::Local { "This Mac" } else { "Remote host" },
-                if remote {
-                    if network.connected { "connected" } else { "offline" }
-                } else if runtime.enabled {
-                    "host running"
-                } else {
-                    "host stopped"
-                },
-                runtime.display.map_or("primary".into(), |index| index.to_string())
-            )),
-            TextFont { font_size: FontSize::Px(22.), ..default() },
-        ));
-        parent.spawn(Node {
-            column_gap: px(6),
-            flex_wrap: FlexWrap::Wrap,
-            ..default()
-        }).with_children(|row| {
-            for (label, action) in [
-                ("This Mac", Action::Destination(Destination::Local)),
-                ("Remote host", Action::Destination(Destination::Remote)),
-                (if runtime.enabled { "Stop host" } else { "Start host" }, Action::ToggleHost),
-                ("STOP ALL", Action::StopAll),
-                ("Display >", Action::NextDisplay),
-                ("Hide", Action::Hide),
-                ("Quit", Action::Quit),
-            ] {
-                button(row, label, UiAction::Runtime(action));
-            }
-        });
-        parent.spawn(Node { column_gap: px(6), ..default() }).with_children(|row| {
-            button(row, format!("Pack: {}", model.pack.label()), UiAction::Focus(Field::Pack));
-            button(row, "Load / refresh", UiAction::Runtime(Action::LoadPack(model.pack.text.clone())));
-        });
-        button(
-            parent,
-            format!("Search title / tags / category: {}", model.query.label()),
-            UiAction::Focus(Field::Search),
-        );
-        parent.spawn(Node {
-            column_gap: px(5),
-            flex_wrap: FlexWrap::Wrap,
-            ..default()
-        }).with_children(|row| {
-            button(row, format!("Tailnet address: {}", model.address.label()), UiAction::Focus(Field::Address));
-            button(row, format!("Pairing secret: {}", "*".repeat(model.secret.text.chars().count())), UiAction::Focus(Field::Secret));
-            for (label, action) in [
-                ("Connect", crate::network_app::NetworkAction::Connect),
-                ("Disconnect", crate::network_app::NetworkAction::Disconnect),
-                ("Enable remote host", crate::network_app::NetworkAction::EnableHost),
-                ("Revoke remote", crate::network_app::NetworkAction::DisableHost),
-            ] {
-                button(row, label, UiAction::Network(action));
-            }
-        });
-        parent.spawn((Text::new(&network.status), TextFont { font_size: FontSize::Px(12.), ..default() }));
-        if let Some(secret) = &network.pairing_secret {
-            parent.spawn((
-                Text::new(format!("Pairing secret (private): {secret}")),
-                TextFont { font_size: FontSize::Px(12.), ..default() },
-            ));
-        }
-        parent.spawn((
-            Text::new(&runtime.status),
-            TextFont { font_size: FontSize::Px(13.), ..default() },
-            TextColor(Color::srgb(0.85, 0.8, 0.6)),
-        ));
-        parent.spawn(Node {
-            display: Display::Grid,
-            grid_template_columns: RepeatedGridTrack::fr(COLUMNS as u16, 1.),
-            column_gap: px(8),
-            row_gap: px(8),
-            ..default()
-        }).with_children(|grid| {
-            for index in Model::visible_indices(clips, &model.query.text, model.first_row) {
-                let clip = &clips[index];
-                let readiness = snapshot.clips.iter()
-                    .find(|c| c.clip_id == clip.identity)
-                    .map(|c| format!("{:?}", c.readiness))
-                    .unwrap_or_else(|| "Unchecked".into());
-                let state = snapshot.instances.iter().rev()
-                    .find(|i| i.clip_id == clip.identity)
-                    .map(|i| format!("{:?}", i.state))
-                    .unwrap_or_else(|| "Idle".into());
-                let error = runtime.errors.get(&clip.identity).cloned().unwrap_or_default();
-                let key = format!(
-                    "{}:{}:{}:{}",
-                    remote,
-                    snapshot.catalog_revision,
-                    clip.identity,
-                    remote && network.remote_icons.contains_key(&clip.identity),
-                );
-                if !icons.0.contains_key(&key) {
-                    let bytes = if remote {
-                        network.remote_icons.get(&clip.identity).cloned()
-                    } else {
-                        Icons::read_icon(&clip.icon_path).ok()
-                    };
-                    let handle = bytes.and_then(|bytes| Icons::icon_image(&bytes).ok())
-                        .map(|image| images.add(image));
-                    if icons.0.len() >= 128 {
-                        let old = icons.0.keys().next().cloned().unwrap();
-                        if let Some(Some(handle)) = icons.0.remove(&old) {
-                            images.remove(handle.id());
-                        }
-                    }
-                    icons.0.insert(key.clone(), handle);
-                }
-                let icon = icons.0.get(&key).cloned().flatten();
-                grid.spawn((
-                    Button,
-                    UiAction::Runtime(Action::Play(clip.identity.clone())),
-                    Node {
-                        height: px(102),
-                        padding: UiRect::all(px(7)),
-                        flex_direction: FlexDirection::Column,
-                        row_gap: px(3),
-                        overflow: Overflow::clip(),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.12, 0.14, 0.17)),
-                )).with_children(|tile| {
-                    if let Some(icon) = icon {
-                        tile.spawn((
-                            ImageNode::new(icon),
-                            Node { width: px(32), height: px(32), ..default() },
-                        ));
-                    }
-                    tile.spawn((
-                        Text::new(&clip.metadata.title),
-                        TextFont { font_size: FontSize::Px(15.), ..default() },
-                    ));
-                    tile.spawn((
-                        Text::new(format!(
-                            "{} | {readiness} | {state}",
-                            std::path::Path::new(&clip.metadata.asset).extension().unwrap_or_default().to_string_lossy(),
-                        )),
-                        TextFont { font_size: FontSize::Px(11.), ..default() },
-                    ));
-                    if !error.is_empty() {
-                        tile.spawn((
-                            Text::new(error),
-                            TextFont { font_size: FontSize::Px(11.), ..default() },
-                            TextColor(Color::srgb(1., 0.4, 0.35)),
-                        ));
-                    }
-                });
-            }
-        });
-        parent.spawn(Node { column_gap: px(6), ..default() }).with_children(|row| {
-            button(row, "Previous", UiAction::Page(-1));
-            button(row, "Next", UiAction::Page(1));
-            row.spawn((
-                Text::new(format!("{total} matches | row {} | mouse wheel scrolls", model.first_row + 1)),
-                TextFont { font_size: FontSize::Px(13.), ..default() },
-            ));
-        });
-        parent.spawn(Node {
-            column_gap: px(5),
-            flex_wrap: FlexWrap::Wrap,
-            ..default()
-        }).with_children(|row| {
-            for instance in snapshot.instances.iter().filter(|i| !i.state.is_terminal()).take(8) {
-                button(
-                    row,
-                    format!("Stop {} | {:?}", instance.clip_id, instance.state),
-                    UiAction::Runtime(Action::Stop(instance.instance_id.clone())),
-                );
-            }
-        });
-        parent.spawn((
-            Text::new("Search: Unicode / IME, arrows, Backspace, Ctrl/Cmd+A. Esc stops all outside fields. Terminal: panel | stop | quit. Native fullscreen overlay is unsupported on this Mac."),
-            TextFont { font_size: FontSize::Px(11.), ..default() },
-        ));
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn config() -> crate::app::Config {
-        crate::app::Config::parse(["--mode".into(), "controller".into()]).unwrap()
-    }
-    #[test]
-    fn thumbnails_reject_large_payloads_and_oversized_ihdr_before_decode() {
-        let mut bytes = vec![0; 24];
-        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
-        bytes[12..16].copy_from_slice(b"IHDR");
-        bytes[16..20].copy_from_slice(&100_000u32.to_be_bytes());
-        bytes[20..24].copy_from_slice(&100_000u32.to_be_bytes());
-        assert_eq!(
-            Icons::icon_image(&bytes).unwrap_err(),
-            "thumbnail dimensions exceed 512x512"
-        );
-        assert!(Icons::icon_image(&vec![0; MAX_ICON_BYTES + 1]).is_err());
-        let icon =
-            std::fs::read(crate::app::resource_root().join("sample-packs/podcast-pack/gif.png"))
-                .unwrap();
-        assert!(Icons::icon_image(&icon).is_ok());
-    }
-    fn input_app() -> (App, Entity) {
-        let mut app = App::new();
-        app.insert_resource(Runtime::new(&config()).unwrap())
-            .init_resource::<Model>()
-            .init_resource::<Actions>()
-            .init_resource::<ButtonInput<KeyCode>>()
-            .add_message::<KeyboardInput>()
-            .add_message::<Ime>()
-            .add_message::<bevy::winit::RawWinitWindowEvent>()
-            .add_systems(Update, text_input);
-        let window = app
-            .world_mut()
-            .spawn((
-                Window {
-                    focused: true,
-                    ..default()
-                },
-                PrimaryWindow,
-            ))
-            .id();
-        app.world_mut().resource_mut::<Model>().focus = Some(Field::Search);
-        (app, window)
-    }
-    fn key(app: &mut App, window: Entity, logical_key: Key, key_code: KeyCode, text: Option<&str>) {
-        app.world_mut().write_message(KeyboardInput {
-            key_code,
-            logical_key,
-            state: ButtonState::Pressed,
-            text: text.map(Into::into),
-            repeat: false,
-            window,
-        });
-    }
-    #[test]
-    fn actual_keyboard_messages_edit_search_and_suppress_drop_shortcuts() {
-        let (mut app, window) = input_app();
-        key(
-            &mut app,
-            window,
-            Key::Character("q".into()),
-            KeyCode::KeyQ,
-            Some("q"),
-        );
-        key(&mut app, window, Key::Space, KeyCode::Space, Some(" "));
-        app.update();
-        assert_eq!(app.world().resource::<Model>().query.text, "q ");
-        assert!(app.world().resource::<Actions>().0.is_empty());
-        key(&mut app, window, Key::Escape, KeyCode::Escape, None);
-        app.update();
-        assert!(app.world().resource::<Actions>().0.is_empty()); // first Escape ends search
-        key(&mut app, window, Key::Escape, KeyCode::Escape, None);
-        app.update();
-        assert!(matches!(
-            app.world().resource::<Actions>().0.front(),
-            Some(Action::StopAll)
-        ));
-    }
-    #[test]
-    fn modifier_down_a_modifier_up_in_one_update_selects_instead_of_typing_a() {
-        let (mut app, window) = input_app();
-        {
-            let mut model = app.world_mut().resource_mut::<Model>();
-            model.query.insert("gif");
-        }
-        key(&mut app, window, Key::Super, KeyCode::SuperLeft, None);
-        key(
-            &mut app,
-            window,
-            Key::Character("a".into()),
-            KeyCode::KeyA,
-            Some("a"),
-        );
-        app.world_mut().write_message(KeyboardInput {
-            key_code: KeyCode::SuperLeft,
-            logical_key: Key::Super,
-            state: ButtonState::Released,
-            text: None,
-            repeat: false,
-            window,
-        });
-        app.update();
-        assert_eq!(app.world().resource::<Model>().query.text, "gif");
-        assert!(app.world().resource::<Model>().query.select_all);
-        assert_eq!(app.world().resource::<Model>().modifiers, 0);
-        key(
-            &mut app,
-            window,
-            Key::Character("video".into()),
-            KeyCode::KeyV,
-            Some("video"),
-        );
-        app.update();
-        assert_eq!(app.world().resource::<Model>().query.text, "video");
-        assert!(app.world().resource::<Actions>().0.is_empty());
-    }
-    #[test]
-    fn flag_only_modifiers_apply_to_the_ordered_key_without_physical_modifier_events() {
-        let entity = Entity::PLACEHOLDER;
-        let key = |text: &str, code| KeyboardInput {
-            window: entity,
-            key_code: code,
-            logical_key: Key::Character(text.into()),
-            text: Some(text.into()),
-            state: ButtonState::Pressed,
-            repeat: false,
-        };
-        let mut flags = 0;
-        let keys = ordered_keyboard(
-            [
-                OrderedInput::Modifiers(1),
-                OrderedInput::Keyboard(key("a", KeyCode::KeyA)),
-                OrderedInput::Modifiers(0),
-                OrderedInput::Keyboard(key("g", KeyCode::KeyG)),
-            ],
-            &mut flags,
-        );
-        assert_eq!(keys.len(), 2);
-        assert!(keys[0].1);
-        assert!(!keys[1].1);
-        assert_eq!(flags, 0);
-        let mut query = Editor::default();
-        query.insert("video");
-        for (key, modified) in keys {
-            if modified && key.key_code == KeyCode::KeyA {
-                query.select_all = true;
-            } else if !modified {
-                query.insert(key.text.as_deref().unwrap());
-            }
-        }
-        assert_eq!(query.text, "g");
-    }
-    #[test]
-    fn pressed_stop_all_button_routes_to_shared_host_and_truthful_request_status() {
-        // Exercise UI routing and host policy; native teardown is separately acknowledged.
-        let mut runtime = Runtime::new(&config()).unwrap();
-        let catalog = std::sync::Arc::new(
-            crate::catalog::load_local(
-                &crate::app::resource_root().join("sample-packs/podcast-pack"),
-            )
-            .unwrap(),
-        );
-        runtime.catalog = catalog.clone();
-        runtime.host = crate::host::Host::new("ui-test".into(), catalog.clone());
-        runtime.destination = Destination::Local;
-        let envelope = crate::commands::Envelope {
-            protocol_version: 1,
-            session_id: "ui-test".into(),
-            command_id: "play".into(),
-            catalog_revision: catalog.revision.clone(),
-            command: crate::commands::PlaybackCommand::Play {
-                clip_id: catalog.clips[0].identity.clone(),
-            },
-        };
-        runtime.host.accept(envelope);
-        let token = runtime
-            .host
-            .drain_effects()
-            .into_iter()
-            .find_map(|effect| {
-                if let crate::host::BackendEffect::Prepare { token, .. } = effect {
-                    Some(token)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        for event in [
-            crate::host::BackendEventKind::Prepared,
-            crate::host::BackendEventKind::Started,
-        ] {
-            runtime.host.backend_event(crate::host::BackendEvent {
-                token: token.clone(),
-                event,
-            });
-        }
-        runtime.snapshot = runtime.host.snapshot();
-        let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
-        let mut app = App::new();
-        app.insert_resource(runtime)
-            .insert_resource(network)
-            .init_resource::<Model>()
-            .init_resource::<Actions>()
-            .add_systems(Update, buttons);
-        app.world_mut()
-            .spawn((Interaction::Pressed, UiAction::Runtime(Action::StopAll)));
-        app.update();
-        assert!(matches!(
-            app.world_mut().resource_mut::<Actions>().0.pop_front(),
-            Some(Action::StopAll)
-        ));
-        app.world_mut()
-            .resource_scope(|world, mut runtime: Mut<Runtime>| {
-                let mut network = world.resource_mut::<crate::network_app::NetworkState>();
-                runtime.request_stop_all(&mut network);
-                assert!(runtime.status.starts_with("Stop all requested"));
-                network.accept_for_ui_test(&mut runtime.host);
-                assert_eq!(
-                    runtime.host.snapshot().instances[0].state,
-                    crate::commands::InstanceState::Stopping
-                );
-                assert!(
-                    runtime
-                        .host
-                        .drain_effects()
-                        .iter()
-                        .any(|effect| matches!(effect, crate::host::BackendEffect::Stop { .. }))
-                );
-            });
-    }
-    #[test]
-    fn actual_ime_messages_keep_preedit_uncommitted_and_commit_only_once() {
-        let (mut app, window) = input_app();
-        app.world_mut().write_message(Ime::Preedit {
-            window,
-            value: "に".into(),
-            cursor: Some((3, 3)),
-        });
-        key(
-            &mut app,
-            window,
-            Key::Character("n".into()),
-            KeyCode::KeyN,
-            Some("n"),
-        );
-        app.update();
-        assert_eq!(app.world().resource::<Model>().query.text, "");
-        assert_eq!(app.world().resource::<Model>().query.preedit, "に");
-        app.world_mut().write_message(Ime::Commit {
-            window,
-            value: "日本".into(),
-        });
-        key(
-            &mut app,
-            window,
-            Key::Character("日本".into()),
-            KeyCode::KeyN,
-            Some("日本"),
-        );
-        app.update();
-        assert_eq!(app.world().resource::<Model>().query.text, "日本");
-        key(&mut app, window, Key::Backspace, KeyCode::Backspace, None);
-        app.update();
-        assert_eq!(app.world().resource::<Model>().query.text, "日");
-        assert!(app.world().resource::<Actions>().0.is_empty());
-    }
-    #[test]
-    fn unicode_cursor_selection_and_backspace_stay_on_character_boundaries() {
-        let mut editor = Editor::default();
-        editor.insert("Aé🌈");
-        editor.left();
-        editor.backspace();
-        assert_eq!(editor.text, "A🌈");
-        editor.right();
-        editor.backspace();
-        assert_eq!(editor.text, "A");
-        editor.select_all = true;
-        editor.insert("日本");
-        assert_eq!(editor.text, "日本");
-    }
-    #[test]
-    fn ten_thousand_catalog_items_render_only_visible_rows_and_search_all_fields() {
-        let catalog = crate::catalog::load_local(
-            &crate::app::resource_root().join("sample-packs/podcast-pack"),
-        )
-        .unwrap();
-        let clips: Vec<_> = (0..10_000)
-            .map(|i| {
-                let mut clip = catalog.clips[0].clone();
-                clip.identity = format!("large/{i}");
-                clip.metadata.title = format!("Title {i}");
-                clip.metadata.tags = vec!["sound".into()];
-                clip.category = "Music".into();
-                clip
-            })
-            .collect();
-        assert_eq!(
-            Model::visible_indices(&clips, "sound music", 100).len(),
-            COLUMNS * ROWS
-        );
-        assert_eq!(Model::visible_indices(&clips, "sound music", 100)[0], 400);
-        assert_eq!(Model::visible_indices(&clips, "Title 9999", 0), vec![9999]);
-        assert!(Model::visible_indices(&clips, "absent", 0).is_empty());
-        assert_eq!(Model::visible_indices(&clips, "", usize::MAX).len(), 0);
     }
 }
