@@ -4,7 +4,7 @@ pub mod host;
 mod media;
 mod overlay;
 mod panel;
-mod transport;
+pub mod transport;
 
 use bevy::prelude::*;
 use bevy::window::WindowPlugin;
