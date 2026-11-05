@@ -1,0 +1,13 @@
+{
+  "cdktf": "0.25.0",
+  "providers": {
+    "tailscale": "=0.29.2"
+  },
+  "targetVersions": {
+    "opentofu": ">=1.8.0"
+  },
+  "cli": {
+    "name": "opentofu",
+    "version": "1.10.6"
+  }
+}

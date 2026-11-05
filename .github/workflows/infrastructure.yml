@@ -1,0 +1,28 @@
+name: Infrastructure
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  validate:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v17
+      - name: Locked tools, bindings, pure tests and schema validation
+        run: |
+          nix develop .#infrastructure --command bash -euc '
+            cd infra/cdktn/tailscale
+            uv sync --locked
+            npm ci --ignore-scripts
+            TERRAFORM_BINARY_NAME=tofu npm exec -- cdktn get
+            git diff --exit-code -- imports
+            uv run --locked --no-sync python -m unittest discover -s tests -v
+            uv run --locked --no-sync python main.py synth --config network.config.example.json
+            uv run --locked --no-sync python main.py validate durop-network --config network.config.example.json
+          '
