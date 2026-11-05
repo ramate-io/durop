@@ -4,7 +4,7 @@ The user performs the final gameplay, recording, and two-Mac acceptance. The too
 here collect reproducible local observations and leave missing evidence explicit.
 Passing unit tests, a decoder probe, an image asset submission, or a Tailscale ping
 does not demonstrate audible output, displayed pixels, recording quality, or usable
-game input. See [packaging](../packaging/README.md), [the panel](panel.md),
+game input. See [packaging](packaging.md), [the panel](panel.md),
 [media](media-backend.md), and [transport](transport.md) for the application/setup contracts.
 
 ## Available local evidence
