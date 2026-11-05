@@ -80,9 +80,13 @@ pub enum BackendEventKind {
 
 /// Host-private lifecycle bookkeeping for one active occurrence.
 struct Instance {
+    /// Observable identity, generation and lifecycle state; only the host mutates it.
     snapshot: InstanceSnapshot,
+    /// Whether matching backend preparation was acknowledged before start admission.
     prepared: bool,
+    /// Older restarting occurrences whose cleanup must finish before this one starts.
     blockers: Vec<String>,
+    /// Prevents emitting duplicate Start effects while awaiting acknowledgement.
     start_requested: bool,
 }
 
@@ -98,16 +102,27 @@ impl Instance {
 
 /// Single serialized policy authority over a pinned catalog and playback session.
 pub struct Host {
+    /// Fresh lifetime identity used to reject envelopes from older hosts.
     session_id: String,
+    /// Immutable revision pinned for every occurrence in this session.
     catalog: Arc<Catalog>,
+    /// Active occurrences, including stopping workers that still consume capacity.
     instances: BTreeMap<String, Instance>,
+    /// Terminal snapshots retained in completion order up to HISTORY_CAP.
     history: VecDeque<InstanceSnapshot>,
+    /// Latest preparation result keyed by stable catalog clip identity.
     readiness: BTreeMap<String, Readiness>,
+    /// Remembered command decisions; replay returns these without new effects.
     dedupe: BTreeMap<String, CommandOutcome>,
+    /// Insertion order used to evict the oldest remembered command at DEDUPE_CAP.
     dedupe_order: VecDeque<String>,
+    /// Ordered observations retained up to EVENT_CAP until the application drains them.
     events: VecDeque<HostEvent>,
+    /// Deferred backend actions; admission bounds pending work before adding more.
     effects: VecDeque<BackendEffect>,
+    /// Monotonic event sequence, independent of controller command identifiers.
     sequence: u64,
+    /// Session-local occurrence counter; identities never reuse an earlier value.
     next_instance: u64,
 }
 
@@ -491,23 +506,32 @@ pub fn command_channel(wake: impl Fn() + Send + Sync + 'static) -> (CommandSende
 
 /// One admitted ingress item with stop-ordering and optional remote liveness.
 struct Queued {
+    /// Validated-at-consumption command; queue admission itself grants no host authority.
     envelope: Envelope,
+    /// Stop ordering at admission; earlier ordinary work is superseded by a newer barrier.
     epoch: u64,
+    /// Optional remote reply correlation, absent for local fire-and-observe submissions.
     ticket: Option<u64>,
+    /// Optional connection lease checked immediately before the host applies the command.
     active: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Mutex-protected sender state keeps stop epochs ordered with queue admission.
 struct Submit {
+    /// Bounded ordinary lane; saturation cannot consume emergency capacity.
     normal_tx: tokio::sync::mpsc::Sender<Queued>,
+    /// Reserved bounded lane for StopAll requests.
     priority_tx: tokio::sync::mpsc::Sender<Queued>,
+    /// Last successfully queued stop barrier, advanced atomically with admission.
     epoch: u64,
 }
 
 /// Cloneable bounded ingress shared by local and authenticated remote controllers.
 #[derive(Clone)]
 pub struct CommandSender {
+    /// Shared lock orders queue insertion and stop-epoch changes across all producers.
     inner: Arc<std::sync::Mutex<Submit>>,
+    /// Nonblocking application wake callback invoked only after successful admission.
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -577,9 +601,13 @@ impl CommandSender {
 
 /// Single host-side receiver with separate emergency and ordinary queues.
 pub struct CommandInbox {
+    /// Sole consumer of ordinary controller intentions.
     normal_rx: tokio::sync::mpsc::Receiver<Queued>,
+    /// Emergency lane drained before ordinary commands on every update.
     priority_rx: tokio::sync::mpsc::Receiver<Queued>,
+    /// Newest effective stop barrier; older ordinary commands are rejected as superseded.
     cutoff: u64,
+    /// Requests another application update when bounded draining leaves pending work.
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 

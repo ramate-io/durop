@@ -1,4 +1,6 @@
-//! Bounded media worker boundary. Native decoder objects never leave the worker.
+//! Bounded decoder workers with main-thread native playback controls.
+//! AVPlayer resources stay with the main-thread service; immutable image and
+//! frame values cross the boundary for worker conversion and renderer upload.
 //!
 //! One worker belongs to one host instance; the host bounds simultaneous workers.
 //! Generations tag every event/frame so a stopped or restarted decoder cannot

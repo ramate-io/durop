@@ -726,33 +726,183 @@ fn render(
         ))
         .id();
     model.root = Some(root);
-    commands.entity(root).with_children(|parent|{
-        parent.spawn((Text::new(format!("DUROP | {} | {} | display {}",if runtime.destination==Destination::Local{"This Mac"}else{"Remote host"},if remote{if network.connected{"connected"}else{"offline"}}else if runtime.enabled{"host running"}else{"host stopped"},runtime.display.map_or("primary".into(),|index|index.to_string()))),TextFont{font_size:FontSize::Px(22.),..default()}));
-        parent.spawn(Node{column_gap:px(6),flex_wrap:FlexWrap::Wrap,..default()}).with_children(|row|{for(label,action)in[("This Mac",Action::Destination(Destination::Local)),("Remote host",Action::Destination(Destination::Remote)),(if runtime.enabled{"Stop host"}else{"Start host"},Action::ToggleHost),("STOP ALL",Action::StopAll),("Display >",Action::NextDisplay),("Hide",Action::Hide),("Quit",Action::Quit)]{button(row,label,UiAction::Runtime(action));}});
-        parent.spawn(Node{column_gap:px(6),..default()}).with_children(|row|{button(row,format!("Pack: {}",model.pack.label()),UiAction::Focus(Field::Pack));button(row,"Load / refresh",UiAction::Runtime(Action::LoadPack(model.pack.text.clone())));});
-        button(parent,format!("Search title / tags / category: {}",model.query.label()),UiAction::Focus(Field::Search));
-        parent.spawn(Node{column_gap:px(5),flex_wrap:FlexWrap::Wrap,..default()}).with_children(|row|{
-            button(row,format!("Tailnet address: {}",model.address.label()),UiAction::Focus(Field::Address));
-            button(row,format!("Pairing secret: {}", "*".repeat(model.secret.text.chars().count())),UiAction::Focus(Field::Secret));
-            for (label,action) in [("Connect",crate::network_app::NetworkAction::Connect),("Disconnect",crate::network_app::NetworkAction::Disconnect),("Enable remote host",crate::network_app::NetworkAction::EnableHost),("Revoke remote",crate::network_app::NetworkAction::DisableHost)]{button(row,label,UiAction::Network(action));}
-        });
-        parent.spawn((Text::new(&network.status),TextFont{font_size:FontSize::Px(12.),..default()}));
-        if let Some(secret)=&network.pairing_secret {parent.spawn((Text::new(format!("Pairing secret (private): {secret}")),TextFont{font_size:FontSize::Px(12.),..default()}));}
-        parent.spawn((Text::new(&runtime.status),TextFont{font_size:FontSize::Px(13.),..default()},TextColor(Color::srgb(0.85,0.8,0.6))));
-        parent.spawn(Node{display:Display::Grid,grid_template_columns:RepeatedGridTrack::fr(COLUMNS as u16,1.),column_gap:px(8),row_gap:px(8),..default()}).with_children(|grid|{for index in Model::visible_indices(clips,&model.query.text,model.first_row){let clip=&clips[index];let readiness=snapshot.clips.iter().find(|c|c.clip_id==clip.identity).map(|c|format!("{:?}",c.readiness)).unwrap_or_else(||"Unchecked".into());let state=snapshot.instances.iter().rev().find(|i|i.clip_id==clip.identity).map(|i|format!("{:?}",i.state)).unwrap_or_else(||"Idle".into());let error=runtime.errors.get(&clip.identity).cloned().unwrap_or_default();
-            let key=format!("{}:{}:{}:{}",remote,snapshot.catalog_revision,clip.identity,remote&&network.remote_icons.contains_key(&clip.identity));
-            if !icons.0.contains_key(&key){
-                let bytes=if remote{network.remote_icons.get(&clip.identity).cloned()}else{Icons::read_icon(&clip.icon_path).ok()};
-                let handle=bytes.and_then(|bytes|Icons::icon_image(&bytes).ok()).map(|image|images.add(image));
-                if icons.0.len()>=128{let old=icons.0.keys().next().cloned().unwrap();if let Some(Some(handle))=icons.0.remove(&old){images.remove(handle.id());}}
-                icons.0.insert(key.clone(),handle);
+    commands.entity(root).with_children(|parent| {
+        parent.spawn((
+            Text::new(format!(
+                "DUROP | {} | {} | display {}",
+                if runtime.destination == Destination::Local { "This Mac" } else { "Remote host" },
+                if remote {
+                    if network.connected { "connected" } else { "offline" }
+                } else if runtime.enabled {
+                    "host running"
+                } else {
+                    "host stopped"
+                },
+                runtime.display.map_or("primary".into(), |index| index.to_string())
+            )),
+            TextFont { font_size: FontSize::Px(22.), ..default() },
+        ));
+        parent.spawn(Node {
+            column_gap: px(6),
+            flex_wrap: FlexWrap::Wrap,
+            ..default()
+        }).with_children(|row| {
+            for (label, action) in [
+                ("This Mac", Action::Destination(Destination::Local)),
+                ("Remote host", Action::Destination(Destination::Remote)),
+                (if runtime.enabled { "Stop host" } else { "Start host" }, Action::ToggleHost),
+                ("STOP ALL", Action::StopAll),
+                ("Display >", Action::NextDisplay),
+                ("Hide", Action::Hide),
+                ("Quit", Action::Quit),
+            ] {
+                button(row, label, UiAction::Runtime(action));
             }
-            let icon=icons.0.get(&key).cloned().flatten();
-            grid.spawn((Button,UiAction::Runtime(Action::Play(clip.identity.clone())),Node{height:px(102),padding:UiRect::all(px(7)),flex_direction:FlexDirection::Column,row_gap:px(3),overflow:Overflow::clip(),..default()},BackgroundColor(Color::srgb(0.12,0.14,0.17)))).with_children(|tile|{if let Some(icon)=icon{tile.spawn((ImageNode::new(icon),Node{width:px(32),height:px(32),..default()}));}tile.spawn((Text::new(&clip.metadata.title),TextFont{font_size:FontSize::Px(15.),..default()}));tile.spawn((Text::new(format!("{} | {readiness} | {state}",std::path::Path::new(&clip.metadata.asset).extension().unwrap_or_default().to_string_lossy())),TextFont{font_size:FontSize::Px(11.),..default()}));if !error.is_empty(){tile.spawn((Text::new(error),TextFont{font_size:FontSize::Px(11.),..default()},TextColor(Color::srgb(1.,0.4,0.35))));}});
-        }});
-        parent.spawn(Node{column_gap:px(6),..default()}).with_children(|row|{button(row,"Previous",UiAction::Page(-1));button(row,"Next",UiAction::Page(1));row.spawn((Text::new(format!("{total} matches | row {} | mouse wheel scrolls",model.first_row+1)),TextFont{font_size:FontSize::Px(13.),..default()}));});
-        parent.spawn(Node{column_gap:px(5),flex_wrap:FlexWrap::Wrap,..default()}).with_children(|row|{for instance in snapshot.instances.iter().filter(|i|!i.state.is_terminal()).take(8){button(row,format!("Stop {} | {:?}",instance.clip_id,instance.state),UiAction::Runtime(Action::Stop(instance.instance_id.clone())));}});
-        parent.spawn((Text::new("Search: Unicode / IME, arrows, Backspace, Ctrl/Cmd+A. Esc stops all outside fields. Terminal: panel | stop | quit. Native fullscreen overlay is unsupported on this Mac."),TextFont{font_size:FontSize::Px(11.),..default()}));
+        });
+        parent.spawn(Node { column_gap: px(6), ..default() }).with_children(|row| {
+            button(row, format!("Pack: {}", model.pack.label()), UiAction::Focus(Field::Pack));
+            button(row, "Load / refresh", UiAction::Runtime(Action::LoadPack(model.pack.text.clone())));
+        });
+        button(
+            parent,
+            format!("Search title / tags / category: {}", model.query.label()),
+            UiAction::Focus(Field::Search),
+        );
+        parent.spawn(Node {
+            column_gap: px(5),
+            flex_wrap: FlexWrap::Wrap,
+            ..default()
+        }).with_children(|row| {
+            button(row, format!("Tailnet address: {}", model.address.label()), UiAction::Focus(Field::Address));
+            button(row, format!("Pairing secret: {}", "*".repeat(model.secret.text.chars().count())), UiAction::Focus(Field::Secret));
+            for (label, action) in [
+                ("Connect", crate::network_app::NetworkAction::Connect),
+                ("Disconnect", crate::network_app::NetworkAction::Disconnect),
+                ("Enable remote host", crate::network_app::NetworkAction::EnableHost),
+                ("Revoke remote", crate::network_app::NetworkAction::DisableHost),
+            ] {
+                button(row, label, UiAction::Network(action));
+            }
+        });
+        parent.spawn((Text::new(&network.status), TextFont { font_size: FontSize::Px(12.), ..default() }));
+        if let Some(secret) = &network.pairing_secret {
+            parent.spawn((
+                Text::new(format!("Pairing secret (private): {secret}")),
+                TextFont { font_size: FontSize::Px(12.), ..default() },
+            ));
+        }
+        parent.spawn((
+            Text::new(&runtime.status),
+            TextFont { font_size: FontSize::Px(13.), ..default() },
+            TextColor(Color::srgb(0.85, 0.8, 0.6)),
+        ));
+        parent.spawn(Node {
+            display: Display::Grid,
+            grid_template_columns: RepeatedGridTrack::fr(COLUMNS as u16, 1.),
+            column_gap: px(8),
+            row_gap: px(8),
+            ..default()
+        }).with_children(|grid| {
+            for index in Model::visible_indices(clips, &model.query.text, model.first_row) {
+                let clip = &clips[index];
+                let readiness = snapshot.clips.iter()
+                    .find(|c| c.clip_id == clip.identity)
+                    .map(|c| format!("{:?}", c.readiness))
+                    .unwrap_or_else(|| "Unchecked".into());
+                let state = snapshot.instances.iter().rev()
+                    .find(|i| i.clip_id == clip.identity)
+                    .map(|i| format!("{:?}", i.state))
+                    .unwrap_or_else(|| "Idle".into());
+                let error = runtime.errors.get(&clip.identity).cloned().unwrap_or_default();
+                let key = format!(
+                    "{}:{}:{}:{}",
+                    remote,
+                    snapshot.catalog_revision,
+                    clip.identity,
+                    remote && network.remote_icons.contains_key(&clip.identity),
+                );
+                if !icons.0.contains_key(&key) {
+                    let bytes = if remote {
+                        network.remote_icons.get(&clip.identity).cloned()
+                    } else {
+                        Icons::read_icon(&clip.icon_path).ok()
+                    };
+                    let handle = bytes.and_then(|bytes| Icons::icon_image(&bytes).ok())
+                        .map(|image| images.add(image));
+                    if icons.0.len() >= 128 {
+                        let old = icons.0.keys().next().cloned().unwrap();
+                        if let Some(Some(handle)) = icons.0.remove(&old) {
+                            images.remove(handle.id());
+                        }
+                    }
+                    icons.0.insert(key.clone(), handle);
+                }
+                let icon = icons.0.get(&key).cloned().flatten();
+                grid.spawn((
+                    Button,
+                    UiAction::Runtime(Action::Play(clip.identity.clone())),
+                    Node {
+                        height: px(102),
+                        padding: UiRect::all(px(7)),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(3),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.12, 0.14, 0.17)),
+                )).with_children(|tile| {
+                    if let Some(icon) = icon {
+                        tile.spawn((
+                            ImageNode::new(icon),
+                            Node { width: px(32), height: px(32), ..default() },
+                        ));
+                    }
+                    tile.spawn((
+                        Text::new(&clip.metadata.title),
+                        TextFont { font_size: FontSize::Px(15.), ..default() },
+                    ));
+                    tile.spawn((
+                        Text::new(format!(
+                            "{} | {readiness} | {state}",
+                            std::path::Path::new(&clip.metadata.asset).extension().unwrap_or_default().to_string_lossy(),
+                        )),
+                        TextFont { font_size: FontSize::Px(11.), ..default() },
+                    ));
+                    if !error.is_empty() {
+                        tile.spawn((
+                            Text::new(error),
+                            TextFont { font_size: FontSize::Px(11.), ..default() },
+                            TextColor(Color::srgb(1., 0.4, 0.35)),
+                        ));
+                    }
+                });
+            }
+        });
+        parent.spawn(Node { column_gap: px(6), ..default() }).with_children(|row| {
+            button(row, "Previous", UiAction::Page(-1));
+            button(row, "Next", UiAction::Page(1));
+            row.spawn((
+                Text::new(format!("{total} matches | row {} | mouse wheel scrolls", model.first_row + 1)),
+                TextFont { font_size: FontSize::Px(13.), ..default() },
+            ));
+        });
+        parent.spawn(Node {
+            column_gap: px(5),
+            flex_wrap: FlexWrap::Wrap,
+            ..default()
+        }).with_children(|row| {
+            for instance in snapshot.instances.iter().filter(|i| !i.state.is_terminal()).take(8) {
+                button(
+                    row,
+                    format!("Stop {} | {:?}", instance.clip_id, instance.state),
+                    UiAction::Runtime(Action::Stop(instance.instance_id.clone())),
+                );
+            }
+        });
+        parent.spawn((
+            Text::new("Search: Unicode / IME, arrows, Backspace, Ctrl/Cmd+A. Esc stops all outside fields. Terminal: panel | stop | quit. Native fullscreen overlay is unsupported on this Mac."),
+            TextFont { font_size: FontSize::Px(11.), ..default() },
+        ));
     });
 }
 

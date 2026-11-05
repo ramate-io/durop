@@ -97,7 +97,7 @@ pub enum Rejection {
     InvalidCommand,
     /// The requested clip is absent from the pinned catalog.
     UnknownClip,
-    /// The requested occurrence has never been accepted by this host.
+    /// The occurrence is absent from active state and the bounded terminal history.
     UnknownInstance,
     /// Bounded host resources cannot admit the operation yet.
     Busy,
@@ -172,7 +172,7 @@ pub struct ClipStatus {
 pub struct HostSnapshot {
     /// Fresh host session identity; prevents replay across host lifetimes.
     pub session_id: String,
-    /// Immutable catalog revision the controller used to choose this command.
+    /// Immutable catalog revision pinned by this host session.
     pub catalog_revision: String,
     /// Monotonic host event sequence at this observation.
     pub sequence: u64,

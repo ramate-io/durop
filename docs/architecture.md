@@ -62,7 +62,9 @@ exposes loopback helpers to application test dependencies; ordinary app/package
 builds do not enable it. Tests using these helpers do not establish real tailnet or
 two-Mac acceptance.
 
-Packaging continues to produce `target/release/durop` and the same app bundle.
+Native packaging builds `target/native-package/aarch64-apple-darwin/release/durop`
+and places that executable in the same app bundle. A regular `cargo build --release`
+uses `target/release/durop`.
 Application resources resolve from the source root in development and from the
 bundle's `Contents/Resources` after packaging. Library fixtures resolve relative
 to their crate's location; runtime library APIs receive explicit resource paths.
