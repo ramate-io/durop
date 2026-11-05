@@ -17,8 +17,8 @@ desktop and two-Mac acceptance.
 
 The temporary pack's original path was restored from preferences when the native
 app launched. Package relocation did not cause it to switch to the bundled
-sample pack in this run. Follow-up `30187a1` normalizes bundled defaults across app relocation and adds a
-regression test. That follow-up still needs a new native GUI retest.
+sample pack in this run. Follow-up `30187a1` normalizes bundled defaults across
+app relocation and adds a regression test. That follow-up still needs a new native GUI retest.
 
 ## Observed
 
@@ -43,8 +43,8 @@ regression test. That follow-up still needs a new native GUI retest.
   field contents in this GUI run, despite the earlier unit fix in `1c843f0`.
   A source-based hypothesis is that winit can deliver a flags-only
   `ModifiersChanged` event without physical keyboard input; raw events were not
-  captured during this run. A raw-event fix is underway in PR 20 and needs a new
-  native GUI retest.
+  captured during this run. Follow-up `30187a1` consumes ordered raw modifier
+  events; it still needs a new native GUI retest.
 - Repeated StopAll pointer attempts and Escape attempts during the active GIF did
   not produce an observed `Stopped` state. `Finished` appeared after the GIF's
   timer elapsed; that does not prove StopAll or Escape succeeded. CUA/native
