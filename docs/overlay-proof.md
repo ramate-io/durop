@@ -100,9 +100,13 @@ Run the README formatting/check/test/clippy/build commands first.
      sleep 8
      printf 'panel\n'
      cat
-   } | ./target/debug/durop
+   } | BEVY_ASSET_ROOT="$PWD" ./target/debug/durop
    ```
 
+   Run this from the checkout root. `BEVY_ASSET_ROOT` points to the directory
+   containing `assets/`, so direct execution finds `assets/overlay-proof.png`.
+   Unlike `cargo run`, direct execution does not supply `CARGO_MANIFEST_DIR`;
+   without an explicit asset root, Bevy searches beside the executable instead.
    Use your configured target directory for the binary path if customized.
    No compilation takes place during the timed test. The terminal accepts
    commands after the delayed test. Repeat on a normal
@@ -165,12 +169,40 @@ desktop automation; it was not production packaging.
 The fix preserves the initialized window's ISA and dispatches focus policy by
 instance marker. Native checks include six passing tests, including Objective-C
 dispatch coverage for marked overlays, ordinary windows and inherited methods.
-This test uses NSObject probes, not real NSWindows. Desktop retesting of the
-fixed build was blocked by a locked Mac; successful overlay presentation after
-the fix is not yet established.
+This test uses NSObject probes, not real NSWindows. After desktop access returned,
+the `6929aef` build survived `hold`. Its normal-desktop static recording showed
+the magenta fixture with transparent center and margins. The temporary wrapper
+needed an `assets` link beside its executable; a link only in `Resources` did
+not load the fixture. The normal-desktop recording also showed a pulse and
+automatic clearing. Terminal `hide`, `stop`, `panel`, and panel close/reopen were
+responsive; `quit` exited with status 0. A process CPU spot check read 0.0%,
+which does not establish redraw counts or idle power.
 
-Visual alpha, click/keyboard/controller passthrough, fullscreen/Spaces, mixed
-displays, physical monitor removal, recording, animation timing and idle-power
-acceptance remain pending. Compilation and logic checks do not satisfy those
-runtime acceptance items. Record the actual device results and recording in the
-PR before declaring #2 complete.
+The [reviewed normal-desktop clip](evidence/normal-desktop-6929aef.mov) is a
+32-second excerpt (source seconds 8–40) of `normal-input-6929aef.mov`.
+Its SHA-256 is
+`3184100e23192ac79dea767f2ceb25dcf0bf129a2d71d0e4eb82e6d3f09b4a9a`.
+It documents desktop compositing and pulse/clearing only. Full source recordings
+remain local because they include private desktop content.
+
+In a separate native-fullscreen TextEdit Space, representative frames at 3, 10,
+20 and 35 seconds of a 45-second recording showed no fixture despite `show`
+then `hold`. Text entry reached TextEdit, but absence of the overlay does not
+establish input passthrough or retained focus: the targeted automation could
+inject text or reactivate its chosen app. A second 35-second recording tested
+the public
+[`canJoinAllApplications`](https://developer.apple.com/documentation/appkit/nswindow/collectionbehavior-swift.struct/canjoinallapplications)
+flag on the same native-fullscreen TextEdit Space. Frames at 3, 10, 20 and 30
+seconds again showed no fixture; an independent NSWorkspace query reported
+`com.apple.TextEdit` frontmost during `hold`. The ineffective candidate flag was
+removed. Native-fullscreen presentation is unsupported in this observed
+configuration; the retained implementation is the `6929aef` ISA fix and original
+collection behavior flags.
+
+Beyond normal-desktop compositing, pulse/clearing and local safety controls,
+click/keyboard/controller passthrough, focus retention under an unfocused
+trigger, broader fullscreen/Spaces support, mixed displays, physical monitor
+removal, precise animation timing and idle-power acceptance remain pending.
+Game/controller and mixed-monitor hardware were unavailable. Compilation and
+logic checks do not satisfy those runtime acceptance items. Record the remaining
+device results before declaring #2 complete.
