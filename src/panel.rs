@@ -98,6 +98,7 @@ struct Model {
     secret: Editor,
     network_initialized: bool,
     saved_preferences: Option<crate::preferences::Preferences>,
+    modifiers: u8,
 }
 #[derive(Component, Clone)]
 enum UiAction {
@@ -301,23 +302,19 @@ fn buttons(
         }
     }
 }
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Native clipboard access keeps the editor on Bevy's main thread"
-)]
 fn text_input(
     mut keys: MessageReader<KeyboardInput>,
     mut ime: MessageReader<Ime>,
     primary: Single<(Entity, &mut Window), With<PrimaryWindow>>,
     mut model: ResMut<Model>,
     runtime: Res<Runtime>,
-    held: Res<ButtonInput<KeyCode>>,
     mut actions: ResMut<Actions>,
     _main: bevy::ecs::system::NonSendMarker,
 ) {
     let (entity, mut window) = primary.into_inner();
     window.ime_enabled = model.focus.is_some();
     if !window.focused {
+        model.modifiers = 0;
         keys.clear();
         ime.clear();
         return;
@@ -345,14 +342,30 @@ fn text_input(
         }
     }
     for key in keys.read() {
-        if key.window != entity || key.state != ButtonState::Pressed {
+        if key.window != entity {
+            continue;
+        }
+        let modifier = match key.key_code {
+            KeyCode::SuperLeft => 1,
+            KeyCode::SuperRight => 2,
+            KeyCode::ControlLeft => 4,
+            KeyCode::ControlRight => 8,
+            _ => 0,
+        };
+        if modifier != 0 {
+            if key.state == ButtonState::Pressed {
+                model.modifiers |= modifier;
+            } else {
+                model.modifiers &= !modifier;
+            }
+        }
+        if key.state != ButtonState::Pressed {
             continue;
         }
         if let Some(field) = model.focus {
-            let modified = held.pressed(KeyCode::SuperLeft)
-                || held.pressed(KeyCode::SuperRight)
-                || held.pressed(KeyCode::ControlLeft)
-                || held.pressed(KeyCode::ControlRight);
+            // Preserve modifier ordering even if key-down and key-up arrive in
+            // one update, when ButtonInput already contains the final state.
+            let modified = model.modifiers != 0;
             let edit = match field {
                 Field::Search => &mut model.query,
                 Field::Pack => &mut model.pack,
@@ -398,7 +411,7 @@ fn text_input(
                 _ => (),
             }
             model.first_row = 0;
-        } else if !key.repeat {
+        } else if !key.repeat && model.modifiers == 0 {
             match key.logical_key {
                 Key::Escape => actions.0.push_back(Action::StopAll),
                 Key::Space if runtime.destination == Destination::Local => {
@@ -669,6 +682,44 @@ mod tests {
             app.world().resource::<Actions>().0.front(),
             Some(Action::StopAll)
         ));
+    }
+    #[test]
+    fn modifier_down_a_modifier_up_in_one_update_selects_instead_of_typing_a() {
+        let (mut app, window) = input_app();
+        {
+            let mut model = app.world_mut().resource_mut::<Model>();
+            model.query.insert("gif");
+        }
+        key(&mut app, window, Key::Super, KeyCode::SuperLeft, None);
+        key(
+            &mut app,
+            window,
+            Key::Character("a".into()),
+            KeyCode::KeyA,
+            Some("a"),
+        );
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::SuperLeft,
+            logical_key: Key::Super,
+            state: ButtonState::Released,
+            text: None,
+            repeat: false,
+            window,
+        });
+        app.update();
+        assert_eq!(app.world().resource::<Model>().query.text, "gif");
+        assert!(app.world().resource::<Model>().query.select_all);
+        assert_eq!(app.world().resource::<Model>().modifiers, 0);
+        key(
+            &mut app,
+            window,
+            Key::Character("video".into()),
+            KeyCode::KeyV,
+            Some("video"),
+        );
+        app.update();
+        assert_eq!(app.world().resource::<Model>().query.text, "video");
+        assert!(app.world().resource::<Actions>().0.is_empty());
     }
     #[test]
     fn actual_ime_messages_keep_preedit_uncommitted_and_commit_only_once() {
