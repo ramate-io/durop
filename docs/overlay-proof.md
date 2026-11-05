@@ -47,10 +47,16 @@ power measurement; verify actual redraw/CPU behavior on the Mac.
 ## macOS boundary
 
 `src/overlay_macos.rs` configures only the overlay, on the AppKit main thread,
-before allowing it to become visible. A no-ivar subclass of winit's existing
-window class refuses key/main-window status and maps `makeKeyAndOrderFront:` to
-`orderFront:`. This preserves winit's other behavior and leaves the panel's class
-unchanged. It also disables mouse handling and shadows and requests all Spaces,
+before allowing it to become visible. Three method adapters on `WinitWindow`
+check a per-instance associated marker: overlays refuse key/main-window status
+and map `makeKeyAndOrderFront:` to `orderFront:`; unmarked panel windows forward
+to the original implementations. Inherited methods are overridden only on
+`WinitWindow`, leaving `NSWindow` itself unchanged. The adapter preserves every
+window's original class (ISA): replacing the class of an initialized AppKit
+window caused a computed-property assertion on macOS 27.0.1. A native Objective-C
+dispatch regression checks marked/unmarked instances, inherited method isolation
+and unchanged classes; desktop acceptance must additionally exercise real windows.
+It also disables mouse handling and shadows and requests all Spaces,
 stationary/fullscreen-auxiliary behavior. The overlay uses a transparent clear
 color and macOS post-multiplied surface alpha.
 
@@ -142,8 +148,29 @@ Without it, the cloud host's Linux C compiler rejects Apple `-arch` and
 `-mmacosx-version-min` arguments. No build workaround or SDK path is committed.
 The cross-check validates Rust types; it does not establish a native linked build.
 
-Cloud Linux compilation and logic checks do not satisfy the runtime acceptance
-items above. No Mac runtime, fullscreen/Spaces, keyboard/controller focus,
-physical monitor removal, GPU compositing, recording, or idle-power result is
-claimed by this document. Record the actual device results and recording in the
+On November 4, 2026, native validation used macOS 27.0.1 (26A434) on a
+Mac mini (Mac16,11), M4 Pro with 12 CPU cores, 16 GPU cores and 48 GB RAM.
+The only reported display was an MSI MP161 E2, 1920 × 1080 at 60 Hz,
+scale 1, origin (0, 0). Commit `3c78e54` passed native formatting, locked
+check/test/build and strict clippy through `nix develop`, without the cross-check's
+`CARGO_FEATURE_NO_NEON` workaround. A panel screenshot confirmed rendered text,
+and Activity Monitor showed one `durop` PID.
+
+The first `hold` crashed in AppKit's `NSDP_getComputedPropertyValue` via
+`_realMakeFirstResponder` and `orderFront:`. Both the raw executable and a
+temporary `.app` wrapper failed, with macOS IPS crash reports. The wrapper under
+`/tmp` contained an identical binary, a plist and a resource/assets link for
+desktop automation; it was not production packaging.
+
+The fix preserves the initialized window's ISA and dispatches focus policy by
+instance marker. Native checks include six passing tests, including Objective-C
+dispatch coverage for marked overlays, ordinary windows and inherited methods.
+This test uses NSObject probes, not real NSWindows. Desktop retesting of the
+fixed build was blocked by a locked Mac; successful overlay presentation after
+the fix is not yet established.
+
+Visual alpha, click/keyboard/controller passthrough, fullscreen/Spaces, mixed
+displays, physical monitor removal, recording, animation timing and idle-power
+acceptance remain pending. Compilation and logic checks do not satisfy those
+runtime acceptance items. Record the actual device results and recording in the
 PR before declaring #2 complete.
