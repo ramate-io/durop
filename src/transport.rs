@@ -78,6 +78,13 @@ impl std::fmt::Debug for SessionCredential {
     }
 }
 impl SessionCredential {
+    /// Accept an explicitly entered pairing secret. Do not persist or log the input.
+    pub fn from_secret(secret: String) -> Result<Self, TransportError> {
+        if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(TransportError::InvalidConfiguration);
+        }
+        Ok(Self(secret))
+    }
     pub fn bearer(&self) -> &str {
         &self.0
     }
@@ -588,5 +595,7 @@ pub async fn diagnostics(peer: Option<IpAddr>) -> Result<Value, TransportError> 
     )
 }
 
+mod client;
 #[cfg(test)]
 mod tests;
+pub use client::{ControllerClient, ControllerError, ControllerUpdate};
