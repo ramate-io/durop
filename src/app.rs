@@ -1,7 +1,6 @@
 //! Application modes and the real host/media bridge. No decoder work runs in UI code.
-use crate::{catalog::{self, Catalog, CatalogCache, Clip, PackSource, Anchor, Fit}, commands::{Envelope, PlaybackCommand, CommandOutcome, InstanceState, PROTOCOL_VERSION}, host::{Host, BackendEffect, BackendEvent, BackendEventKind, BackendToken}, media::{MediaWorker, MediaSpec, MediaEventKind}, overlay::{OverlayWindow, PlaybackOverlay, OVERLAY_LAYER}};
+use crate::{catalog::{Catalog, CatalogCache, Clip, PackSource, Anchor, Fit}, commands::{Envelope, PlaybackCommand, CommandOutcome, PROTOCOL_VERSION}, host::{Host, BackendEffect, BackendEvent, BackendEventKind, BackendToken}, media::{MediaWorker, MediaSpec, MediaEventKind}, overlay::{OverlayWindow, PlaybackOverlay, OVERLAY_LAYER}};
 use bevy::{prelude::*, asset::RenderAssetUsages, camera::visibility::RenderLayers, render::render_resource::{Extent3d, TextureDimension, TextureFormat}, window::PrimaryWindow};
-use serde::{Serialize, Deserialize};
 use std::{collections::{BTreeMap, VecDeque}, path::PathBuf, sync::{Arc, Mutex, mpsc}, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,7 +9,7 @@ pub enum Mode { Local, Host, Controller }
 pub struct Config { pub mode: Mode, pub pack: PathBuf, pub display: Option<usize>, pub connect: Option<String> }
 impl Config {
     pub fn parse(args: impl IntoIterator<Item=String>) -> Result<Self,String> {
-        let mut config=Self{mode:Mode::Local,pack:"examples/podcast-pack".into(),display:None,connect:None};
+        let mut config=Self{mode:Mode::Local,pack:resource_root().join("sample-packs/podcast-pack"),display:None,connect:None};
         let mut args=args.into_iter();
         while let Some(arg)=args.next() {
             let mut value=|| args.next().ok_or_else(||format!("{arg} needs a value"));
@@ -26,6 +25,12 @@ impl Config {
         Ok(config)
     }
 }
+pub fn resource_root()->PathBuf {
+    if let Ok(exe)=std::env::current_exe() && let Some(directory)=exe.parent() && directory.file_name().is_some_and(|name|name=="MacOS") && let Some(contents)=directory.parent() {
+        return contents.join("Resources");
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum Destination { Local, Remote }
 #[derive(Debug,Clone)]
@@ -35,6 +40,7 @@ pub struct Actions(pub VecDeque<Action>);
 struct Playback {
     token: BackendToken, worker: MediaWorker, clip: Clip,
     image: Option<Handle<Image>>, sprite: Option<Entity>,
+    failure: Option<String>,
 }
 #[derive(Resource)]
 pub struct Runtime {
@@ -62,8 +68,12 @@ fn session_id() -> String {
 }
 impl Runtime {
     pub fn new(config: &Config) -> Result<Self,String> {
-        let cache=CatalogCache::new(private_root().join("packs")).map_err(|e|e.to_string())?;
-        let catalog=cache.prepare(&PackSource::LocalDirectory(config.pack.clone())).map_err(|e|e.to_string())?;
+        let catalog=if config.mode==Mode::Controller {
+            Arc::new(Catalog{root:PathBuf::new(),manifest:crate::catalog::PackManifest{schema_version:1,pack_id:"remote".into(),title:"Remote host".into()},clips:vec![],revision:"unconnected".into()})
+        } else {
+            let cache=CatalogCache::new(private_root().join("packs")).map_err(|e|e.to_string())?;
+            cache.prepare(&PackSource::LocalDirectory(config.pack.clone())).map_err(|e|e.to_string())?
+        };
         let (load_tx,load_rx)=mpsc::channel();
         Ok(Self {host:Host::new(session_id(),catalog.clone()),catalog,mode:config.mode,destination:if config.mode==Mode::Controller {Destination::Remote}else{Destination::Local},enabled:config.mode!=Mode::Controller,status:if config.mode==Mode::Controller{"Remote host unavailable: connect through transport when configured".into()}else{"This Mac · host running".into()},errors:BTreeMap::new(),pack_input:config.pack.to_string_lossy().into_owned(),loading:false,workers:BTreeMap::new(),next_command:0,quitting:false,load_rx:Mutex::new(load_rx),load_tx})
     }
@@ -136,19 +146,24 @@ fn media_bridge(mut commands:Commands,mut runtime:ResMut<Runtime>,mut images:Res
                 MediaEventKind::Prepared{..}=>BackendEventKind::Prepared,
                 MediaEventKind::Started=>BackendEventKind::Started,
                 MediaEventKind::Finished=>{remove.push(id.clone());BackendEventKind::Finished},
-                MediaEventKind::Stopped=>{remove.push(id.clone());BackendEventKind::Stopped},
+                MediaEventKind::Stopped=>{remove.push(id.clone());match playback.failure.take(){Some(message)=>BackendEventKind::Failed{message},None=>BackendEventKind::Stopped}},
                 MediaEventKind::Failed{message}=>{remove.push(id.clone());BackendEventKind::Failed{message}},
             };
             callbacks.push(BackendEvent{token:playback.token.clone(),event:kind});
         }
         if let Some(frame)=playback.worker.latest_frame() {
             if frame.generation!=playback.token.generation {continue;}
-            let image=frame_image(&frame);
             if let Some(handle)=&playback.image {
-                if let Some(existing)=images.get_mut(handle) { *existing=image; }
+                if let Some(existing)=images.get_mut(handle) {
+                    let size=Extent3d{width:frame.width,height:frame.height,depth_or_array_layers:1};
+                    if existing.texture_descriptor.size!=size {existing.resize(size);}
+                    let data=existing.data.get_or_insert_with(Vec::new);data.clear();data.extend_from_slice(&frame.rgba);
+                }
             } else {
-                let handle=images.add(image);
-                playback.sprite=Some(commands.spawn((Sprite::from_image(handle.clone()),RenderLayers::layer(OVERLAY_LAYER),Transform::default())).id());
+                let handle=images.add(frame_image(&frame));
+                let (size,position)=placement(&playback.clip,Vec2::new(frame.width as f32,frame.height as f32),Vec2::new(window.width(),window.height()));
+                let mut sprite=Sprite::from_image(handle.clone());sprite.custom_size=Some(size);
+                playback.sprite=Some(commands.spawn((sprite,RenderLayers::layer(OVERLAY_LAYER),Transform::from_xyz(position.x,position.y,0.0))).id());
                 playback.image=Some(handle);
             }
             if let Some(entity)=playback.sprite && let Ok((mut sprite,mut transform))=sprites.get_mut(entity) {
@@ -168,13 +183,17 @@ fn media_bridge(mut commands:Commands,mut runtime:ResMut<Runtime>,mut images:Res
                     let worker=MediaWorker::spawn();
                     let result=worker.prepare(MediaSpec{path:clip.asset_path.clone(),generation:token.generation,max_duration:Duration::from_millis(clip.metadata.playback.max_duration_ms),looping:clip.metadata.playback.looping,volume:1.0});
                     match result {
-                        Ok(())=>{runtime.workers.insert(token.instance_id.clone(),Playback{token,worker,clip:*clip,image:None,sprite:None});},
+                        Ok(())=>{runtime.workers.insert(token.instance_id.clone(),Playback{token,worker,clip:*clip,image:None,sprite:None,failure:None});},
                         Err(message)=>runtime.host.backend_event(BackendEvent{token,event:BackendEventKind::Failed{message}}),
                     }
                 }
-                BackendEffect::Start{token}=>{if let Some(playback)=runtime.workers.get(&token.instance_id) && let Err(message)=playback.worker.start(token.generation) {playback.worker.stop(token.generation);runtime.host.backend_event(BackendEvent{token,event:BackendEventKind::Failed{message}});}},
+                BackendEffect::Start{token}=>{if let Some(playback)=runtime.workers.get_mut(&token.instance_id) && let Err(message)=playback.worker.start(token.generation) {playback.failure=Some(message);playback.worker.stop(token.generation);}},
                 BackendEffect::Stop{token}=>{
-                    if let Some(playback)=runtime.workers.get(&token.instance_id) {playback.worker.stop(token.generation);}
+                    if let Some(playback)=runtime.workers.get_mut(&token.instance_id) {
+                        playback.worker.stop(token.generation);
+                        if let Some(entity)=playback.sprite.take(){commands.entity(entity).despawn();}
+                        if let Some(image)=playback.image.take(){images.remove(image.id());}
+                    }
                     else {runtime.host.backend_event(BackendEvent{token,event:BackendEventKind::Stopped});}
                 }
             }
