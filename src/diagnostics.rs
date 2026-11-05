@@ -422,6 +422,30 @@ mod tests {
         ))
     }
     #[test]
+    fn saturated_writer_queue_discards_whole_events_without_waiting() {
+        let counters = Arc::new(Counters::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let factory = EventFactory {
+            sender,
+            counters: counters.clone(),
+        };
+        for _ in 0..2 {
+            let mut event = factory.make_writer();
+            event.write_all(b"{\"stage\":\"test\"}\n").unwrap();
+        }
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
+        assert!(
+            matches!(receiver.try_recv(), Ok(WriterCommand::Event(bytes)) if bytes == b"{\"stage\":\"test\"}\n")
+        );
+        {
+            let mut event = factory.make_writer();
+            event.write_all(&vec![b'x'; EVENT_LIMIT + 1]).unwrap();
+        }
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 2);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn whole_event_cap_and_private_file_never_write_partial_json() {
         let path = path();
         let (recorder, guard) = create(&path, 4096).unwrap();

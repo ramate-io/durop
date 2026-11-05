@@ -7,6 +7,26 @@ does not demonstrate audible output, displayed pixels, recording quality, or usa
 game input. See [packaging](../packaging/README.md), [the panel](panel.md),
 [media](media-backend.md), and [transport](transport.md) for the application/setup contracts.
 
+## Available local evidence
+
+At source `78e643506f4478bdc32fdab463fe5cd9e07869cd`, the explicit policy/loopback probe
+ran on Mac16,11, 48 GiB RAM, arm64, macOS 27.0.1. It used a debug test executable,
+an empty host receiving StopAll, 30 samples per origin, and a 1 ms simulated main-loop
+poll. The diagnostic capture was complete with zero dropped events, evicted traces, or writer
+errors. [Raw JSONL](evidence/local-loopback-78e6435.jsonl) and the
+[aggregate report](evidence/local-loopback-78e6435.json) include source/fixture and
+test-executable identity. The fixture is loaded for the catalog; no decoder is started.
+
+| Observation | Count | p50 ms | p95 ms | Max ms |
+|---|---:|---:|---:|---:|
+| Local queue to policy acknowledgment | 30 | 0.001 | 0.005 | 0.014 |
+| Remote host handoff to policy acknowledgment | 30 | 0.054 | 0.113 | 0.151 |
+| Same-Mac authenticated loopback controller round trip | 30 | 1.981 | 2.624 | 2.827 |
+
+This probe measures neither panel click latency nor media output, game performance,
+A/V offset, recording, sustained resource behavior, or a second network. Those entries
+remain unmeasured in the report and belong to the user's final acceptance run.
+
 ## Private capture directory and artifact identity
 
 Python 3 uses only its standard library. Create a new directory outside Git:
@@ -66,6 +86,10 @@ when the host adapter admits an authenticated remote request into the shared que
 it excludes controller/network transit. Controller round trips are measured on the
 controller alone. Never subtract wall-clock timestamps from separate Macs to invent
 one-way latency. A reply may be a rejection; examine the rejection count as well.
+Timing rows cover admitted commands with observed outcomes. Admission failures,
+pre-admission rejection, or a command canceled by disconnect may have no timing row.
+Retain total button-attempt/failure counts in the operator evidence; these percentiles
+alone do not establish a zero-failure rate.
 
 Image asset submission precedes Bevy render preparation/GPU presentation. Backend
 Started precedes any independently verified audible samples/displayed pixels. Audio
@@ -162,6 +186,7 @@ python3 scripts/acceptance.py report \
   --timing warm=/tmp/durop-run/warm.jsonl \
   --timing remote=/tmp/durop-run/controller.jsonl \
   --frames baseline=/tmp/durop-run/baseline-frames.csv \
+  --frames recording=/tmp/durop-run/recording-frames.csv \
   --frames idle=/tmp/durop-run/idle-frames.csv \
   --frames active=/tmp/durop-run/active-frames.csv \
   --resources active=/tmp/durop-run/active-resources.csv \
@@ -173,7 +198,9 @@ Supply only files actually captured; omit absent arguments. A/V CSV uses signed
 `offset_ms` values measured from the flash/beep recording, with the sign convention
 recorded in the environment notes. The report gives signed and absolute distributions.
 All percentiles use nearest rank (`ceil(p*n)-1`), and empty observations remain null
-with count zero. Frame-time comparisons require a positive baseline p95. The proposed
+with count zero. Durop's frame-time comparisons require a positive `recording` baseline
+p95, isolating its effect from recorder overhead; the game-alone baseline remains a
+separate distribution. The proposed
 review limits remain warm physical output p95 100 ms, controller acknowledgment p95
 250 ms, absolute A/V offset 50 ms, idle game p95 increase 5%, and active increase 10%.
 Submission/callback metrics do not establish the physical-output target. Failed targets

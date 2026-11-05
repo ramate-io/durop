@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import subprocess
 import sys
+import types
 import unittest
 
 SPEC = importlib.util.spec_from_file_location("acceptance", Path(__file__).parents[1] / "acceptance.py")
@@ -11,6 +12,18 @@ acceptance = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(acceptance)
 
 class Statistics(unittest.TestCase):
+    def test_report_isolates_durop_from_recording_overhead(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label, value in (("baseline", 10), ("recording", 20), ("idle", 21)):
+                (root / f"{label}.csv").write_text(f"frame_ms\n{value}\n")
+            args = types.SimpleNamespace(timing=None, frames=[f"{label}={root / (label + '.csv')}" for label in ("baseline", "recording", "idle")], resources=None, av_offsets=None, metadata=None, out=root / "report.json")
+            acceptance.report(args)
+            result = json.loads(args.out.read_text())
+            self.assertEqual(result["gameP95ComparisonBaseline"], "recording")
+            self.assertTrue(result["gameP95Comparison"]["idle"]["withinProposedLimit"])
+            self.assertEqual(result["gameFrameMilliseconds"]["baseline"]["p95"], 10)
+
     def test_frame_targets_handle_missing_zero_and_exact_boundary(self):
         self.assertIsNone(acceptance.frame_comparison(None, 20, 5)["withinProposedLimit"])
         self.assertIsNone(acceptance.frame_comparison(0, 20, 5)["withinProposedLimit"])

@@ -201,7 +201,8 @@ def report(args):
         rss, cpu, elapsed = numeric(rows, "rss_kib"), numeric(rows, "cpu_percent"), numeric(rows, "elapsed_s")
         resources[label] = {"count": len(rows), "observedSeconds": elapsed[-1] - elapsed[0] if elapsed else 0, "rssKiB": summary(rss), "rssStartKiB": rss[0] if rss else None, "rssEndKiB": rss[-1] if rss else None, "rssDeltaKiB": rss[-1] - rss[0] if rss else None, "cpuPercent": summary(cpu), "observation": "Process sampling; neither GPU load nor proof of bounded memory beyond this interval"}
     comparisons = {}
-    baseline = frames.get("baseline", {}).get("p95")
+    # Compare Durop with game+recording to isolate Durop from recorder overhead.
+    baseline = frames.get("recording", {}).get("p95")
     for label, target in (("idle", 5), ("active", 10)):
         observed = frames.get(label, {}).get("p95")
         comparisons[label] = frame_comparison(baseline, observed, target)
@@ -210,7 +211,7 @@ def report(args):
         offsets = numeric(csv_rows(args.av_offsets), "offset_ms", signed=True)
         absolute = summary([abs(value) for value in offsets])
         av = {"signedMilliseconds": summary(offsets), "absoluteMilliseconds": absolute, "absoluteMaxWithin50ms": absolute["max"] <= 50 if absolute["max"] is not None else None, "observation": "Operator measured flash/beep recording offsets; not inferred from app callbacks"}
-    result = {"percentileMethod": "nearest rank: sorted[ceil(p*n)-1]", "environment": json.loads(args.metadata.read_text()) if args.metadata else None, "timings": timings, "gameFrameMilliseconds": frames, "gameP95Comparison": comparisons, "processResources": resources, "audioVideoOffsets": av, "unmeasuredByThisTool": ["audibility", "displayed pixels", "game input usability", "GPU utilization", "network one-way latency", "recording quality", "two-Mac authorization"], "proposedPhysicalTargetsNotProvenBySubmissionMetrics": {"warmLocalOutputP95ms": 100, "controllerAcknowledgmentP95ms": 250, "absoluteAVOffsetMs": 50}, "physicalOutputClaimsFromCallbacks": False}
+    result = {"percentileMethod": "nearest rank: sorted[ceil(p*n)-1]", "environment": json.loads(args.metadata.read_text()) if args.metadata else None, "timings": timings, "gameFrameMilliseconds": frames, "gameP95ComparisonBaseline": "recording", "gameP95Comparison": comparisons, "processResources": resources, "audioVideoOffsets": av, "unmeasuredByThisTool": ["audibility", "displayed pixels", "game input usability", "GPU utilization", "network one-way latency", "recording quality", "two-Mac authorization"], "proposedPhysicalTargetsNotProvenBySubmissionMetrics": {"warmLocalOutputP95ms": 100, "controllerAcknowledgmentP95ms": 250, "absoluteAVOffsetMs": 50}, "physicalOutputClaimsFromCallbacks": False}
     write_json(args.out, result)
     print("Wrote aggregate report; missing measurements remain null/unmeasured")
 
@@ -220,13 +221,13 @@ def network(args):
         raise ValueError("choose installed Tailscale CLI with --tailscale")
     status = json.loads(run([binary, "status", "--json"]))
     check = json.loads(run([binary, "netcheck", "--format=json"]))
-    result = {"backendState": status.get("BackendState"), "netcheck": {key: check.get(key) for key in ("UDP", "IPv4", "IPv6", "MappingVariesByDestIP", "PreferredDERP")}, "connection": "unmeasured", "pingMilliseconds": None}
+    result = {"backendState": status.get("BackendState"), "netcheck": {key: check.get(key) for key in ("UDP", "IPv4", "IPv6", "MappingVariesByDestIP", "PreferredDERP")}, "pingPath": "unmeasured", "pingMilliseconds": None, "observation": "Tailscale ping path at capture time; not a per-WebSocket transport trace"}
     if args.peer:
         peer = ipaddress.ip_address(args.peer)
         if not (peer in ipaddress.ip_network("100.64.0.0/10") or peer in ipaddress.ip_network("fd7a:115c:a1e0::/48")):
             raise ValueError("peer must be a Tailscale address")
         output = run([binary, "ping", "--c=1", "--timeout=1s", str(peer)])
-        result["connection"] = "relay" if "DERP" in output else ("direct" if "via" in output else "unmeasured")
+        result["pingPath"] = "relay" if "DERP" in output else ("direct" if "via" in output else "unmeasured")
         elapsed = re.search(r"\bin (\d+(?:\.\d+)?)ms\b", output)
         if elapsed:
             result["pingMilliseconds"] = float(elapsed[1])
