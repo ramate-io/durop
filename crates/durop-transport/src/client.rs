@@ -1,4 +1,4 @@
-//! Native controller with explicit targets and no reconnect/replay queue.
+//! Authenticated remote wire client with explicit targets and no reconnect/replay queue.
 use super::*;
 use std::collections::VecDeque;
 use tokio_tungstenite::{
@@ -6,139 +6,25 @@ use tokio_tungstenite::{
     tungstenite::client::IntoClientRequest,
 };
 
+/// A bounded request's transport or protocol result, without exposing secrets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerError {
+    /// Target is not an explicit Tailscale IP and nonzero port.
     InvalidTarget,
+    /// The connection has ended; create a new client to obtain a fresh snapshot.
     Disconnected,
+    /// Upgrade, heartbeat, or request exceeded its deadline.
     Timeout,
+    /// Response shape, request identity, or authoritative state violates the protocol.
     Protocol,
+    /// The host or current connection cannot admit another command.
     Busy,
+    /// The requested clip has no icon in the authenticated allowlist.
     UnknownIcon,
+    /// The upgrade was denied or the selected host could not be reached.
     ConnectionDenied,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn snapshot(sequence: u64) -> HostSnapshot {
-        HostSnapshot {
-            session_id: "session".into(),
-            catalog_revision: "revision".into(),
-            sequence,
-            clips: vec![],
-            instances: vec![],
-        }
-    }
-    async fn fake_host() -> (TcpListener, SocketAddr) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        (listener, address)
-    }
-    async fn accept(listener: TcpListener) -> tokio_tungstenite::WebSocketStream<TcpStream> {
-        let (tcp, _) = listener.accept().await.unwrap();
-        #[allow(clippy::result_large_err)]
-        let mut socket = accept_hdr_async_with_config(
-            tcp,
-            |_: &Request, mut response: Response| {
-                response
-                    .headers_mut()
-                    .insert("sec-websocket-protocol", SUBPROTOCOL.parse().unwrap());
-                Ok(response)
-            },
-            None,
-        )
-        .await
-        .unwrap();
-        socket
-            .send(Message::Text(
-                serde_json::json!({"type":"snapshot","snapshot":snapshot(0)})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .unwrap();
-        socket
-    }
-    #[tokio::test]
-    async fn silent_heartbeat_blackhole_expires_connection() {
-        let (listener, address) = fake_host().await;
-        let (release, released) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let _socket = accept(listener).await;
-            let _ = released.await;
-        });
-        let mut client = ControllerClient::connect_loopback(
-            address,
-            SessionCredential::from_secret("a".repeat(64)).unwrap(),
-        )
-        .await
-        .unwrap();
-        client.heartbeat = tokio::time::Instant::now();
-        assert!(matches!(
-            timeout(Duration::from_secs(7), client.next_update())
-                .await
-                .unwrap(),
-            Err(ControllerError::Timeout)
-        ));
-        assert!(!client.is_connected());
-        let _ = release.send(());
-        server.await.unwrap();
-    }
-    #[tokio::test]
-    async fn cancelling_gap_recovery_accepts_late_snapshot_before_next_reply() {
-        let (listener, address) = fake_host().await;
-        let (requested, observed) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let mut socket = accept(listener).await;
-            socket.send(Message::Text(serde_json::json!({"type":"event","event":HostEvent { sequence: 2, instance_id: None, event: durop_protocol::EventKind::Stopped }}).to_string().into())).await.unwrap();
-            let request = socket.next().await.unwrap().unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(request.to_text().unwrap()).unwrap()["type"],
-                "snapshot"
-            );
-            requested.send(()).unwrap();
-            let command = socket.next().await.unwrap().unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(command.to_text().unwrap()).unwrap()["type"],
-                "command"
-            );
-            socket
-                .send(Message::Text(
-                    serde_json::json!({"type":"snapshot","snapshot":snapshot(2)})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
-            socket.send(Message::Text(serde_json::json!({"type":"outcome","command_id":"after-cancel","outcome":CommandOutcome::Accepted { instance_id: None }}).to_string().into())).await.unwrap();
-            // Keep the socket alive until the caller closes it.
-            let _ = socket.next().await;
-        });
-        let mut client = ControllerClient::connect_loopback(
-            address,
-            SessionCredential::from_secret("a".repeat(64)).unwrap(),
-        )
-        .await
-        .unwrap();
-        let mut update = Box::pin(client.next_update());
-        tokio::select! { _ = &mut update => panic!("snapshot should still be pending"), _ = observed => {} }
-        drop(update);
-        assert_eq!(
-            client
-                .command(
-                    "after-cancel".into(),
-                    "revision".into(),
-                    PlaybackCommand::StopAll
-                )
-                .await
-                .unwrap(),
-            CommandOutcome::Accepted { instance_id: None }
-        );
-        assert_eq!(client.current_snapshot().sequence, 2);
-        client.disconnect().await;
-        server.await.unwrap();
-    }
-}
 impl std::fmt::Display for ControllerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -152,13 +38,19 @@ impl std::fmt::Display for ControllerError {
         })
     }
 }
+
 impl std::error::Error for ControllerError {}
 
+/// Authoritative state updates; a snapshot replaces any missed event history.
 #[derive(Debug)]
 pub enum ControllerUpdate {
+    /// The next contiguous host event after the last applied state sequence.
     Event(HostEvent),
+    /// A complete host snapshot obtained initially or after an event gap.
     Snapshot(HostSnapshot),
 }
+
+/// Bounded host packet shapes received on the single authenticated socket.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Packet {
@@ -183,12 +75,15 @@ enum Packet {
         code: String,
     },
 }
+
+/// Correlate one outstanding request while allowing intervening snapshots/events.
 enum Expected {
     Snapshot,
     Catalog,
     Icon(String),
     Outcome(String),
 }
+
 impl Expected {
     fn matches(&self, packet: &Packet) -> bool {
         match (self, packet) {
@@ -214,10 +109,12 @@ pub struct ControllerClient {
     heartbeat: tokio::time::Instant,
     pending_ping: Option<(Vec<u8>, tokio::time::Instant)>,
     ping_counter: u64,
+    acknowledgment_observer: Option<Arc<dyn Fn(Duration) + Send + Sync>>,
 }
+
 impl ControllerClient {
-    /// Connect to loopback only in explicit cross-crate test-support builds.
     #[cfg(any(test, feature = "test-support"))]
+    /// Connect an isolated loopback fixture only in explicit test-support builds.
     pub async fn connect_loopback(
         target: SocketAddr,
         credential: SessionCredential,
@@ -227,6 +124,8 @@ impl ControllerClient {
         }
         Self::connect_inner(target, credential).await
     }
+
+    /// Authenticate an explicit Tailscale target and require its initial snapshot.
     pub async fn connect(
         target: SocketAddr,
         credential: SessionCredential,
@@ -236,6 +135,8 @@ impl ControllerClient {
         }
         Self::connect_inner(target, credential).await
     }
+
+    /// Perform the shared bounded handshake; only the explicit test-support entry accepts loopback.
     async fn connect_inner(
         target: SocketAddr,
         credential: SessionCredential,
@@ -290,6 +191,7 @@ impl ControllerClient {
             heartbeat: tokio::time::Instant::now() + Duration::from_secs(20),
             pending_ping: None,
             ping_counter: 0,
+            acknowledgment_observer: None,
         };
         let initial = timeout(IO_TIMEOUT, client.read())
             .await
@@ -300,34 +202,64 @@ impl ControllerClient {
         client.apply_snapshot(snapshot)?;
         Ok(client)
     }
+
+    /// Whether a connection remains available as of its last observed I/O state.
+    /// Continue polling updates so heartbeat deadlines can detect an idle blackhole.
     pub fn is_connected(&self) -> bool {
         self.socket.is_some()
     }
+
+    /// Borrow the latest complete authoritative snapshot, excluding later event deltas.
     pub fn current_snapshot(&self) -> &HostSnapshot {
         &self.snapshot
     }
+
+    /// Observe controller-local reply latency before snapshot recovery.
+    /// The callback must be nonblocking and receives no credentials or identifiers.
+    pub fn observe_acknowledgments(&mut self, observer: impl Fn(Duration) + Send + Sync + 'static) {
+        self.acknowledgment_observer = Some(Arc::new(observer));
+    }
+
+    /// Close this socket and discard buffered events without creating a retry queue.
     pub async fn disconnect(&mut self) {
         if let Some(mut socket) = self.socket.take() {
             let _ = timeout(IO_TIMEOUT, socket.close(None)).await;
         }
         self.events.clear();
     }
+
+    /// Build one command in the authenticated session and wait for its correlated outcome.
+    /// A retry must deliberately reuse its command ID; it is never automatic.
     pub async fn command(
         &mut self,
         command_id: String,
         catalog_revision: String,
         command: PlaybackCommand,
     ) -> Result<CommandOutcome, ControllerError> {
-        if command_id.is_empty() || command_id.len() > 128 {
-            return Err(ControllerError::Protocol);
-        }
         let envelope = Envelope {
             protocol_version: PROTOCOL_VERSION,
             session_id: self.snapshot.session_id.clone(),
-            command_id: command_id.clone(),
+            command_id,
             catalog_revision,
             command,
         };
+        self.submit_envelope(envelope).await
+    }
+
+    /// Send one canonical request without changing its identity or revision.
+    /// A request from another session is rejected before reaching the socket.
+    pub async fn submit_envelope(
+        &mut self,
+        envelope: Envelope,
+    ) -> Result<CommandOutcome, ControllerError> {
+        if envelope.command_id.is_empty()
+            || envelope.command_id.len() > 128
+            || envelope.session_id != self.snapshot.session_id
+            || envelope.protocol_version != PROTOCOL_VERSION
+        {
+            return Err(ControllerError::Protocol);
+        }
+        let command_id = envelope.command_id.clone();
         let roundtrip_started = std::time::Instant::now();
         let packet = self
             .roundtrip(
@@ -335,13 +267,17 @@ impl ControllerClient {
                 Expected::Outcome(command_id),
             )
             .await?;
-        let _ = roundtrip_started.elapsed();
+        if let Some(observer) = &self.acknowledgment_observer {
+            observer(roundtrip_started.elapsed());
+        }
         self.resync_if_needed().await?;
         let Packet::Outcome { outcome, .. } = packet else {
             return Err(ControllerError::Protocol);
         };
         Ok(outcome)
     }
+
+    /// Fetch bounded controller-safe metadata over the authenticated connection.
     pub async fn catalog(&mut self) -> Result<Value, ControllerError> {
         let packet = self
             .roundtrip(serde_json::json!({"type":"catalog"}), Expected::Catalog)
@@ -352,6 +288,8 @@ impl ControllerClient {
         };
         Ok(catalog)
     }
+
+    /// Fetch one allowlisted, dimension-bounded PNG by clip identity, never a path.
     pub async fn icon(&mut self, clip_id: &str) -> Result<Vec<u8>, ControllerError> {
         if clip_id.is_empty() || clip_id.len() > 256 {
             return Err(ControllerError::UnknownIcon);
@@ -372,6 +310,8 @@ impl ControllerClient {
         }
         Ok(png)
     }
+
+    /// Replace local state with a current snapshot without replaying any actions.
     pub async fn refresh_snapshot(&mut self) -> Result<HostSnapshot, ControllerError> {
         let packet = self
             .roundtrip(serde_json::json!({"type":"snapshot"}), Expected::Snapshot)
@@ -382,6 +322,7 @@ impl ControllerClient {
         self.apply_snapshot(snapshot)?;
         Ok(self.snapshot.clone())
     }
+
     /// Can be selected alongside UI actions. Cancelling this read does not queue a
     /// button press or reconnect. Snapshot updates replace any missed event history.
     pub async fn next_update(&mut self) -> Result<ControllerUpdate, ControllerError> {
@@ -426,12 +367,16 @@ impl ControllerClient {
             }
         }
     }
+
+    /// Recover event gaps before returning control to another application action.
     async fn resync_if_needed(&mut self) -> Result<(), ControllerError> {
         if self.needs_snapshot {
             self.refresh_snapshot().await?;
         }
         Ok(())
     }
+
+    /// Replace state only when sequence, session, and revision remain authoritative.
     fn apply_snapshot(&mut self, snapshot: HostSnapshot) -> Result<(), ControllerError> {
         if snapshot.session_id.is_empty()
             || snapshot.session_id.len() > 128
@@ -449,6 +394,8 @@ impl ControllerClient {
         self.needs_snapshot = false;
         Ok(())
     }
+
+    /// Buffer at most 64 contiguous events; gaps force a full snapshot instead.
     fn record_event(&mut self, event: HostEvent) {
         if event.sequence <= self.sequence {
             return;
@@ -465,6 +412,8 @@ impl ControllerClient {
         self.sequence = event.sequence;
         self.events.push_back(event);
     }
+
+    /// Apply one total request deadline and destroy failed sockets without retrying.
     async fn roundtrip(
         &mut self,
         request: Value,
@@ -480,6 +429,8 @@ impl ControllerClient {
         }
         result
     }
+
+    /// Send once and consume only the correlated reply, preserving intervening state.
     async fn exchange(
         &mut self,
         request: Value,
@@ -514,6 +465,8 @@ impl ControllerClient {
             }
         }
     }
+
+    /// Read bounded packets and enforce matching-Pong liveness while otherwise idle.
     async fn read(&mut self) -> Result<Packet, ControllerError> {
         loop {
             let deadline = self
@@ -566,3 +519,6 @@ impl ControllerClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
