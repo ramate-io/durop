@@ -432,6 +432,8 @@ pub fn command_channel(wake: impl Fn() + Send + Sync + 'static) -> (CommandSende
 struct Queued {
     envelope: Envelope,
     epoch: u64,
+    ticket: Option<u64>,
+    active: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 struct Submit {
     normal_tx: tokio::sync::mpsc::Sender<Queued>,
@@ -452,6 +454,23 @@ impl CommandSender {
     /// Queue admission is not host acceptance. Failed admission always returns
     /// Busy/Closed; it never silently drops a controller command.
     pub fn try_send(&self, envelope: Envelope) -> Result<(), QueueError> {
+        self.send(envelope, None, None)
+    }
+    /// Remote admission must still be live immediately before host acceptance.
+    pub fn try_send_guarded(
+        &self,
+        envelope: Envelope,
+        ticket: u64,
+        active: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), QueueError> {
+        self.send(envelope, Some(ticket), Some(active))
+    }
+    fn send(
+        &self,
+        envelope: Envelope,
+        ticket: Option<u64>,
+        active: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<(), QueueError> {
         let mut submit = self.inner.lock().unwrap();
         let priority = matches!(envelope.command, PlaybackCommand::StopAll);
         let epoch = if priority {
@@ -464,11 +483,16 @@ impl CommandSender {
         } else {
             &submit.normal_tx
         };
-        tx.try_send(Queued { envelope, epoch })
-            .map_err(|e| match e {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => QueueError::Busy,
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => QueueError::Closed,
-            })?;
+        tx.try_send(Queued {
+            envelope,
+            epoch,
+            ticket,
+            active,
+        })
+        .map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => QueueError::Busy,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => QueueError::Closed,
+        })?;
         if priority {
             submit.epoch = epoch;
         }
@@ -487,6 +511,7 @@ pub struct CommandInbox {
 pub struct CommandReceipt {
     pub command_id: String,
     pub outcome: CommandOutcome,
+    pub ticket: Option<u64>,
 }
 impl CommandInbox {
     /// At most 8 emergency requests then 32 ordinary requests per update.
@@ -500,13 +525,21 @@ impl CommandInbox {
             };
             let sequence = host.sequence;
             let command_id = queued.envelope.command_id.clone();
-            let outcome = host.accept(queued.envelope);
+            let live = queued.active.as_ref().is_none_or(|active| active());
+            let outcome = if live {
+                host.accept(queued.envelope)
+            } else {
+                CommandOutcome::Rejected {
+                    reason: Rejection::Superseded,
+                }
+            };
             if matches!(outcome, CommandOutcome::Accepted { .. }) && host.sequence != sequence {
                 self.cutoff = self.cutoff.max(queued.epoch);
             }
             receipts.push(CommandReceipt {
                 command_id,
                 outcome,
+                ticket: queued.ticket,
             });
         }
         for _ in 0..32 {
@@ -514,10 +547,17 @@ impl CommandInbox {
                 break;
             };
             let command_id = queued.envelope.command_id.clone();
-            let outcome = host.accept_inner(queued.envelope, queued.epoch < self.cutoff);
+            let outcome = if queued.active.as_ref().is_none_or(|active| active()) {
+                host.accept_inner(queued.envelope, queued.epoch < self.cutoff)
+            } else {
+                CommandOutcome::Rejected {
+                    reason: Rejection::Superseded,
+                }
+            };
             receipts.push(CommandReceipt {
                 command_id,
                 outcome,
+                ticket: queued.ticket,
             });
         }
         if self.has_pending() {
@@ -883,6 +923,58 @@ mod tests {
         tx.try_send(wrong).unwrap();
         rx.drain(&mut host);
         assert_eq!(host.instances.len(), 2);
+    }
+
+    #[test]
+    fn guarded_remote_stop_barriers_respect_liveness_and_distinct_receipts() {
+        let mut host = host(Retrigger::Stack);
+        let (tx, mut rx) = command_channel(|| {});
+        tx.try_send(play("local-before-dead-stop")).unwrap();
+        tx.try_send_guarded(
+            envelope("dead-remote-stop", PlaybackCommand::StopAll),
+            11,
+            Arc::new(|| false),
+        )
+        .unwrap();
+        let receipts = rx.drain(&mut host);
+        assert!(matches!(
+            receipts[0].outcome,
+            CommandOutcome::Rejected {
+                reason: Rejection::Superseded
+            }
+        ));
+        assert_eq!(receipts[0].ticket, Some(11));
+        assert!(matches!(
+            receipts[1].outcome,
+            CommandOutcome::Accepted { .. }
+        ));
+        tx.try_send(play("local-before-live-stop")).unwrap();
+        tx.try_send_guarded(
+            envelope("live-stop", PlaybackCommand::StopAll),
+            12,
+            Arc::new(|| true),
+        )
+        .unwrap();
+        let receipts = rx.drain(&mut host);
+        assert!(matches!(
+            receipts[1].outcome,
+            CommandOutcome::Rejected {
+                reason: Rejection::Superseded
+            }
+        ));
+        tx.try_send(play("local-after-stop")).unwrap();
+        tx.try_send_guarded(
+            envelope("live-stop", PlaybackCommand::StopAll),
+            13,
+            Arc::new(|| true),
+        )
+        .unwrap();
+        let receipts = rx.drain(&mut host);
+        assert_eq!(receipts[0].ticket, Some(13));
+        assert!(matches!(
+            receipts[1].outcome,
+            CommandOutcome::Accepted { .. }
+        ));
     }
 
     #[test]
