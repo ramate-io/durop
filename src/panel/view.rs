@@ -127,7 +127,16 @@ impl View<'_> {
                             Node {
                                 position_type: PositionType::Absolute,
                                 top: px(76),
-                                left: px(0),
+                                left: if menu == Dropdown::Host {
+                                    px(0)
+                                } else {
+                                    auto()
+                                },
+                                right: if menu == Dropdown::Catalog {
+                                    px(0)
+                                } else {
+                                    auto()
+                                },
                                 width: px(width.max(260.)),
                                 padding: UiRect::all(px(8)),
                                 border: UiRect::all(px(1)),
@@ -579,6 +588,8 @@ pub(super) fn render(
     primary: Single<&Window, With<PrimaryWindow>>,
 ) {
     let remote = runtime.destination == Destination::Remote;
+    let compact = primary.width() < 760.;
+    let provider_width = ((primary.width() - 70.) * 0.5).max(150.);
     let preferences = crate::preferences::Preferences {
         pack: crate::preferences::Preferences::stored_pack(
             &runtime.pack_input,
@@ -692,13 +703,17 @@ pub(super) fn render(
             })
             .with_children(|brand| {
                 brand.spawn((Text::new("durop"), fonts.display(29.), TextColor(INK)));
-                view.label(brand, "A LITTLE EXPRESSION, ON CUE.", 10., MUTED);
+                if primary.width() >= 620. {
+                    view.label(brand, "A LITTLE EXPRESSION, ON CUE.", 10., MUTED);
+                }
             });
         parent
             .spawn(Node {
                 width: percent(100),
-                min_height: px(68),
+                min_height: px(if compact { 148. } else { 68. }),
                 column_gap: px(14),
+                row_gap: px(12),
+                flex_wrap: FlexWrap::Wrap,
                 align_items: AlignItems::Stretch,
                 ..default()
             })
@@ -709,7 +724,7 @@ pub(super) fn render(
                     if remote { "Tailscale" } else { "Native" },
                     Dropdown::Host,
                     model.dropdown == Some(Dropdown::Host),
-                    220.,
+                    if compact { provider_width } else { 220. },
                 );
                 let catalog_label = if remote {
                     "Remote catalog"
@@ -727,7 +742,7 @@ pub(super) fn render(
                     catalog_label,
                     Dropdown::Catalog,
                     model.dropdown == Some(Dropdown::Catalog),
-                    300.,
+                    if compact { provider_width } else { 300. },
                 );
                 header
                     .spawn((
@@ -735,6 +750,8 @@ pub(super) fn render(
                         UiAction::Focus(Field::Search),
                         Node {
                             flex_grow: 1.,
+                            width: if compact { percent(100) } else { auto() },
+                            min_height: px(68),
                             min_width: px(130),
                             padding: UiRect::axes(px(16), px(11)),
                             border: UiRect::all(px(1)),

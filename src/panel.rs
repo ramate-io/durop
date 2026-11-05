@@ -224,7 +224,10 @@ impl GridLayout {
     fn for_window(width: f32, height: f32) -> Self {
         let available = (width - 78.).max(180.);
         let columns = ((available + 20.) / 250.).floor().clamp(1., 6.) as usize;
-        let rows = ((height - 276.) / 302.).floor().clamp(1., 6.) as usize;
+        let toolbar_extra = if width < 760. { 80. } else { 0. };
+        let rows = ((height - 276. - toolbar_extra) / 302.)
+            .floor()
+            .clamp(1., 6.) as usize;
         Self {
             columns,
             rows,
