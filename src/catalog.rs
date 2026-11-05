@@ -475,9 +475,60 @@ fn validate_https(url: &str) -> Result<()> {
     }
     Ok(())
 }
+fn usable_git_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+fn find_git(search: &std::ffi::OsStr) -> Result<PathBuf> {
+    std::env::split_paths(search)
+        .map(|directory| directory.join("git"))
+        .find(|path| usable_git_file(path))
+        .ok_or_else(|| invalid("Git refresh requires a usable Git installation on PATH. Local, bundled and already cached packs do not require Git; no developer tools are installed automatically."))
+}
+#[cfg(target_os = "macos")]
+fn selected_developer_git(developer: &Path) -> Result<PathBuf> {
+    let git = developer.join("usr/bin/git");
+    if usable_git_file(&git)
+        && fs::canonicalize(&git).ok().as_deref() != Some(Path::new("/usr/bin/git"))
+    {
+        Ok(git)
+    } else {
+        Err(invalid(
+            "Git refresh is unavailable: Apple's Git launcher has no usable selected Git. Install or configure a standalone Git on PATH, or use a local/bundled/cached pack. Durop does not install Command Line Tools.",
+        ))
+    }
+}
+fn git_executable() -> Result<PathBuf> {
+    let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+    let git = find_git(&search)?;
+    #[cfg(target_os = "macos")]
+    if fs::canonicalize(&git).ok().as_deref() == Some(Path::new("/usr/bin/git")) {
+        // /usr/bin/git is a launcher that can display a developer-tools install
+        // prompt on a clean Mac. Check selected tools without invoking that stub.
+        let mut select = Command::new("/usr/bin/xcode-select");
+        select.arg("-p");
+        let bytes = run_git_command(select, std::time::Duration::from_secs(2))
+            .map_err(|_| invalid("Git refresh requires usable external Git. Apple's Git launcher has no selected developer tools; Durop will not invoke an installation prompt. Use a local/bundled/cached pack, or configure standalone Git on PATH."))?;
+        let directory = String::from_utf8(bytes)
+            .map_err(|_| invalid("invalid selected developer-tools path"))?;
+        return selected_developer_git(Path::new(directory.trim()));
+    }
+    Ok(git)
+}
 /// Bounded output and wall time; errors deliberately omit Git stderr/URLs to avoid credential leaks.
 fn git(repo: &Path, args: &[&std::ffi::OsStr], local: bool) -> Result<Vec<u8>> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_executable()?);
     command
         .args([
             "-c",
@@ -502,7 +553,7 @@ fn git(repo: &Path, args: &[&std::ffi::OsStr], local: bool) -> Result<Vec<u8>> {
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1");
-    run_git_command(command, std::time::Duration::from_secs(120))
+    run_git_command(command, std::time::Duration::from_secs(120)).map_err(|error| invalid(format!("Git refresh could not complete; check that Git is usable and the source/ref is available. Local/bundled/cached packs remain usable. {error}")))
 }
 fn run_git_command(mut command: Command, timeout: std::time::Duration) -> Result<Vec<u8>> {
     use std::{
@@ -1039,6 +1090,29 @@ mod cache_tests {
                 })
                 .is_err()
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn missing_git_is_actionable_without_executing_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = Temp::new();
+        let search = std::env::join_paths([&directory.0]).unwrap();
+        assert!(find_git(&search).unwrap_err().0.contains("Local, bundled"));
+        let candidate = directory.0.join("git");
+        fs::write(&candidate, b"not an executable").unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(find_git(&search).is_err());
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(find_git(&search).unwrap(), candidate);
+        // Detection checks readiness without launching an arbitrary file or the
+        // Apple installation stub. Actual Git errors remain bounded/suppressed.
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn absent_selected_apple_git_does_not_request_installation() {
+        let directory = Temp::new();
+        let error = selected_developer_git(&directory.0).unwrap_err();
+        assert!(error.0.contains("does not install Command Line Tools"));
     }
     #[cfg(unix)]
     #[test]

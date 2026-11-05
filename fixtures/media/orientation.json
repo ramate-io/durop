@@ -1,0 +1,19 @@
+{
+  "id": "orientation",
+  "title": "Orientation and alpha fringe check",
+  "asset": "orientation-alpha.mov",
+  "tags": [
+    "proof",
+    "orientation"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4000
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.25,
+    "fit": "contain"
+  }
+}
