@@ -217,7 +217,7 @@ pub struct ControllerClient {
 }
 impl ControllerClient {
     #[cfg(test)]
-    pub(super) async fn connect_loopback(
+    pub(crate) async fn connect_loopback(
         target: SocketAddr,
         credential: SessionCredential,
     ) -> Result<Self, ControllerError> {
@@ -363,7 +363,7 @@ impl ControllerClient {
         let Packet::Icon { png, .. } = packet else {
             return Err(ControllerError::Protocol);
         };
-        if png.len() > 32 * 1024 || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        if !valid_icon_png(&png) {
             self.socket = None;
             return Err(ControllerError::Protocol);
         }
