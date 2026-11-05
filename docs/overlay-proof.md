@@ -203,6 +203,7 @@ Beyond normal-desktop compositing, pulse/clearing and local safety controls,
 click/keyboard/controller passthrough, focus retention under an unfocused
 trigger, broader fullscreen/Spaces support, mixed displays, physical monitor
 removal, precise animation timing and idle-power acceptance remain pending.
-Game/controller and mixed-monitor hardware were unavailable. Compilation and
+Game/controller cases were not exercised; only one non-Retina display was
+available to this run. Compilation and
 logic checks do not satisfy those runtime acceptance items. Record the remaining
 device results before declaring #2 complete.
