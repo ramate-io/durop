@@ -50,6 +50,7 @@ Contents/
   Resources/
     Durop.icns
     assets/
+    sample-packs/reactions/
     sample-packs/podcast-pack/
     sample-packs/media-proof/
     notices/
@@ -60,6 +61,10 @@ The icon repackages Durop's independently authored overlay PNG. Version comes
 from Cargo.toml; the build record stores the exact source revision, compiler
 channel, SDK and minimum OS. Identity is `io.ramate.durop`. Build artifacts must
 not contain secrets or private configuration.
+
+The default reactions catalog is copied with its provenance and license records.
+The bundled Expletus Sans and IBM Plex Mono fonts retain their OFL texts under
+`assets/fonts/`; media and fonts do not inherit the application's MIT license.
 
 The recursive validator enumerates every Mach-O, including unreferenced plugins
 and nested libraries. It checks arm64 architecture, deployment versions,

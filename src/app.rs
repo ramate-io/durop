@@ -49,6 +49,11 @@ pub struct Config {
 }
 
 impl Config {
+    /// Resolve the offline reaction catalog shipped with this executable.
+    pub fn bundled_pack() -> PathBuf {
+        resource_root().join("sample-packs/reactions")
+    }
+
     /// Parse startup options without accepting session credentials on the command line.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let preferences = crate::preferences::Preferences::load();
@@ -56,7 +61,7 @@ impl Config {
             mode: Mode::Local,
             pack: crate::preferences::Preferences::resolved_pack(
                 &preferences.pack,
-                &resource_root().join("sample-packs/podcast-pack"),
+                &Self::bundled_pack(),
             ),
             display: preferences.display,
             connect: None,
@@ -115,6 +120,13 @@ impl Config {
             })
         } else if value.starts_with("https://") {
             let (url, reference) = value.rsplit_once('#').unwrap_or((value, "HEAD"));
+            if let Some((reference, directory)) = reference.split_once(':') {
+                return Ok(PackSource::HttpsGitDirectory {
+                    url: url.into(),
+                    reference: reference.into(),
+                    directory: directory.into(),
+                });
+            }
             Ok(PackSource::HttpsGit {
                 url: url.into(),
                 reference: reference.into(),
@@ -155,8 +167,8 @@ pub enum Action {
     LoadPack(String),
     /// Choose the destination for subsequent playback.
     Destination(Destination),
-    /// Cycle the overlay’s selected monitor.
-    NextDisplay,
+    /// Choose a specific monitor, or restore the primary-display default.
+    SelectDisplay(Option<usize>),
 }
 
 /// Ordered pending user actions collected from the panel and native callbacks.
@@ -445,13 +457,16 @@ pub(crate) fn actions(
                 }
                 .into();
             }
-            Action::NextDisplay => {
-                let count = monitors.iter().count();
-                if count > 0 {
-                    let next = runtime.display.map_or(0, |i| (i + 1) % count);
-                    runtime.display = Some(next);
-                    controls.0.push(crate::overlay::Control::Display(next));
+            Action::SelectDisplay(display) => {
+                if display.is_some_and(|index| index >= monitors.iter().count()) {
+                    runtime.status = "Selected display is no longer available".into();
+                    continue;
                 }
+                runtime.display = display;
+                controls.0.push(display.map_or(
+                    crate::overlay::Control::PrimaryDisplay,
+                    crate::overlay::Control::Display,
+                ));
             }
             Action::LoadPack(path) => {
                 if runtime.loading {
@@ -803,6 +818,25 @@ impl Playback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_reactions_are_complete_and_cover_all_three_media_kinds() {
+        let catalog = crate::catalog::load_local(&Config::bundled_pack()).unwrap();
+        assert_eq!(catalog.clips.len(), 30);
+        let kinds: std::collections::BTreeSet<_> = catalog
+            .clips
+            .iter()
+            .map(|clip| clip.asset_path.extension().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["gif", "mp3", "mp4"].into_iter().collect());
+        assert!(
+            catalog
+                .clips
+                .iter()
+                .all(|clip| clip.metadata.tags.len() >= 2)
+        );
+    }
+
     #[test]
     fn modes_and_explicit_cli_targets_do_not_take_credentials() {
         let config = Config::parse(
@@ -853,6 +887,12 @@ mod tests {
     }
     #[test]
     fn git_pack_selection_preserves_explicit_reference() {
+        assert!(matches!(
+            Config::pack_source("https://github.com/ramate-io/durop.git#main:sample-packs/reactions").unwrap(),
+            PackSource::HttpsGitDirectory { url, reference, directory }
+                if url == "https://github.com/ramate-io/durop.git" && reference == "main"
+                    && directory == std::path::Path::new("sample-packs/reactions")
+        ));
         assert!(
             matches!(Config::pack_source("https://example.com/pack.git#release").unwrap(),PackSource::HttpsGit{url,reference}if url=="https://example.com/pack.git"&&reference=="release")
         );

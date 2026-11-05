@@ -67,7 +67,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args == ["--self-check"] {
         let root = app::resource_root();
-        match catalog::load_local(&root.join("sample-packs/podcast-pack")) {
+        match catalog::load_local(&app::Config::bundled_pack()) {
             Ok(catalog) => {
                 println!(
                     "resources={} clips={} revision={}",
@@ -117,7 +117,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "Durop".into(),
-                        resolution: (1040, 800).into(),
+                        resolution: (1160, 820).into(),
                         visible: config.mode != app::Mode::Host,
                         focused: config.mode != app::Mode::Host,
                         ..default()
