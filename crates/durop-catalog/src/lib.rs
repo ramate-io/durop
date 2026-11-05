@@ -759,7 +759,7 @@ mod tests {
     }
     pub(super) fn fixture() -> Temp {
         let t = Temp::new();
-        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/sample-pack");
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/sample-pack");
         fs::create_dir(t.0.join("reactions")).unwrap();
         for file in [
             "durop.json",
@@ -1214,7 +1214,7 @@ mod cache_tests {
         )
         .unwrap();
         assert_eq!(revision, expected);
-        let catalog = load_local(&data.join("examples/sample-pack")).unwrap();
+        let catalog = load_local(&data.join("../../examples/sample-pack")).unwrap();
         assert_eq!(catalog.clips[0].identity, "sample/chime");
         assert_eq!(
             catalog.clips[0].decoder_readiness,

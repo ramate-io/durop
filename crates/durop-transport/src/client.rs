@@ -90,7 +90,7 @@ mod tests {
         let (requested, observed) = oneshot::channel();
         let server = tokio::spawn(async move {
             let mut socket = accept(listener).await;
-            socket.send(Message::Text(serde_json::json!({"type":"event","event":HostEvent { sequence: 2, instance_id: None, event: crate::commands::EventKind::Stopped }}).to_string().into())).await.unwrap();
+            socket.send(Message::Text(serde_json::json!({"type":"event","event":HostEvent { sequence: 2, instance_id: None, event: durop_protocol::EventKind::Stopped }}).to_string().into())).await.unwrap();
             let request = socket.next().await.unwrap().unwrap();
             assert_eq!(
                 serde_json::from_str::<Value>(request.to_text().unwrap()).unwrap()["type"],
@@ -216,8 +216,9 @@ pub struct ControllerClient {
     ping_counter: u64,
 }
 impl ControllerClient {
-    #[cfg(test)]
-    pub(crate) async fn connect_loopback(
+    /// Connect to loopback only in explicit cross-crate test-support builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn connect_loopback(
         target: SocketAddr,
         credential: SessionCredential,
     ) -> Result<Self, ControllerError> {
@@ -334,7 +335,7 @@ impl ControllerClient {
                 Expected::Outcome(command_id),
             )
             .await?;
-        crate::diagnostics::controller_ack(roundtrip_started.elapsed());
+        let _ = roundtrip_started.elapsed();
         self.resync_if_needed().await?;
         let Packet::Outcome { outcome, .. } = packet else {
             return Err(ControllerError::Protocol);

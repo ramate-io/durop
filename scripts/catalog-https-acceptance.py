@@ -115,7 +115,7 @@ with tempfile.TemporaryDirectory(prefix="durop-https-") as temporary:
     env.update(GIT_SSL_CAINFO=str(certificate), DUROP_TEST_REPOSITORY=str(pack),
                DUROP_TEST_HTTPS_URL=f"https://localhost:{server.server_port}/pack/.git")
     try:
-        run(["cargo", "test", "--locked", "catalog::cache_tests::https_authenticated_cache_acceptance",
+        run(["cargo", "test", "-p", "durop-catalog", "--locked", "cache_tests::https_authenticated_cache_acceptance",
              "--", "--ignored", "--exact"], cwd=project, env=env)
         assert not marker.exists(), "a repository script, hook or smudge filter executed"
         assert "get" in helper_log.read_text().splitlines(), "credential helper was not used"

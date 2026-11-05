@@ -27,7 +27,7 @@ async fn fixture() -> Fixture {
         serde_json::json!({"clips":[{"id":"applause"}]}),
         BTreeMap::from([(
             "applause".into(),
-            include_bytes!("../../assets/overlay-proof.png").to_vec(),
+            include_bytes!("../../../assets/overlay-proof.png").to_vec(),
         )]),
     )
     .unwrap();
@@ -364,7 +364,7 @@ fn pairing_secret(session: &RemoteSession) -> SessionCredential {
 
 #[test]
 fn png_icon_dimensions_are_bounded_before_decode() {
-    let mut png = include_bytes!("../../assets/overlay-proof.png").to_vec();
+    let mut png = include_bytes!("../../../assets/overlay-proof.png").to_vec();
     assert!(valid_icon_png(&png));
     png[16..20].copy_from_slice(&65536u32.to_be_bytes());
     assert!(!valid_icon_png(&png));
@@ -473,7 +473,7 @@ async fn production_client_browses_and_uses_canonical_command_replies() {
 
 #[tokio::test]
 async fn production_client_recovers_event_gaps_and_reconnects_without_replay() {
-    use crate::commands::EventKind;
+    use durop_protocol::EventKind;
     let mut fixture = fixture().await;
     let mut client = ControllerClient::connect_loopback(
         fixture.session.address,
@@ -571,7 +571,7 @@ async fn production_client_rejects_snapshot_behind_observed_event() {
         .send(HostEvent {
             sequence: 2,
             instance_id: None,
-            event: crate::commands::EventKind::Stopped,
+            event: durop_protocol::EventKind::Stopped,
         })
         .unwrap();
     assert!(matches!(

@@ -2,20 +2,34 @@
 use super::*;
 use std::{fs::File, io::BufReader, num::NonZeroU64, path::Path};
 
+/// Bound on all precomposited frames retained by one GIF timeline.
 const MAX_TIMELINE_BYTES: usize = 128 * 1024 * 1024;
+/// Fully composited immutable canvas and its exclusive presentation end time.
 struct Frame {
+    /// End of this frame interval measured from playback start.
     end: Duration,
+    /// Composited straight-alpha RGBA8 canvas for this frame.
     pixels: Arc<[u8]>,
 }
+
+/// Portable GIF decoder with bounded composited storage and monotonic playback timing.
 pub(super) struct Timeline {
+    /// Logical screen width shared by every composited frame.
     width: u32,
+    /// Logical screen height shared by every composited frame.
     height: u32,
+    /// Composited frames bounded by both frame count and total bytes.
     frames: Vec<Frame>,
+    /// Sum of validated frame delays.
     duration: Duration,
+    /// Playback start instant; absent until explicitly started.
     clock: Option<Instant>,
+    /// Last published frame index, preventing duplicate frame emission.
     last: Option<usize>,
 }
+
 impl Timeline {
+    /// Decode and composite offsets, transparency and disposal while checking cancellation.
     pub(super) fn prepare(path: &Path, control: &Control, generation: u64) -> Result<Self, String> {
         let mut options = ::gif::DecodeOptions::new();
         options.set_color_output(::gif::ColorOutput::RGBA);
@@ -26,7 +40,7 @@ impl Timeline {
             .read_info(BufReader::new(File::open(path).map_err(|e| e.to_string())?))
             .map_err(|e| e.to_string())?;
         let (width, height) = (u32::from(reader.width()), u32::from(reader.height()));
-        let size = frame_size(width, height)?;
+        let size = DecodedFrame::byte_len(width, height)?;
         let background = reader
             .bg_color()
             .and_then(|index| {
@@ -135,13 +149,19 @@ impl Timeline {
             last: None,
         })
     }
+
+    /// Return the complete composited timeline duration.
     pub(super) fn duration(&self) -> Duration {
         self.duration
     }
+
+    /// Reset playback time and permit the first frame to be published again.
     pub(super) fn start(&mut self) {
         self.clock = Some(Instant::now());
         self.last = None;
     }
+
+    /// Select the current frame from elapsed time without queueing missed frames.
     pub(super) fn tick(
         &mut self,
         generation: u64,
@@ -186,9 +206,10 @@ mod tests {
             shutdown: AtomicBool::new(false),
         }
     }
+
     #[test]
     fn disposal_offsets_transparency_and_timing_are_composited() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/media/disposal.gif");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/media/disposal.gif");
         let timeline = Timeline::prepare(&path, &control(), 1).unwrap();
         assert_eq!(timeline.duration, Duration::from_millis(700));
         let pixel = |frame: usize, x: usize, y: usize| {

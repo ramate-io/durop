@@ -1,5 +1,5 @@
 //! Explicit, revocable, tailnet-only remote sessions, outside Bevy's frame loop.
-use crate::commands::{
+use durop_protocol::{
     CommandOutcome, Envelope, HostEvent, HostSnapshot, PROTOCOL_VERSION, PlaybackCommand,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -43,7 +43,7 @@ const REQUESTS_PER_SECOND: usize = 20;
 const SUBPROTOCOL: &str = "durop.v1";
 enum BindingGuard {
     Tailnet,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Loopback,
 }
 
@@ -228,8 +228,9 @@ pub async fn enable(
     )
 }
 
-#[cfg(test)]
-pub(crate) async fn enable_test_loopback(
+/// Start an authenticated loopback session for cross-crate regression tests only.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn enable_test_loopback(
     bridge: HostBridge,
     catalog: RemoteCatalog,
 ) -> Result<RemoteSession, TransportError> {

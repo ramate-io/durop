@@ -1841,10 +1841,45 @@ name = "durop"
 version = "0.1.0"
 dependencies = [
  "bevy",
- "futures-util",
- "getrandom 0.4.3",
+ "durop-catalog",
+ "durop-host",
+ "durop-media",
+ "durop-protocol",
+ "durop-transport",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "winit",
+]
+
+[[package]]
+name = "durop-catalog"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "durop-host"
+version = "0.1.0"
+dependencies = [
+ "durop-catalog",
+ "durop-protocol",
+ "tokio",
+]
+
+[[package]]
+name = "durop-media"
+version = "0.1.0"
+dependencies = [
  "gif",
- "if-addrs",
  "objc2 0.6.4",
  "objc2-av-foundation",
  "objc2-core-graphics",
@@ -1852,16 +1887,29 @@ dependencies = [
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
- "raw-window-handle",
+]
+
+[[package]]
+name = "durop-protocol"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
- "sha2",
+]
+
+[[package]]
+name = "durop-transport"
+version = "0.1.0"
+dependencies = [
+ "durop-protocol",
+ "futures-util",
+ "getrandom 0.4.3",
+ "if-addrs",
+ "serde",
+ "serde_json",
  "subtle",
  "tokio",
  "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "winit",
 ]
 
 [[package]]

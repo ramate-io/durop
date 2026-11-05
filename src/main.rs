@@ -1,19 +1,26 @@
 mod app;
 #[cfg(target_os = "macos")]
 mod app_macos;
-pub mod catalog;
-pub mod commands;
+/// Validated local and Git catalog sources, independent of presentation.
+pub extern crate durop_catalog as catalog;
+/// Shared wire commands and host observations.
+pub extern crate durop_protocol as commands;
 mod diagnostics;
-pub mod host;
-pub mod media;
+/// Serialized playback policy and bounded command ingress.
+pub extern crate durop_host as host;
+/// Framework-independent GIF and native media workers.
+pub extern crate durop_media as media;
+mod media_app;
 mod network_app;
 pub mod overlay;
 mod panel;
 mod preferences;
-pub mod transport;
+/// Authenticated Tailscale sessions and controller protocol.
+pub extern crate durop_transport as transport;
 
 use bevy::{prelude::*, window::ExitCondition};
 
+/// Parse startup mode, assemble the application, and flush diagnostics on exit.
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("Durop {}", env!("CARGO_PKG_VERSION"));
@@ -32,9 +39,9 @@ fn main() {
             .get(3)
             .is_some_and(|argument| argument == "--cancel")
         {
-            media::probe_cancel(std::path::Path::new(path))
+            media::ProbeReport::cancel(std::path::Path::new(path))
         } else {
-            media::probe(std::path::Path::new(path))
+            media::ProbeReport::play(std::path::Path::new(path))
         };
         match result {
             Ok(report) => println!("{report:#?}"),
@@ -117,7 +124,7 @@ fn main() {
         )
         .add_plugins((
             overlay::OverlayPlugin,
-            media::MediaPlugin,
+            media_app::MediaPlugin,
             app::RuntimePlugin,
             network_app::NetworkPlugin,
             panel::PanelPlugin,

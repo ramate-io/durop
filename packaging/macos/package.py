@@ -32,7 +32,8 @@ def capture(args, **kwargs):
 def source_fingerprint():
     digest=hashlib.sha256()
     files=[ROOT/name for name in ("Cargo.toml","Cargo.lock","rust-toolchain.toml")]
-    files.extend(path for path in (ROOT/"src").rglob("*") if path.is_file())
+    for source in (ROOT / "src", ROOT / "crates"):
+        files.extend(path for path in source.rglob("*") if path.is_file())
     for path in sorted(files):
         name=str(path.relative_to(ROOT)).encode()
         data=path.read_bytes()
@@ -76,7 +77,7 @@ def main():
     if f"release: {channel}\n" not in compiler + "\n":
         parser.error("rustc version does not match rust-toolchain.toml")
     fingerprint=source_fingerprint()
-    run([cargo, "build", "--release", "--locked", "--target", TARGET], cwd=ROOT, env=env)
+    run([cargo, "build", "--package", "durop", "--bin", "durop", "--release", "--locked", "--target", TARGET], cwd=ROOT, env=env)
     if source_fingerprint()!=fingerprint:
         raise RuntimeError("Rust source inputs changed during the build; retry from a frozen checkout")
     binary = ROOT / "target/native-package" / TARGET / "release/durop"

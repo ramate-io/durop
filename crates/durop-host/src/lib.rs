@@ -1,60 +1,93 @@
 //! Serialized host authority; native resources stay behind generation-tagged effects.
-use crate::{
-    catalog::{Catalog, Clip, Retrigger},
-    commands::{
-        ClipStatus, CommandOutcome, Envelope, EventKind, HostEvent, HostSnapshot, InstanceSnapshot,
-        InstanceState, PROTOCOL_VERSION, PlaybackCommand, Readiness, Rejection,
-    },
+#![deny(missing_docs)]
+
+use durop_catalog::{Catalog, Clip, Retrigger};
+use durop_protocol::{
+    ClipStatus, CommandOutcome, Envelope, EventKind, HostEvent, HostSnapshot, InstanceSnapshot,
+    InstanceState, PROTOCOL_VERSION, PlaybackCommand, Readiness, Rejection,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
 
+/// Maximum active occurrences, including workers still stopping.
 pub const CONCURRENCY_CAP: usize = 8;
+/// Maximum remembered command outcomes per host lifetime.
 pub const DEDUPE_CAP: usize = 1024;
+/// Maximum terminal occurrences retained for reconnect snapshots.
 pub const HISTORY_CAP: usize = 256;
+/// Maximum undrained host events retained in memory.
 pub const EVENT_CAP: usize = 256;
 
+/// Occurrence and generation guard carried across the backend boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendToken {
+    /// Occurrence whose resources the backend owns.
     pub instance_id: String,
+    /// Generation that must still match when the backend reports completion.
     pub generation: u64,
 }
+
+/// Deferred native actions emitted only after serialized host policy decisions.
 #[derive(Debug, Clone)]
 pub enum BackendEffect {
+    /// Prepare immutable clip resources without starting playback.
     Prepare {
+        /// Guard identifying the occurrence and generation for this action.
         token: BackendToken,
+        /// Pinned catalog metadata and local resources to prepare.
         clip: Box<Clip>,
     },
+    /// Start an already prepared occurrence.
     Start {
+        /// Guard identifying the occurrence and generation for this action.
         token: BackendToken,
     },
+    /// Cancel work and acknowledge only after native cleanup.
     Stop {
+        /// Guard identifying the occurrence and generation for this action.
         token: BackendToken,
     },
-}
-#[derive(Debug, Clone)]
-pub struct BackendEvent {
-    pub token: BackendToken,
-    pub event: BackendEventKind,
-}
-#[derive(Debug, Clone)]
-pub enum BackendEventKind {
-    Prepared,
-    Started,
-    Finished,
-    Stopped,
-    Failed { message: String },
 }
 
+/// Generation-tagged backend observation returned to the host authority.
+#[derive(Debug, Clone)]
+pub struct BackendEvent {
+    /// Occurrence guard copied from the initiating backend effect.
+    pub token: BackendToken,
+    /// Observed native lifecycle transition.
+    pub event: BackendEventKind,
+}
+
+/// Backend acknowledgements accepted by the serialized host state machine.
+#[derive(Debug, Clone)]
+pub enum BackendEventKind {
+    /// Resources are ready; the host may now request playback start.
+    Prepared,
+    /// Playback start was acknowledged by the backend.
+    Started,
+    /// Playback completed and its resources have been released.
+    Finished,
+    /// Requested cancellation completed and released resources.
+    Stopped,
+    /// Preparation or playback ended unsuccessfully.
+    Failed {
+        /// Backend diagnostic associated with this terminal failure.
+        message: String,
+    },
+}
+
+/// Host-private lifecycle bookkeeping for one active occurrence.
 struct Instance {
     snapshot: InstanceSnapshot,
     prepared: bool,
     blockers: Vec<String>,
     start_requested: bool,
 }
+
 impl Instance {
+    /// Capture the occurrence guard attached to outgoing native work.
     fn token(&self) -> BackendToken {
         BackendToken {
             instance_id: self.snapshot.instance_id.clone(),
@@ -63,6 +96,7 @@ impl Instance {
     }
 }
 
+/// Single serialized policy authority over a pinned catalog and playback session.
 pub struct Host {
     session_id: String,
     catalog: Arc<Catalog>,
@@ -102,10 +136,12 @@ impl Host {
         }
     }
 
+    /// Validate, deduplicate and apply one controller intention.
     pub fn accept(&mut self, envelope: Envelope) -> CommandOutcome {
         self.accept_inner(envelope, false)
     }
 
+    /// Apply admission ordering while retaining outcomes for idempotent retries.
     fn accept_inner(&mut self, envelope: Envelope, superseded: bool) -> CommandOutcome {
         let reason = if envelope.protocol_version != PROTOCOL_VERSION {
             Some(Rejection::UnsupportedVersion)
@@ -150,6 +186,7 @@ impl Host {
         outcome
     }
 
+    /// Resolve a command against bounded active/history state before emitting effects.
     fn decide(&mut self, command: &PlaybackCommand) -> Result<Option<String>, Rejection> {
         match command {
             PlaybackCommand::Play { clip_id } => {
@@ -190,6 +227,7 @@ impl Host {
         }
     }
 
+    /// Apply an accepted policy decision and enqueue generation-guarded effects.
     fn perform(&mut self, command: PlaybackCommand, instance_id: Option<String>) {
         match command {
             PlaybackCommand::Play { clip_id } => {
@@ -245,6 +283,7 @@ impl Host {
         }
     }
 
+    /// Request cancellation once while retaining the occurrence until backend cleanup.
     fn stop(&mut self, id: &str) {
         if let Some(instance) = self.instances.get_mut(id)
             && instance.snapshot.state != InstanceState::Stopping
@@ -263,6 +302,7 @@ impl Host {
     }
 
     /// Callback tokens must match the worker's original occurrence and generation.
+    /// Advance lifecycle only when the backend occurrence and generation still match.
     pub fn backend_event(&mut self, event: BackendEvent) {
         let Some(instance) = self.instances.get_mut(&event.token.instance_id) else {
             return;
@@ -321,6 +361,7 @@ impl Host {
         }
     }
 
+    /// Move a terminal occurrence into bounded history and unblock restart dependents.
     fn terminal(&mut self, id: &str, state: InstanceState, event: EventKind) {
         let Some(mut instance) = self.instances.remove(id) else {
             return;
@@ -352,6 +393,7 @@ impl Host {
         }
     }
 
+    /// Record an ordered rejection event without issuing backend work.
     fn rejected(&mut self, command_id: &str, reason: Rejection) -> CommandOutcome {
         self.emit(
             None,
@@ -362,6 +404,8 @@ impl Host {
         );
         CommandOutcome::Rejected { reason }
     }
+
+    /// Append a monotonically sequenced observation, retaining the bounded event tail.
     fn emit(&mut self, instance_id: Option<String>, event: EventKind) {
         self.sequence = self
             .sequence
@@ -376,6 +420,8 @@ impl Host {
             event,
         });
     }
+
+    /// Return a bounded recovery view of readiness, active instances and history.
     pub fn snapshot(&self) -> HostSnapshot {
         HostSnapshot {
             session_id: self.session_id.clone(),
@@ -397,21 +443,29 @@ impl Host {
                 .collect(),
         }
     }
+
+    /// Return the fresh identity shared by this host and its controller envelopes.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+
+    /// Return the latest emitted event sequence.
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
+
+    /// Consume ordered events accumulated since the previous application update.
     pub fn drain_events(&mut self) -> Vec<HostEvent> {
         self.events.drain(..).collect()
     }
+
+    /// Consume native actions to execute outside serialized policy handling.
     pub fn drain_effects(&mut self) -> Vec<BackendEffect> {
         self.effects.drain(..).collect()
     }
 }
 
-/// Bounded shared ingress. The wake callback must notify Bevy's event loop; it
+/// Bounded shared ingress. The wake callback must notify the application event loop; it
 /// must not perform playback or block. One receiver serializes all policy work.
 pub fn command_channel(wake: impl Fn() + Send + Sync + 'static) -> (CommandSender, CommandInbox) {
     let (normal_tx, normal_rx) = tokio::sync::mpsc::channel(128);
@@ -435,33 +489,44 @@ pub fn command_channel(wake: impl Fn() + Send + Sync + 'static) -> (CommandSende
     )
 }
 
+/// One admitted ingress item with stop-ordering and optional remote liveness.
 struct Queued {
     envelope: Envelope,
     epoch: u64,
     ticket: Option<u64>,
     active: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
+
+/// Mutex-protected sender state keeps stop epochs ordered with queue admission.
 struct Submit {
     normal_tx: tokio::sync::mpsc::Sender<Queued>,
     priority_tx: tokio::sync::mpsc::Sender<Queued>,
     epoch: u64,
 }
+
+/// Cloneable bounded ingress shared by local and authenticated remote controllers.
 #[derive(Clone)]
 pub struct CommandSender {
     inner: Arc<std::sync::Mutex<Submit>>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
+
+/// Queue admission failure; no playback policy has been applied yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueError {
+    /// The selected bounded queue has no remaining capacity.
     Busy,
+    /// The sole host receiver has been dropped.
     Closed,
 }
+
 impl CommandSender {
     /// Queue admission is not host acceptance. Failed admission always returns
     /// Busy/Closed; it never silently drops a controller command.
     pub fn try_send(&self, envelope: Envelope) -> Result<(), QueueError> {
         self.send(envelope, None, None)
     }
+
     /// Remote admission must still be live immediately before host acceptance.
     pub fn try_send_guarded(
         &self,
@@ -471,6 +536,8 @@ impl CommandSender {
     ) -> Result<(), QueueError> {
         self.send(envelope, Some(ticket), Some(active))
     }
+
+    /// Atomically admit a command and advance the stop epoch only after queue success.
     fn send(
         &self,
         envelope: Envelope,
@@ -507,18 +574,26 @@ impl CommandSender {
         Ok(())
     }
 }
+
+/// Single host-side receiver with separate emergency and ordinary queues.
 pub struct CommandInbox {
     normal_rx: tokio::sync::mpsc::Receiver<Queued>,
     priority_rx: tokio::sync::mpsc::Receiver<Queued>,
     cutoff: u64,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
+
+/// Host outcome correlated with its command and optional remote reply ticket.
 #[derive(Debug)]
 pub struct CommandReceipt {
+    /// Controller command identity used for matching acknowledgements.
     pub command_id: String,
+    /// Serialized host decision for the queued operation.
     pub outcome: CommandOutcome,
+    /// Remote reply ticket; absent for local fire-and-observe commands.
     pub ticket: Option<u64>,
 }
+
 impl CommandInbox {
     /// At most 8 emergency requests then 32 ordinary requests per update.
     /// A new accepted StopAll supersedes older queued commands, but a replayed
@@ -571,6 +646,8 @@ impl CommandInbox {
         }
         receipts
     }
+
+    /// Whether another bounded drain should wake the application loop.
     pub fn has_pending(&self) -> bool {
         !self.priority_rx.is_empty() || !self.normal_rx.is_empty()
     }
@@ -579,7 +656,7 @@ impl CommandInbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ClipMetadata, DecoderReadiness, PackManifest, Playback};
+    use durop_catalog::{ClipMetadata, DecoderReadiness, PackManifest, Playback};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn host(policy: Retrigger) -> Host {
@@ -617,6 +694,7 @@ mod tests {
             }),
         )
     }
+
     fn envelope(id: &str, command: PlaybackCommand) -> Envelope {
         Envelope {
             protocol_version: 1,
@@ -626,6 +704,7 @@ mod tests {
             command,
         }
     }
+
     fn play(id: &str) -> Envelope {
         envelope(
             id,
@@ -634,6 +713,7 @@ mod tests {
             },
         )
     }
+
     fn prepared_token(host: &mut Host, id: &str) -> BackendToken {
         assert!(matches!(
             host.accept(play(id)),
@@ -650,12 +730,14 @@ mod tests {
             })
             .unwrap()
     }
+
     fn signal(host: &mut Host, token: &BackendToken, event: BackendEventKind) {
         host.backend_event(BackendEvent {
             token: token.clone(),
             event,
         });
     }
+
     fn start(host: &mut Host, token: &BackendToken) {
         signal(host, token, BackendEventKind::Prepared);
         assert!(matches!(
