@@ -19,4 +19,5 @@ jobs:
       - run: nix develop --command cargo fmt --all -- --check
       - run: nix develop --command cargo check --locked
       - run: nix develop --command cargo test --locked
+      - run: nix develop --command cargo clippy --all-targets --locked -- -D warnings
       - run: nix develop --command cargo build --locked
