@@ -103,6 +103,32 @@ selected self fields, connectivity information, and direct/relay ping text; it o
 raw account/device status. It never runs login, up, down, policy, plan, or apply.
 Diagnostics are host-local, not remotely callable. They do not log session secrets.
 
+## Native controller
+
+`ControllerClient::connect(SocketAddr, SessionCredential::from_secret(secret)?)`
+is the production native client. The explicit target must be a Tailscale IP and
+nonzero port; credentials never appear in URLs or Debug output. The client consumes
+the credential for the authenticated upgrade and requires `durop.v1` plus a fresh
+initial typed snapshot. Only the isolated test build has a loopback connect helper.
+
+Own the mutable client in a task on the existing Tokio runtime. Use `command(id,
+revision, PlaybackCommand)` for canonical typed outcomes, `catalog()` and `icon(id)`
+for bounded browsing, `refresh_snapshot()` for current state, and `next_update()`
+for typed events or replacement snapshots. The panel can select `next_update()`
+alongside its bounded online UI action channel. `current_snapshot()` supplies the
+session/revision for initial controls; publish host snapshots before related events.
+The client detects event-sequence gaps or its 64-event buffer overflowing and obtains
+a replacement snapshot. Backwards snapshots, a changed session/revision on the same
+connection, malformed packets, and uncorrelated replies fail closed.
+
+Commands and browse requests have five-second deadlines. The client sends bounded
+heartbeats while reading to maintain an idle connection. A timeout or connection
+failure destroys the socket and any pending request; it never reconnects or retries
+button presses. `disconnect()` explicitly closes access. Disable remote actions when
+`is_connected()` becomes false, clear pending UI actions, and require an explicit
+Connect with protected credential input. A newly created client always fetches a
+fresh snapshot. The UI must not persist pairing input or its online action queue.
+
 ## Validation and remaining acceptance
 
 Run `nix develop --command cargo test --locked transport::tests`, followed by the
@@ -111,6 +137,9 @@ exercise successful authentication, rejection of credentials/origin/path/version
 bounded connections and rates, malformed/oversized messages, catalog/icon scoping,
 reconnect snapshots, priority StopAll, disconnect cancellation, and revocation. These
 tests never bind to a real Tailscale interface or change network configuration.
+Four additional loopback tests use the production client for actual browse/commands,
+typed outcomes, event-gap recovery, reconnect/revocation, offline refusal, and pending
+request timeout without replay.
 
 Two separately enrolled Macs on different networks still must prove authorized
 catalog/icon browse, play/stop/status, concurrent local/remote policy, wrong revisions,

@@ -10,6 +10,7 @@ struct Fixture {
     commands: mpsc::Receiver<RemoteCommand>,
     emergency: mpsc::Receiver<RemoteCommand>,
     snapshot: watch::Sender<HostSnapshot>,
+    events: broadcast::Sender<HostEvent>,
 }
 async fn fixture() -> Fixture {
     let (commands, commands_rx) = mpsc::channel(1);
@@ -39,7 +40,7 @@ async fn fixture() -> Fixture {
             commands,
             emergency,
             snapshot: snapshot_rx,
-            events,
+            events: events.clone(),
         },
         catalog,
         BindingGuard::Loopback,
@@ -50,6 +51,7 @@ async fn fixture() -> Fixture {
         commands: commands_rx,
         emergency: emergency_rx,
         snapshot,
+        events,
     }
 }
 fn request(session: &RemoteSession) -> tokio_tungstenite::tungstenite::http::Request<()> {
@@ -354,4 +356,196 @@ async fn production_rejects_loopback_wildcard_lan_and_unassigned_tailnet() {
     let token = SessionCredential(random_hex::<32>().unwrap());
     assert_eq!(token.bearer().len(), 64);
     assert!(!format!("{token:?}").contains(token.bearer()));
+}
+
+fn pairing_secret(session: &RemoteSession) -> SessionCredential {
+    SessionCredential::from_secret(session.credential.bearer().to_string()).unwrap()
+}
+
+#[tokio::test]
+async fn production_client_browses_and_uses_canonical_command_replies() {
+    let mut fixture = fixture().await;
+    assert!(matches!(
+        ControllerClient::connect(fixture.session.address, pairing_secret(&fixture.session)).await,
+        Err(ControllerError::InvalidTarget)
+    ));
+    assert!(SessionCredential::from_secret("URL-token-or-invalid-secret".into()).is_err());
+    assert!(matches!(
+        ControllerClient::connect_loopback(
+            fixture.session.address,
+            SessionCredential::from_secret("f".repeat(64)).unwrap()
+        )
+        .await,
+        Err(ControllerError::ConnectionDenied)
+    ));
+    let mut client = ControllerClient::connect_loopback(
+        fixture.session.address,
+        pairing_secret(&fixture.session),
+    )
+    .await
+    .unwrap();
+    assert_eq!(client.current_snapshot().session_id, "test-session");
+    assert_eq!(
+        client.catalog().await.unwrap()["clips"][0]["id"],
+        "applause"
+    );
+    assert!(
+        client
+            .icon("applause")
+            .await
+            .unwrap()
+            .starts_with(b"\x89PNG\r\n\x1a\n")
+    );
+    assert_eq!(
+        client.icon("../../private").await,
+        Err(ControllerError::UnknownIcon)
+    );
+    assert!(client.is_connected());
+    let (outcome, ()) = tokio::join!(
+        client.command(
+            "typed-command".into(),
+            "abc".into(),
+            PlaybackCommand::Play {
+                clip_id: "applause".into()
+            }
+        ),
+        async {
+            let command = fixture.commands.recv().await.unwrap();
+            assert!(command.is_active());
+            assert_eq!(command.envelope.command_id, "typed-command");
+            assert_eq!(command.envelope.catalog_revision, "abc");
+            command
+                .reply
+                .send(CommandOutcome::Accepted {
+                    instance_id: Some("instance-1".into()),
+                })
+                .unwrap();
+        }
+    );
+    assert_eq!(
+        outcome.unwrap(),
+        CommandOutcome::Accepted {
+            instance_id: Some("instance-1".into())
+        }
+    );
+    client.disconnect().await;
+    assert_eq!(
+        client
+            .command("offline".into(), "abc".into(), PlaybackCommand::StopAll)
+            .await,
+        Err(ControllerError::Disconnected)
+    );
+    assert!(fixture.emergency.try_recv().is_err());
+    fixture.session.close().await;
+}
+
+#[tokio::test]
+async fn production_client_recovers_event_gaps_and_reconnects_without_replay() {
+    use crate::commands::EventKind;
+    let mut fixture = fixture().await;
+    let mut client = ControllerClient::connect_loopback(
+        fixture.session.address,
+        pairing_secret(&fixture.session),
+    )
+    .await
+    .unwrap();
+    fixture
+        .snapshot
+        .send_modify(|snapshot| snapshot.sequence = 2);
+    fixture
+        .events
+        .send(HostEvent {
+            sequence: 2,
+            instance_id: None,
+            event: EventKind::Stopped,
+        })
+        .unwrap();
+    let update = timeout(Duration::from_secs(2), client.next_update())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(update, ControllerUpdate::Snapshot(snapshot) if snapshot.sequence == 2));
+    fixture
+        .events
+        .send(HostEvent {
+            sequence: 3,
+            instance_id: None,
+            event: EventKind::Finished,
+        })
+        .unwrap();
+    assert!(
+        matches!(client.next_update().await.unwrap(), ControllerUpdate::Event(event) if event.sequence == 3)
+    );
+    client.disconnect().await;
+    fixture
+        .snapshot
+        .send_modify(|snapshot| snapshot.sequence = 7);
+    let mut reconnect = ControllerClient::connect_loopback(
+        fixture.session.address,
+        pairing_secret(&fixture.session),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reconnect.current_snapshot().sequence, 7);
+    assert!(fixture.commands.try_recv().is_err());
+    assert!(fixture.emergency.try_recv().is_err());
+    fixture.session.revoke();
+    assert!(reconnect.next_update().await.is_err());
+    assert!(!reconnect.is_connected());
+    assert_eq!(
+        reconnect.catalog().await,
+        Err(ControllerError::Disconnected)
+    );
+    fixture.session.close().await;
+}
+
+#[tokio::test]
+async fn production_client_pending_timeout_cancels_without_replay() {
+    let mut fixture = fixture().await;
+    let mut client = ControllerClient::connect_loopback(
+        fixture.session.address,
+        pairing_secret(&fixture.session),
+    )
+    .await
+    .unwrap();
+    let (outcome, queued) = tokio::join!(
+        client.command(
+            "never-replied".into(),
+            "abc".into(),
+            PlaybackCommand::Play {
+                clip_id: "applause".into()
+            }
+        ),
+        async { fixture.commands.recv().await.unwrap() }
+    );
+    assert!(outcome.is_err());
+    assert!(!queued.is_active());
+    assert!(!client.is_connected());
+    assert!(fixture.commands.try_recv().is_err());
+    fixture.session.close().await;
+}
+
+#[tokio::test]
+async fn production_client_rejects_snapshot_behind_observed_event() {
+    let fixture = fixture().await;
+    let mut client = ControllerClient::connect_loopback(
+        fixture.session.address,
+        pairing_secret(&fixture.session),
+    )
+    .await
+    .unwrap();
+    fixture
+        .events
+        .send(HostEvent {
+            sequence: 2,
+            instance_id: None,
+            event: crate::commands::EventKind::Stopped,
+        })
+        .unwrap();
+    assert!(matches!(
+        client.next_update().await,
+        Err(ControllerError::Protocol)
+    ));
+    assert!(!client.is_connected());
+    fixture.session.close().await;
 }
