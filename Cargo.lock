@@ -1861,6 +1861,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "winit",
 ]
 
 [[package]]

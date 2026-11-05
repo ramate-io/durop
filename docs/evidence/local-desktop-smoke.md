@@ -17,8 +17,8 @@ desktop and two-Mac acceptance.
 
 The temporary pack's original path was restored from preferences when the native
 app launched. Package relocation did not cause it to switch to the bundled
-sample pack in this run. This is an observed setup behavior; root cause and fix
-are pending in PR 20.
+sample pack in this run. Follow-up `30187a1` normalizes bundled defaults across app relocation and adds a
+regression test. That follow-up still needs a new native GUI retest.
 
 ## Observed
 

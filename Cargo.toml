@@ -20,6 +20,7 @@ if-addrs = "0.14"
 subtle = "2.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "registry"] }
+winit = { version = "=0.30.13", default-features = false, features = ["x11"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
