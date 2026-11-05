@@ -16,6 +16,129 @@ pub enum ControllerError {
     UnknownIcon,
     ConnectionDenied,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn snapshot(sequence: u64) -> HostSnapshot {
+        HostSnapshot {
+            session_id: "session".into(),
+            catalog_revision: "revision".into(),
+            sequence,
+            clips: vec![],
+            instances: vec![],
+        }
+    }
+    async fn fake_host() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        (listener, address)
+    }
+    async fn accept(listener: TcpListener) -> tokio_tungstenite::WebSocketStream<TcpStream> {
+        let (tcp, _) = listener.accept().await.unwrap();
+        #[allow(clippy::result_large_err)]
+        let mut socket = accept_hdr_async_with_config(
+            tcp,
+            |_: &Request, mut response: Response| {
+                response
+                    .headers_mut()
+                    .insert("sec-websocket-protocol", SUBPROTOCOL.parse().unwrap());
+                Ok(response)
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        socket
+            .send(Message::Text(
+                serde_json::json!({"type":"snapshot","snapshot":snapshot(0)})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        socket
+    }
+    #[tokio::test]
+    async fn silent_heartbeat_blackhole_expires_connection() {
+        let (listener, address) = fake_host().await;
+        let (release, released) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let _socket = accept(listener).await;
+            let _ = released.await;
+        });
+        let mut client = ControllerClient::connect_loopback(
+            address,
+            SessionCredential::from_secret("a".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+        client.heartbeat = tokio::time::Instant::now();
+        assert!(matches!(
+            timeout(Duration::from_secs(7), client.next_update())
+                .await
+                .unwrap(),
+            Err(ControllerError::Timeout)
+        ));
+        assert!(!client.is_connected());
+        let _ = release.send(());
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn cancelling_gap_recovery_accepts_late_snapshot_before_next_reply() {
+        let (listener, address) = fake_host().await;
+        let (requested, observed) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut socket = accept(listener).await;
+            socket.send(Message::Text(serde_json::json!({"type":"event","event":HostEvent { sequence: 2, instance_id: None, event: crate::commands::EventKind::Stopped }}).to_string().into())).await.unwrap();
+            let request = socket.next().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(request.to_text().unwrap()).unwrap()["type"],
+                "snapshot"
+            );
+            requested.send(()).unwrap();
+            let command = socket.next().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(command.to_text().unwrap()).unwrap()["type"],
+                "command"
+            );
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"type":"snapshot","snapshot":snapshot(2)})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket.send(Message::Text(serde_json::json!({"type":"outcome","command_id":"after-cancel","outcome":CommandOutcome::Accepted { instance_id: None }}).to_string().into())).await.unwrap();
+            // Keep the socket alive until the caller closes it.
+            let _ = socket.next().await;
+        });
+        let mut client = ControllerClient::connect_loopback(
+            address,
+            SessionCredential::from_secret("a".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut update = Box::pin(client.next_update());
+        tokio::select! { _ = &mut update => panic!("snapshot should still be pending"), _ = observed => {} }
+        drop(update);
+        assert_eq!(
+            client
+                .command(
+                    "after-cancel".into(),
+                    "revision".into(),
+                    PlaybackCommand::StopAll
+                )
+                .await
+                .unwrap(),
+            CommandOutcome::Accepted { instance_id: None }
+        );
+        assert_eq!(client.current_snapshot().sequence, 2);
+        client.disconnect().await;
+        server.await.unwrap();
+    }
+}
 impl std::fmt::Display for ControllerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -89,6 +212,8 @@ pub struct ControllerClient {
     events: VecDeque<HostEvent>,
     needs_snapshot: bool,
     heartbeat: tokio::time::Instant,
+    pending_ping: Option<(Vec<u8>, tokio::time::Instant)>,
+    ping_counter: u64,
 }
 impl ControllerClient {
     #[cfg(test)]
@@ -162,6 +287,8 @@ impl ControllerClient {
             events: VecDeque::new(),
             needs_snapshot: false,
             heartbeat: tokio::time::Instant::now() + Duration::from_secs(20),
+            pending_ping: None,
+            ping_counter: 0,
         };
         let initial = timeout(IO_TIMEOUT, client.read())
             .await
@@ -386,17 +513,31 @@ impl ControllerClient {
     }
     async fn read(&mut self) -> Result<Packet, ControllerError> {
         loop {
+            let deadline = self
+                .pending_ping
+                .as_ref()
+                .map(|(_, deadline)| *deadline)
+                .unwrap_or(self.heartbeat);
+            if self.pending_ping.is_some() && tokio::time::Instant::now() >= deadline {
+                return Err(ControllerError::Timeout);
+            }
             let socket = self.socket.as_mut().ok_or(ControllerError::Disconnected)?;
-            let message = match tokio::time::timeout_at(self.heartbeat, socket.next()).await {
+            let message = match tokio::time::timeout_at(deadline, socket.next()).await {
                 Ok(next) => next
                     .ok_or(ControllerError::Disconnected)?
                     .map_err(|_| ControllerError::Disconnected)?,
                 Err(_) => {
-                    timeout(IO_TIMEOUT, socket.send(Message::Ping(Vec::new().into())))
+                    if self.pending_ping.is_some() {
+                        return Err(ControllerError::Timeout);
+                    }
+                    self.ping_counter = self.ping_counter.wrapping_add(1);
+                    let ping = self.ping_counter.to_be_bytes().to_vec();
+                    timeout(IO_TIMEOUT, socket.send(Message::Ping(ping.clone().into())))
                         .await
                         .map_err(|_| ControllerError::Timeout)?
                         .map_err(|_| ControllerError::Disconnected)?;
                     self.heartbeat = tokio::time::Instant::now() + Duration::from_secs(20);
+                    self.pending_ping = Some((ping, tokio::time::Instant::now() + IO_TIMEOUT));
                     continue;
                 }
             };
@@ -408,7 +549,15 @@ impl ControllerClient {
                     .await
                     .map_err(|_| ControllerError::Timeout)?
                     .map_err(|_| ControllerError::Disconnected)?,
-                Message::Pong(_) => {}
+                Message::Pong(bytes) => {
+                    if self
+                        .pending_ping
+                        .as_ref()
+                        .is_some_and(|(expected, _)| expected.as_slice() == bytes.as_ref())
+                    {
+                        self.pending_ping = None;
+                    }
+                }
                 _ => return Err(ControllerError::Disconnected),
             }
         }
