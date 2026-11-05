@@ -86,6 +86,7 @@ pub struct RemoteCatalogView {
 }
 
 impl RemoteCatalogView {
+    // Reject oversized/duplicate projections before icons or panel resources are allocated.
     fn validate(&self) -> bool {
         let mut ids = BTreeSet::new();
         self.clips.len() <= 256
@@ -107,14 +108,23 @@ impl RemoteCatalogView {
 
 /// Background results carry a generation so an ended session cannot update a new one.
 enum Update {
+    // A live transport request still needs the shared host ingress guard and policy.
     Remote(RemoteCommand),
+    // Ownership arrives only after catalog projection, address verification, and binding.
     HostEnabled(u64, RemoteSession),
+    // Wake the idle UI when the listener's verification or permission ends.
     HostEnded(u64),
+    // Report only the current enable attempt; stale generations are ignored by dispatch.
     HostFailed(u64, String),
+    // The authenticated initial snapshot authorizes the Connecting -> Connected transition.
     Connected(u64, HostSnapshot, RemoteCatalogView),
+    // Complete remote state supersedes any previously displayed event-derived state.
     Snapshot(u64, HostSnapshot),
+    // Bounded bytes fetched for an exact ID from the validated remote catalog.
     Icon(u64, String, Vec<u8>),
+    // Admission/host outcome, distinct from backend Started or physical output.
     Outcome(u64, CommandOutcome),
+    // Clear controller state and pending UI intentions for this generation only.
     Disconnected(u64, String),
 }
 
@@ -144,24 +154,43 @@ pub struct NetworkState {
     pub pairing_secret: Option<String>,
     /// One-shot UI intentions; each update processes at most 64 and discards excess.
     pub actions: VecDeque<NetworkAction>,
+    // One long-lived executor for sockets/CLI work; never created by a button handler.
     runtime: tokio::runtime::Runtime,
+    // Native controller and host-side remote requests converge on this in-process queue.
     local: NativeControllerBackend,
+    // Sole policy pump; drains emergency work first and enforces canonical stop barriers.
     inbox: CommandInbox,
+    // Forwards authenticated ingress into bounded UI updates and wakes an idle event loop.
     remote_job: tokio::task::JoinHandle<()>,
+    // Listener-facing channel endpoints; no native playback objects cross this boundary.
     bridge: HostBridge,
+    // Publish the complete local state before broadcasting its associated events.
     snapshots: watch::Sender<HostSnapshot>,
+    // Main-thread receiver for generation-tagged background results.
     updates: mpsc::Receiver<Update>,
+    // Cloned into background tasks; bounded capacity limits queued UI work.
     update_tx: mpsc::Sender<Update>,
+    // Explicit event-loop wake shared by queue ingress and background result producers.
     wake: Arc<dyn Fn() + Send + Sync>,
+    // Owning handle revokes all listener access when disabled or replaced.
     session: Option<Arc<RemoteSession>>,
+    // Cancelable enable operation, including trusted icon reads off the UI thread.
     host_job: Option<tokio::task::JoinHandle<()>>,
+    // Turns background listener termination into an idle-UI status update.
     host_monitor: Option<tokio::task::JoinHandle<()>>,
+    // Owns the remote socket; aborting it discards the old connection's pending work.
     client_job: Option<tokio::task::JoinHandle<()>>,
+    // Authentication in progress: this state has no ControllerBackend implementation.
     connecting: Option<TailscaleControllerBackend<Connecting>>,
+    // Only this ready typestate can admit remote commands from the UI.
     controller: Option<TailscaleControllerBackend<Connected>>,
+    // Invalidates results from an earlier host enable/disable operation.
     host_generation: u64,
+    // Invalidates results from an earlier remote connection attempt.
     client_generation: u64,
+    // Correlates each remote queue admission independently of user command IDs.
     ticket: u64,
+    // Bounded by ingress capacity; preserves each request's live guard and reply sender.
     pending: BTreeMap<u64, GuardedRequest>,
 }
 
@@ -434,20 +463,35 @@ impl NetworkState {
         let forwarded = update_tx.clone();
         let forward_wake = wake.clone();
         let remote_job = async_runtime.spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                request = emergency.recv() => {
-                    let Some(request) = request else { break; };
-                    // Admit already queued normal work before the stop so the shared
-                    // ingress epoch barrier supersedes it, rather than replaying later.
-                    while let Ok(normal) = remote.try_recv() { if !notify(&forwarded, &forward_wake, Update::Remote(normal)).await { return; } }
-                    if !notify(&forwarded, &forward_wake, Update::Remote(request)).await { break; }
+            loop {
+                tokio::select! {
+                    biased;
+                    request = emergency.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        // Preserve admission order so the canonical StopAll epoch
+                        // supersedes ordinary requests that were already queued.
+                        while let Ok(normal) = remote.try_recv() {
+                            if !notify(&forwarded, &forward_wake, Update::Remote(normal)).await {
+                                return;
+                            }
+                        }
+                        if !notify(&forwarded, &forward_wake, Update::Remote(request)).await {
+                            break;
+                        }
+                    }
+                    request = remote.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        if !notify(&forwarded, &forward_wake, Update::Remote(request)).await {
+                            break;
+                        }
+                    }
                 }
-                request = remote.recv() => { let Some(request) = request else { break; }; if !notify(&forwarded, &forward_wake, Update::Remote(request)).await { break; } }
             }
-        }
-    });
+        });
         NetworkState {
             address: config.address.clone().unwrap_or_default(),
             secret: String::new(),
@@ -775,15 +819,33 @@ async fn controller_connected(
             command = priority.recv() => command,
             command = normal.recv() => command,
             update = client.next_update() => {
-                match update.map_err(|error| error.to_string())? { ControllerUpdate::Event(_) => refresh = true, ControllerUpdate::Snapshot(snapshot) => { if !notify(updates, wake, Update::Snapshot(generation, snapshot)).await { break; } } }
+                match update.map_err(|error| error.to_string())? {
+                    ControllerUpdate::Event(_) => refresh = true,
+                    ControllerUpdate::Snapshot(snapshot) => {
+                        if !notify(updates, wake, Update::Snapshot(generation, snapshot)).await {
+                            break;
+                        }
+                    }
+                }
                 continue;
             }
             _ = tick.tick() => {
                 if refresh {
-                    let snapshot = client.refresh_snapshot().await.map_err(|error| error.to_string())?; refresh = false;
-                    if !notify(updates, wake, Update::Snapshot(generation, snapshot)).await { break; }
+                    let snapshot = client.refresh_snapshot().await.map_err(|error| error.to_string())?;
+                    refresh = false;
+                    if !notify(updates, wake, Update::Snapshot(generation, snapshot)).await {
+                        break;
+                    }
                 } else if let Some(clip) = icons.next() {
-                    match client.icon(&clip.clip_id).await { Ok(png) => { if !notify(updates, wake, Update::Icon(generation, clip.clip_id, png)).await { break; } }, Err(transport::ControllerError::UnknownIcon) => {}, Err(error) => return Err(error.to_string()) }
+                    match client.icon(&clip.clip_id).await {
+                        Ok(png) => {
+                            if !notify(updates, wake, Update::Icon(generation, clip.clip_id, png)).await {
+                                break;
+                            }
+                        }
+                        Err(transport::ControllerError::UnknownIcon) => {},
+                        Err(error) => return Err(error.to_string()),
+                    }
                 }
                 continue;
             }

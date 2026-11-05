@@ -37,19 +37,28 @@ use tokio_tungstenite::{
     },
 };
 
+// Includes unauthenticated upgrades, so stalled handshakes cannot exhaust task capacity.
 const MAX_CONNECTIONS: usize = 4;
+// Requests are small commands/identities; full media is never accepted on this channel.
 const MAX_INPUT: usize = 16 * 1024;
+// Leaves room for JSON-expanded bounded PNG bytes and authoritative snapshots.
 const MAX_OUTPUT: usize = 256 * 1024;
+// Each stage has its own deadline; an idle or backpressured peer cannot pin a task.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// Control frames count too, so ping traffic cannot bypass the authenticated rate limit.
 const REQUESTS_PER_SECOND: usize = 20;
+// Negotiate the version before accepting any application payload.
 const SUBPROTOCOL: &str = "durop.v1";
+
 /// Binding verification mode; only isolated tests may omit tailnet verification.
 enum BindingGuard {
+    // Recheck both OS assignment and Tailscale self identity throughout the session.
     Tailnet,
     #[cfg(any(test, feature = "test-support"))]
+    // Explicit default-off fixture support; production never chooses a fallback binding.
     Loopback,
 }
 
@@ -87,6 +96,7 @@ impl std::error::Error for TransportError {}
 
 /// Only the enable/pairing UI should read this value. Debug never prints credentials.
 pub struct SessionCredential(String);
+
 impl std::fmt::Debug for SessionCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SessionCredential([REDACTED])")
@@ -108,7 +118,8 @@ impl SessionCredential {
     }
 }
 
-/// Encode operating-system randomness without introducing a printable/loggable wrapper.
+/// Encode fresh operating-system randomness for the private credential constructor.
+/// The returned bytes are sensitive even though this temporary value is a String.
 fn random_hex<const N: usize>() -> Result<String, TransportError> {
     let mut bytes = [0; N];
     getrandom::fill(&mut bytes).map_err(|_| TransportError::Random)?;
@@ -124,6 +135,7 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
+    // Validate configuration before opening a socket or invoking the Tailscale CLI.
     fn validate(&self) -> Result<(), TransportError> {
         if self.address.port() == 0
             || !is_tailnet_ip(self.address.ip())
@@ -145,7 +157,9 @@ impl SessionConfig {
 /// is ever accepted from a controller, nor is the filesystem read by this adapter.
 #[derive(Clone)]
 pub struct RemoteCatalog {
+    // Already-projected public metadata; native catalog paths must not enter this value.
     metadata: Value,
+    // Immutable exact-ID allowlist; lookup never interprets a controller string as a path.
     icons: BTreeMap<String, Vec<u8>>,
 }
 
@@ -190,7 +204,9 @@ pub struct RemoteCommand {
     pub envelope: Envelope,
     /// One reply to the originating connection; closure also cancels pending admission.
     pub reply: oneshot::Sender<CommandOutcome>,
+    // Dropping the originating socket task invalidates requests already in the host queue.
     connection: Arc<AtomicBool>,
+    // Ending host permission invalidates every connection's pending requests together.
     session: Arc<AtomicBool>,
 }
 
@@ -226,8 +242,11 @@ pub struct RemoteSession {
     pub session_id: String,
     /// Fresh pairing credential; its Debug representation is redacted.
     pub credential: SessionCredential,
+    // Synchronous permission check shared with connections and application status views.
     active: Arc<AtomicBool>,
+    // Wakes tasks blocked on socket I/O when the owner explicitly ends access.
     revoke: watch::Sender<bool>,
+    // Owns the listener and joins/aborts all bounded connection tasks during shutdown.
     task: JoinHandle<()>,
 }
 
@@ -285,6 +304,8 @@ pub async fn enable_test_loopback(
     start(listener, vec![], bridge, catalog, BindingGuard::Loopback)
 }
 
+/// Attach lifecycle ownership to an already verified listener and fresh credential.
+/// The drop guard also revokes permission if the task is aborted before its first poll.
 fn start(
     listener: TcpListener,
     origins: Vec<String>,
@@ -319,13 +340,25 @@ fn start(
             tokio::select! {
                 biased;
                 _ = revoked.changed() => break,
-                _ = check.tick(), if matches!(guard, BindingGuard::Tailnet) => { if verify_tailnet_address(address.ip()).await.is_err() { break; } }
+                _ = check.tick(), if matches!(guard, BindingGuard::Tailnet) => {
+                    if verify_tailnet_address(address.ip()).await.is_err() {
+                        break;
+                    }
+                }
                 accepted = listener.accept() => {
-                    let Ok((tcp, _peer)) = accepted else { break; };
-                    let Ok(permit) = slots.clone().try_acquire_owned() else { drop(tcp); continue; };
+                    let Ok((tcp, _peer)) = accepted else {
+                        break;
+                    };
+                    let Ok(permit) = slots.clone().try_acquire_owned() else {
+                        drop(tcp);
+                        continue;
+                    };
                     let state = state.clone();
                     let revoked = revoked.clone();
-                    connections.spawn(async move { let _permit = permit; connection(tcp, state, revoked).await; });
+                    connections.spawn(async move {
+                        let _permit = permit;
+                        connection(tcp, state, revoked).await;
+                    });
                 }
                 Some(_) = connections.join_next(), if !connections.is_empty() => {}
             }
@@ -346,16 +379,23 @@ fn start(
 
 /// Immutable session policy shared by its bounded authenticated connection tasks.
 struct ConnectionState {
+    // Compared in constant time during upgrade; never included in responses or Debug output.
     expected_authorization: String,
+    // Exact browser origins, independent of tailnet membership and bearer permission.
     origins: Vec<String>,
+    // Shared session permission; revocation is checked again before command admission.
     active: Arc<AtomicBool>,
+    // Host-owned queues and authoritative publication, with no playback objects here.
     bridge: HostBridge,
+    // Pinned metadata/icons cannot change beneath an authenticated connection.
     catalog: RemoteCatalog,
+    // Binds this credential to one host recording identity.
     session_id: String,
 }
 
 /// Fail closed when a listener or connection task exits, including cancellation.
 struct ConnectionLifetime(Arc<AtomicBool>);
+
 impl Drop for ConnectionLifetime {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
@@ -364,8 +404,11 @@ impl Drop for ConnectionLifetime {
 
 /// One in-flight command reply; the socket remains readable during this wait.
 struct PendingReply {
+    // Echoed only to the same authenticated requester to correlate its outcome.
     command_id: String,
+    // Closing this receiver cancels admission via RemoteCommand::is_active.
     received: oneshot::Receiver<CommandOutcome>,
+    // Absolute deadline survives intervening socket messages and host events.
     deadline: tokio::time::Instant,
 }
 
@@ -373,9 +416,13 @@ struct PendingReply {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientMessage {
+    // Carries canonical policy data; the host still validates revision and clip identity.
     Command { envelope: Envelope },
+    // Reconnect/gap recovery always asks for complete authoritative state.
     Snapshot,
+    // Browsing stays on the authenticated socket rather than a second HTTP server.
     Catalog,
+    // Exact catalog key only, with no filesystem-path interpretation.
     Icon { clip_id: String },
 }
 
@@ -404,28 +451,35 @@ impl ClientMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage<'a> {
+    // Complete state replaces missing events; consumers use its sequence boundary.
     Snapshot {
         snapshot: &'a HostSnapshot,
     },
+    // Pre-sanitized metadata borrowed from the immutable session projection.
     Catalog {
         catalog: &'a Value,
     },
+    // Known PNG bytes only; compressed size and IHDR dimensions were checked at construction.
     Icon {
         clip_id: &'a str,
         png: &'a [u8],
     },
+    // Correlation is per authenticated connection, not inferred from playback events.
     Outcome {
         command_id: &'a str,
         outcome: CommandOutcome,
     },
+    // Sequenced host transitions do not imply physical presentation.
     Event {
         event: &'a HostEvent,
     },
+    // Fixed protocol codes avoid exposing internal paths or implementation errors.
     Error {
         code: &'a str,
     },
 }
 
+// Require path, bearer, origin, version, and live permission before accepting the upgrade.
 // tungstenite's public Callback signature fixes this response type.
 #[allow(clippy::result_large_err)]
 fn handshake(
@@ -482,6 +536,8 @@ fn handshake(
     Ok(response)
 }
 
+/// Keep one bounded socket readable while awaiting its single host reply.
+/// Revocation and EOF cancel queued work; previously accepted playback belongs to the host.
 async fn connection(
     tcp: TcpStream,
     state: Arc<ConnectionState>,
@@ -532,11 +588,22 @@ async fn connection(
             incoming = ws.next() => {
                 let Some(Ok(message)) = incoming else { break; };
                 idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
-                if rate_started.elapsed() >= Duration::from_secs(1) { rate_started = tokio::time::Instant::now(); requests = 0; }
+                if rate_started.elapsed() >= Duration::from_secs(1) {
+                    rate_started = tokio::time::Instant::now();
+                    requests = 0;
+                }
                 requests += 1;
                 if requests > REQUESTS_PER_SECOND || !state.active.load(Ordering::Acquire) { break; }
                 let Message::Text(text) = message else {
-                    match message { Message::Ping(bytes) => { if !matches!(timeout(IO_TIMEOUT, ws.send(Message::Pong(bytes))).await, Ok(Ok(()))) { break; } }, Message::Pong(_) => {}, _ => break }
+                    match message {
+                        Message::Ping(bytes) => {
+                            if !matches!(timeout(IO_TIMEOUT, ws.send(Message::Pong(bytes))).await, Ok(Ok(()))) {
+                                break;
+                            }
+                        }
+                        Message::Pong(_) => {},
+                        _ => break,
+                    }
                     continue;
                 };
                 let Some(request) = ClientMessage::parse(&text) else { break; };
@@ -554,12 +621,22 @@ async fn connection(
                             continue;
                         }
                         // StopAll cancels this connection's pending normal request, too.
-                        if emergency { pending = None; }
+                        if emergency {
+                            pending = None;
+                        }
                         let (reply, received) = oneshot::channel();
                         let command = RemoteCommand { envelope, reply, connection: live.clone(), session: state.active.clone() };
                         let queue = if emergency { &state.bridge.emergency } else { &state.bridge.commands };
-                        if queue.try_send(command).is_err() { send(&mut ws, &ServerMessage::Error { code: "busy" }).await }
-                        else { pending = Some(PendingReply { command_id, received, deadline: tokio::time::Instant::now() + COMMAND_TIMEOUT }); true }
+                        if queue.try_send(command).is_err() {
+                            send(&mut ws, &ServerMessage::Error { code: "busy" }).await
+                        } else {
+                            pending = Some(PendingReply {
+                                command_id,
+                                received,
+                                deadline: tokio::time::Instant::now() + COMMAND_TIMEOUT,
+                            });
+                            true
+                        }
                     }
                 };
                 if !response { break; }
@@ -569,7 +646,14 @@ async fn connection(
                 tokio::time::timeout_at(pending.deadline, &mut pending.received).await
             }, if pending.is_some() => {
                 let Some(pending) = pending.take() else { break; };
-                match outcome { Ok(Ok(outcome)) => { if !send(&mut ws, &ServerMessage::Outcome { command_id: &pending.command_id, outcome }).await { break; } }, _ => break }
+                match outcome {
+                    Ok(Ok(outcome)) => {
+                        if !send(&mut ws, &ServerMessage::Outcome { command_id: &pending.command_id, outcome }).await {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
             }
             event = events.recv() => {
                 let delivered = match event {
@@ -585,6 +669,7 @@ async fn connection(
     let _ = timeout(IO_TIMEOUT, ws.close(None)).await;
 }
 
+/// Bound serialization and backpressure independently of incoming request limits.
 async fn send(
     ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
     message: &ServerMessage<'_>,
@@ -601,6 +686,7 @@ async fn send(
     )
 }
 
+/// Check address-family eligibility only; local ownership needs the separate OS/CLI check.
 fn is_tailnet_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -611,6 +697,7 @@ fn is_tailnet_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Fail closed unless both the OS interface and running Tailscale self identity agree.
 async fn verify_tailnet_address(ip: IpAddr) -> Result<(), TransportError> {
     if !is_tailnet_ip(ip)
         || !if_addrs::get_if_addrs()
@@ -637,6 +724,7 @@ async fn verify_tailnet_address(ip: IpAddr) -> Result<(), TransportError> {
     Ok(())
 }
 
+/// Resolve an installed executable without invoking shell aliases or installation prompts.
 fn find_tailscale(search: &std::ffi::OsStr, fallbacks: &[PathBuf]) -> Option<PathBuf> {
     std::env::split_paths(search)
         .map(|directory| directory.join("tailscale"))
@@ -658,6 +746,7 @@ fn find_tailscale(search: &std::ffi::OsStr, fallbacks: &[PathBuf]) -> Option<Pat
         })
 }
 
+/// Use argument arrays and force the macOS app's CLI mode without opening its UI.
 fn tailscale_command(executable: &Path, arguments: &[&str]) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(executable);
     // The official macOS app executable doubles as its CLI. Finder's process
@@ -667,6 +756,8 @@ fn tailscale_command(executable: &Path, arguments: &[&str]) -> tokio::process::C
     command
 }
 
+/// Read at most 256 KiB within two seconds; cancellation kills the child process.
+/// Callers supply only read-only status, netcheck, or ping arguments.
 async fn tailscale_output(arguments: &[&str]) -> Result<Vec<u8>, TransportError> {
     use std::process::Stdio;
     let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
@@ -726,8 +817,10 @@ pub async fn diagnostics(peer: Option<IpAddr>) -> Result<Value, TransportError> 
 }
 
 mod client;
+
 #[cfg(test)]
 mod tests;
+
 pub use client::{ControllerClient, ControllerError, ControllerUpdate};
 
 #[cfg(all(test, unix))]

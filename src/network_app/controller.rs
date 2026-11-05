@@ -45,6 +45,7 @@ pub(crate) trait ControllerBackend {
 
 /// Native controller backed exclusively by the shared in-process host ingress.
 pub(crate) struct NativeControllerBackend {
+    // Shared host ingress owns validation, cancellation checks, deduplication, and stop epochs.
     sender: CommandSender,
 }
 
@@ -78,9 +79,13 @@ pub(crate) struct Disconnected;
 /// Typestate waiting for the transport's authenticated initial snapshot.
 /// It deliberately does not implement [`ControllerBackend`].
 pub(crate) struct Connecting {
+    // Bounded online lane, inaccessible through ControllerBackend until authentication.
     normal: mpsc::Sender<ControllerRequest>,
+    // Separate emergency lane prevents ordinary saturation from swallowing StopAll.
     priority: mpsc::Sender<ControllerRequest>,
+    // Fresh per-attempt prefix prevents command-ID reuse across explicit reconnects.
     namespace: String,
+    // Dropping either the pending or connected owner cancels every request from this attempt.
     live: Arc<AtomicBool>,
 }
 
@@ -94,15 +99,21 @@ impl Drop for Connecting {
 /// A subsequent socket failure is still a runtime condition, reported by admission
 /// or the transport actor; it never reconnects or replays requests automatically.
 pub(crate) struct Connected {
+    // Retains the original attempt's channels and drop-revoked permission lease.
     channels: Connecting,
+    // Authenticated host identity; an old-session envelope cannot enter these channels.
     session_id: String,
+    // Pinned host catalog revision used when constructing new UI commands.
     catalog_revision: String,
+    // IDs are consumed even on busy admission, and are never retried automatically.
     next_command: u64,
+    // Advances only when StopAll is admitted; the actor suppresses earlier queued work.
     epoch: u64,
 }
 
 /// Tailscale controller whose API follows its connection lifecycle at compile time.
 pub(crate) struct TailscaleControllerBackend<State> {
+    // Only Connected implements admission; the other states carry no callable send API.
     state: State,
 }
 
@@ -113,6 +124,7 @@ pub(super) struct ControllerRequest {
     pub(super) envelope: Envelope,
     /// Earlier normal requests are superseded by an accepted later StopAll.
     pub(super) epoch: u64,
+    // Checked again by the socket actor so dropping a backend revokes already queued work.
     live: Arc<AtomicBool>,
 }
 
@@ -283,7 +295,9 @@ mod tests {
 
     /// A test backend exercises the same admission contract without network I/O.
     struct FakeBackend {
+        // Remaining ordinary admissions before reporting backpressure.
         normal: usize,
+        // Independent emergency budget must survive ordinary saturation.
         priority: usize,
     }
 

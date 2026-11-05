@@ -54,23 +54,29 @@ pub enum ControllerUpdate {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Packet {
+    // Replaces local state only after identity and sequence invariants pass.
     Snapshot {
         snapshot: HostSnapshot,
     },
+    // The application validates its bounded metadata projection before displaying it.
     Catalog {
         catalog: Value,
     },
+    // Both ID correlation and the shared PNG bounds are checked before returning bytes.
     Icon {
         clip_id: String,
         png: Vec<u8>,
     },
+    // A command ID must match the single outstanding request on this socket.
     Outcome {
         command_id: String,
         outcome: CommandOutcome,
     },
+    // Gaps/overflow invalidate buffered history and force snapshot recovery.
     Event {
         event: HostEvent,
     },
+    // Only the documented fixed codes remain recoverable without destroying the socket.
     Error {
         code: String,
     },
@@ -78,6 +84,7 @@ enum Packet {
 
 /// Correlate one outstanding request while allowing intervening snapshots/events.
 enum Expected {
+    // No ID is needed for browse/state requests because the client sends them serially.
     Snapshot,
     Catalog,
     Icon(String),
@@ -85,6 +92,7 @@ enum Expected {
 }
 
 impl Expected {
+    // State/event packets may arrive between request and reply; IDs must still match.
     fn matches(&self, packet: &Packet) -> bool {
         match (self, packet) {
             (Self::Snapshot, Packet::Snapshot { .. }) | (Self::Catalog, Packet::Catalog { .. }) => {
@@ -101,14 +109,23 @@ impl Expected {
 /// on its current connection. Failure destroys that connection, including pending work.
 /// There is no automatic reconnection; Connect always obtains a new host snapshot.
 pub struct ControllerClient {
+    // Taken on failure or disconnect; there is no reconnect handle or offline send buffer.
     socket: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    // Last complete state, whose session/revision cannot change on this connection.
     snapshot: HostSnapshot,
+    // Highest observed sequence, including a gap that the next snapshot must cover.
     sequence: u64,
+    // At most 64 contiguous events awaiting the application consumer.
     events: VecDeque<HostEvent>,
+    // A gap or overflow invalidates buffered history until a full snapshot arrives.
     needs_snapshot: bool,
+    // Next scheduled ping; unrelated incoming events do not postpone it.
     heartbeat: tokio::time::Instant,
+    // Expected Pong payload and its fixed deadline; arbitrary Pong frames do not renew it.
     pending_ping: Option<(Vec<u8>, tokio::time::Instant)>,
+    // Distinguishes heartbeat payloads without storing identifying application data.
     ping_counter: u64,
+    // Application-owned, nonblocking timing sink; keeps this crate independent of logging.
     acknowledgment_observer: Option<Arc<dyn Fn(Duration) + Send + Sync>>,
 }
 
