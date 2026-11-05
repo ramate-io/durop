@@ -89,8 +89,11 @@ a muted decode probe establishes neither.
 Record the flash/beep video fixture and inspect the saved result to measure A/V
 synchronization. Include transparent GIF/alpha video over a safe desktop,
 restart, bounded loop, StopAll, automatic clearing and an unfocused trigger.
-The generated orientation fixture must be asymmetric before claiming row
-orientation correctness. Avoid sharing private windows, pairing secrets or
+The optional `Resources/sample-packs/media-proof` pack includes an asymmetric
+orientation clip: green-dominant tall top-left marker, blue-dominant wide
+bottom-right marker and partially transparent outer edges. Record that clip to
+establish visible orientation/fringe quality; CPU readback alone does not prove
+Bevy's displayed orientation. Avoid sharing private windows, pairing secrets or
 unrelated account/device details.
 
 The user will perform the two-Mac acceptance: installed package without the
