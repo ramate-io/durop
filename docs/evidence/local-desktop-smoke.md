@@ -41,9 +41,10 @@ are pending in PR 20.
   game frame-rate evidence.
 - Cmd+A and Ctrl+A in the search field appended `a` instead of selecting the
   field contents in this GUI run, despite the earlier unit fix in `1c843f0`.
-  Investigation found the observed event path delivered winit `ModifiersChanged`
-  flags without physical key events; a fix is pending in PR 20. The fix needs a
-  new native GUI retest.
+  A source-based hypothesis is that winit can deliver a flags-only
+  `ModifiersChanged` event without physical keyboard input; raw events were not
+  captured during this run. A raw-event fix is underway in PR 20 and needs a new
+  native GUI retest.
 - Repeated StopAll pointer attempts and Escape attempts during the active GIF did
   not produce an observed `Stopped` state. `Finished` appeared after the GIF's
   timer elapsed; that does not prove StopAll or Escape succeeded. CUA/native
@@ -51,9 +52,9 @@ are pending in PR 20.
   tests pass, but they do not establish GUI StopAll behavior.
 - A UI Quit attempt changed the PID observed by a subsequent accessibility
   query, which relaunched the app. Clean UI quit was therefore not verified. The
-  task-owned earlier smoke process (PID 99492) was terminated by the root agent;
-  the current native package app may still be open. Its bounded GIF had no audio
-  and ended.
+  task-owned earlier smoke process (PID 99492) and native package process (PID
+  2419) were terminated by the root agent. Those process cleanups were not UI
+  Quit acceptance. The bounded GIF had no audio and ended.
 - The recording contains private background windows. Keep the recording and
   extracted frames local; do not copy or upload them.
 
