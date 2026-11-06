@@ -151,3 +151,5 @@ This records build, loader, signature and resource evidence. It does not claim
 Finder/GPU/audio playback, the oldest declared OS, a development-free second Mac,
 Gatekeeper acceptance, or live Tailscale connectivity. Final artifact hashes and
 source revision are supplied in each output's BUILD-INFO/VALIDATION/checksum files.
+
+CI uses the supported `macos-15` arm64 runner; GitHub [retired macOS 14 runners](https://github.blog/changelog/2026-10-01-github-actions-macos-14-runner-image-retirement/) on November 2, 2026. The app deployment floor remains macOS 14, validated from Mach-O load commands. Building on macOS 15 does not substitute for runtime acceptance on macOS 14.
