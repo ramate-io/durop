@@ -8,6 +8,14 @@ curated collection of reusable classics and reaction cues; no popularity ranking
 is implied. The MP4 excerpts are silent because their original sources are silent.
 The DOE nuclear-test clips depict an actual nuclear flash/cloud.
 
+All six MP4s have one H.264 video stream and **zero audio streams**, verified by
+stream inspection. For audible cues, select one of the twelve sound entries.
+Durop's production AVFoundation path also plays audio embedded in videos, using
+the same player and clock as the video; this pack's silent excerpts cannot test
+that capability. The separate `fixtures/media/flash-beep.mp4` contains an actual
+AAC soundtrack for A/V acceptance. Native command-line probes are intentionally
+muted and do not establish speaker output.
+
 Each item has a distinct title, tags, real media and an adjacent thumbnail.
 Visual excerpts from the same source occupy separate nonoverlapping intervals.
 Very short original animations repeat within their bounded playback duration.

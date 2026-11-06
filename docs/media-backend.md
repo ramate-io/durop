@@ -42,6 +42,21 @@ errors; physical output-device loss and default-device changes remain untested.
 A maximum duration of ten minutes bounds a session, including loops. Loop seeks
 wait for the native position to return to zero before resuming.
 
+Production preparation passes `volume: 1.0` from `src/app.rs`; the native owner
+applies that value with `AVPlayer::setVolume` before starting the same player.
+The command-line `--media-probe` deliberately passes `volume: 0.0`. Extracting
+video frames does not require a separate audio player or Bevy audio component.
+
+The six MP4s in `sample-packs/reactions/videos` contain one H.264 video stream
+and **no audio stream**. Their silent source excerpts cannot demonstrate video
+soundtrack playback. For an actual combined A/V input, `fixtures/media/flash-beep.mp4`
+contains H.264 video and AAC mono audio at 44.1 kHz. Its soundtrack decoded to
+nonzero samples in the November 5, 2026 check (mean −26.3 dB, peak −11.7 dB).
+The muted native probe prepared, advanced and completed that combined asset;
+audible hardware output and recorded A/V synchronization still require separate
+acceptance. Launch with `--pack fixtures/media` to select the flash/beep video
+in the application when performing that check.
+
 Immutable CIImage values (explicitly Send/Sync in the binding) retain due native
 pixel buffers and cross a latest-only slot to the worker. Core Image renders
 explicit sRGB RGBA8 into one of at most three reusable CPU buffers. The worker
