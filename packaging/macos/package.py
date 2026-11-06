@@ -96,6 +96,7 @@ def main():
         shutil.copy2(binary, executable)
         shutil.copytree(ROOT / "assets", resources / "assets")
         shutil.copytree(ROOT / "sample-packs/podcast-pack", resources / "sample-packs/podcast-pack")
+        shutil.copytree(ROOT / "sample-packs/reactions", resources / "sample-packs/reactions")
         if (ROOT / "fixtures/media").is_dir():
             shutil.copytree(ROOT / "fixtures/media", resources / "sample-packs/media-proof")
         # ICNS ic08 stores the existing 256px PNG verbatim. Native iconutil

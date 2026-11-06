@@ -1,0 +1,15 @@
+{
+  "id": "godspeed",
+  "title": "Godspeed, John Glenn",
+  "asset": "godspeed.mp3",
+  "tags": [
+    "godspeed",
+    "good luck",
+    "mercury"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 2500
+  }
+}

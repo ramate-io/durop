@@ -82,6 +82,8 @@ pub enum Control {
     Displays,
     /// Select a display by its current index.
     Display(usize),
+    /// Restore automatic selection of the current primary display.
+    PrimaryDisplay,
     /// Request proof-mode exit.
     Quit,
     /// Record loss of the stdin control path.
@@ -332,6 +334,7 @@ pub(crate) fn apply_controls(
                     eprintln!("Display index {index} unavailable; use displays.");
                 }
             }
+            Control::PrimaryDisplay => state.target = None,
             Control::NextDisplay => {
                 if !displays.is_empty() {
                     let next = displays

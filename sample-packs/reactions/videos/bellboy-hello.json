@@ -1,0 +1,21 @@
+{
+  "id": "bellboy-hello",
+  "title": "Keaton: hello there",
+  "asset": "bellboy-hello.mp4",
+  "tags": [
+    "keaton",
+    "hello",
+    "hat tip",
+    "bell boy"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 3800
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}

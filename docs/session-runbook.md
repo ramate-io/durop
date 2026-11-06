@@ -8,14 +8,14 @@ desktop; do not infer fullscreen-game support from desktop compositing.
 
 ## Local playback
 
-1. Launch Durop. The default bundled podcast pack provides audio, transparent
-   GIF, video-with-audio and alpha-video fixtures. Select **This Mac** and ensure
-   the local host is running.
+1. Launch Durop. The bundled reaction catalog provides GIFs, sound bites and
+   video clips. Select **Host → Native**, choose a display and **Apply** to
+   start local playback authority.
 2. Search titles/tags/categories, then click a clip. Its state/readiness and any
-   individual failure appear in the panel. Choose the target with **Display >**.
+   individual failure appear in the panel. Change displays in the Native modal.
    Folder names supply initial categories; identity is independent of folder moves.
-3. Use per-instance Stop or **STOP ALL**. Escape stops all when focus is outside
-   a text field; while editing, Escape first exits the field. Do not rely on a
+3. Use per-instance Stop or **STOP ALL**. Escape first cancels an open modal or
+   closes a menu, then exits a focused field, and otherwise stops all. Do not rely on a
    global keyboard hook.
 4. Hide or close the panel only when its reopen path is available. The same
    process continues hosting; reopen from the Dock or attached terminal `panel`.
@@ -23,19 +23,26 @@ desktop; do not infer fullscreen-game support from desktop compositing.
    is required to keep hosting or reopen the panel. If no reopen path exists,
    the panel stays available.
 
-To select a local pack, edit **Pack** and press **Load / refresh**. Use an absolute
+To select a local pack, choose **Catalog → Local directory**, enter its path and
+press **Apply**. Use an absolute
 path when launching from Finder. Directory packs are copied into the user cache,
 validated and pinned; stopping/reloading starts a new catalog session rather
 than mutating a live pin. A failed preparation retains the previous cached
 snapshot. Current UI reload stops the session before attempting a replacement.
 
-For Git packs, the field accepts `https://HOST/ORG/PACK.git#REF` or explicitly
-selected `git+file:///absolute/repository#REF`. Existing Git/helper setup is
+For Git packs, choose **Catalog → Git repository** and provide the HTTPS URL,
+literal ref and optional pack folder. The Durop example uses
+`https://github.com/ramate-io/durop.git`, `main`, and `sample-packs/reactions`.
+Launch arguments also accept `--pack https://HOST/ORG/PACK.git#REF:PACK/FOLDER`
+or explicitly selected `git+file:///absolute/repository#REF`. Existing Git/helper setup is
 required for refresh; local/cached playback is independent of Git. Supply a
 branch, tag or exact commit, not revision expressions. No URL credentials or
 remote Git LFS materialization are supported. See [pack format](packs.md).
 
 ## Host and remote controller
+
+Start with the [Tailnet quickstart](tailnet-quickstart.md) for the Tailscale admin
+console, CDK Terrain policy setup and the complete Durop pairing flow.
 
 Install and authorize Tailscale separately on both Macs. Durop uses its CLI for bounded read-only verification and discovers the
 standard installed macOS app executable even from Finder. Follow [the Tailscale runbook](https://github.com/ramate-io/durop/blob/main/infra/cdktn/tailscale/README.md),
@@ -44,15 +51,16 @@ and narrow ACL policy. Durop does not enroll machines or apply tailnet policy.
 Do not expose the listener on a wildcard/LAN interface or through public
 forwarding.
 
-On the playback Mac, select **This Mac**, load the intended pack and start its
-local host. Enter that Mac's explicit Tailscale IP and port (for example
-`100.x.y.z:48732`) in **Tailnet address**, then choose **Enable remote host**.
+On the playback Mac, select **Host → Native**, load the intended pack and start its
+local host. Open **Share this Mac…** in the Native modal, enter that Mac's explicit
+Tailscale IP and port (for example `100.x.y.z:48732`), then **Apply**.
 The listener verifies that the address belongs to the authenticated local
 Tailscale node. The private pairing secret is displayed for this session; share
 it privately with the intended controller and keep it out of recordings/logs.
 
-On the controller Mac, choose **Remote host**, enter the host's address and the
-pairing secret, then **Connect**. The secret field is masked and cleared after
+On the controller Mac, choose **Host → Tailscale**, enter the host's address and the
+Durop pairing token, then **Apply**. This is the host-generated session credential,
+not a Tailscale API or enrollment key. The secret field is masked and cleared after
 submission. Remote catalog metadata and icons are supplied by the host; media
 stays on the host. Commands target that host's current session/revision and
 receive acknowledgements/state updates. A stale catalog/session is rejected.
@@ -65,8 +73,8 @@ Optional launch configuration, with the app closed first:
 /Applications/Durop.app/Contents/MacOS/durop --mode controller --connect ws://100.x.y.z:48732/control
 ```
 
-The controller launch only prefills the destination; enter its secret in the UI
-and Connect explicitly. Controller mode starts without a local pack. Host mode
+The controller launch only prefills the destination; open **Host → Tailscale**,
+enter its secret and choose **Apply** explicitly. Controller mode starts without a local pack. Host mode
 uses the same app/window with playback authority; hiding its panel does not
 terminate the process. Pairing material is never placed in command arguments.
 

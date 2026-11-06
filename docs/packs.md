@@ -37,7 +37,8 @@ an independently authored, redistributable example with asset provenance.
 
 The application calls `CatalogCache::prepare` on a worker with an explicitly
 selected `PackSource`: a local directory, a local Git repository/ref, or HTTPS
-repository/ref. No panel or transport integration is included yet. `refresh`
+repository/ref, optionally selecting a pack subdirectory. The controller's
+**Catalog** menu configures these sources. `refresh`
 prepares and validates first, then changes the active `Arc<Catalog>` in one
 assignment. `pin` retains the old revision and its asset paths for a live session.
 Preparation alone makes an update available without changing the active session.
@@ -56,6 +57,14 @@ fragments or escaped bytes. Existing Git credential helpers may service HTTPS
 requests; manifests and errors never persist supplied tokens or Git stderr.
 References must be literal branch/tag names or commit IDs, without revision
 expressions. Errors omit remote diagnostics to avoid credential disclosure.
+
+For a pack nested in a repository, use `GitCatalogSource::in_directory` or
+the controller's **Git repository → Pack folder** field. The launch syntax is
+`--pack https://github.com/ramate-io/durop.git#main:sample-packs/reactions`.
+Only the selected subtree is exported; the immutable revision still identifies
+the full commit. Relative paths cannot contain empty, dot, parent, or `.git`
+components. Cache identities include the selected directory, so two packs in
+one commit cannot collide.
 
 Cache directory keys are SHA-256 over length-delimited source identity, immutable
 revision and `catalog-v1` derived-format version. Local directory revisions are

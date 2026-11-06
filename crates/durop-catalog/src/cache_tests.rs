@@ -101,6 +101,81 @@ fn concrete_sources_share_the_object_safe_cache_contract() {
     }
 }
 
+#[test]
+fn git_subdirectories_isolate_pack_contents_and_cache_identity() {
+    let repo = repository();
+    for directory in ["packs/first", "packs/second"] {
+        let target = repo.0.join(directory);
+        fs::create_dir_all(target.join("reactions")).unwrap();
+        fs::copy(repo.0.join("durop.json"), target.join("durop.json")).unwrap();
+        for entry in fs::read_dir(repo.0.join("reactions")).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(
+                entry.path(),
+                target.join("reactions").join(entry.file_name()),
+            )
+            .unwrap();
+        }
+    }
+    fs::write(repo.0.join("unrelated.txt"), "not part of either pack").unwrap();
+    commit(&repo.0);
+    let storage = Temp::new();
+    let mut cache = CatalogCache::new(storage.0.clone()).unwrap();
+    let first = cache
+        .refresh(
+            &GitCatalogSource::local(&repo.0, "HEAD")
+                .in_directory("packs/first")
+                .unwrap(),
+        )
+        .unwrap();
+    let second = cache
+        .prepare(
+            &GitCatalogSource::local(&repo.0, "HEAD")
+                .in_directory("packs/second")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(first.revision, second.revision);
+    assert_ne!(first.root, second.root);
+    assert_eq!(first.clips[0].identity, "sample/chime");
+    assert!(!first.root.join("unrelated.txt").exists());
+    assert!(!first.root.join("packs").exists());
+    let missing = GitCatalogSource::local(&repo.0, "HEAD")
+        .in_directory("packs/missing")
+        .unwrap();
+    assert!(cache.refresh(&missing).is_err());
+    assert!(Arc::ptr_eq(&first, &cache.pin().unwrap()));
+}
+
+#[test]
+fn git_subdirectory_rejects_ambiguous_or_escaping_paths() {
+    for directory in [
+        "",
+        "/absolute",
+        "../outside",
+        "pack/../other",
+        "./pack",
+        "pack//child",
+        "pack/",
+        ".git/objects",
+        "pack/.git",
+        "pack\\child",
+        "C:pack",
+    ] {
+        assert!(
+            GitCatalogSource::local("unused", "HEAD")
+                .in_directory(directory)
+                .is_err(),
+            "{directory}"
+        );
+    }
+    assert!(
+        GitCatalogSource::local("unused", "HEAD")
+            .in_directory("sample-packs/reactions")
+            .is_ok()
+    );
+}
+
 // Commit a local authored fixture so export tests need no network access.
 fn repository() -> Temp {
     let t = fixture();

@@ -1,31 +1,106 @@
-# Local panel and application modes
+# Controller and application modes
 
-Run `durop` for the local panel and overlay in one process. The bundled `sample-packs/podcast-pack` includes generated WAV, MP4, alpha HEVC and GIF examples. Click a tile to submit Play; acceptance, preparation and actual Started state are distinct. Individual Stop buttons and STOP ALL control the same authoritative host as remote controllers. No preview is substituted for a selected remote destination.
+Run `cargo run -p durop --bin durop --locked` inside `nix develop`. The controller
+and overlay share one process. The default [reaction catalog](../sample-packs/reactions)
+contains 31 offline GIFs, sounds and videos with attribution and redistribution terms.
 
-The grid renders twelve tiles at a time. Mouse-wheel scrolling and Previous/Next change the visible rows. Search matches all words across title, tags and category, without decoding thumbnail video. PNG thumbnail input is bounded before decode (one MiB, 512×512); both successful and failed thumbnail loads share a bounded 128-entry cache. Remote icons also satisfy transport's stricter 32 KiB limit.
+## Collection and configuration
 
-Click the search or pack field to edit. Text entry supports Unicode characters, IME preedit/commit, arrow navigation, Home/End, Backspace and Ctrl/Cmd+A replacement. Composition remains separate from committed search text. Enter or Escape ends editing; Escape outside an editor stops playback. Space outside an editor plays the first visible local tile. Search typing never invokes playback shortcuts. The default font can show missing glyphs for scripts outside its coverage; editing/search retain the Unicode text. Broader font coverage remains a visible limitation. On macOS Cmd/Ctrl+V pastes at the focused editor; pairing input remains masked and is cleared after Connect.
+The top row contains **Host**, **Catalog** and search. At compact widths, search
+moves below the two selectors. Cards show real PNG previews, titles, media kinds
+and playback controls; the responsive grid renders only visible rows plus a partial
+row. Wheel/trackpad scrolling and the draggable scrollbar reach the whole collection.
+The collection uses Bevy UI’s `ScrollPosition` and vertical scroll overflow.
+Trackpad movement updates a continuous logical-pixel offset, including fractional
+deltas and OS-provided momentum; there are no row thresholds or snapping. Mouse
+wheel lines convert to pixels, and the scrollbar follows the same continuous offset.
+Search matches every word across title, tags and category. Thumbnails are bounded
+before decode (one MiB, 512×512), with a bounded 128-entry cache including failures.
+Remote icons additionally satisfy the transport's 32 KiB limit.
 
-Enter a pack directory and select Load / refresh. HTTPS Git packs use `https://HOST/REPOSITORY.git#REF`; local Git packs use `git+file://ABSOLUTE/PATH#REF`. Refresh stops the current host and revokes remote access before preparing a new immutable catalog. A failed load leaves an actionable error and the host disabled; it does not replace the current pinned catalog with partial content. Reloading starts a new host session. Decoder failures appear next to their affected tile.
+**Host → Native** selects the primary or an enumerated display. **Host → Tailscale**
+accepts the remote host's explicit Tailscale IP:port and Durop pairing token. This
+is a Durop session credential, not a Tailscale API or enrollment key. Input is masked
+and cleared after submission; credentials never enter preferences, URLs or command
+arguments. **Share this Mac…** in Native settings configures a local listener;
+the runtime verifies the address and generates its own credential. **Revoke remote**
+closes that access. Keep the displayed host credential out of recordings/screenshots.
+Durop does not enroll machines or alter tailnet policy.
 
-Select This Mac or Remote host intentionally. Remote mode displays the remote catalog and authoritative snapshot after Connect; disconnected commands fail without a local fallback or offline replay. Type the Tailscale address and session pairing credential, then Connect. The secret is masked in its input field and cleared when submitted. It is never stored in preferences or put in a URL/process argument. Enable remote host explicitly to create the listener and a fresh pairing credential; Revoke remote immediately closes that access. The displayed host pairing secret is private: exclude it from recordings/screenshots intended for sharing.
+**Catalog** offers the bundled pack, an absolute local directory, or an HTTPS Git
+repository with a literal ref and optional pack folder. The repository example is
+`https://github.com/ramate-io/durop.git`, ref `main`, folder `sample-packs/reactions`.
+Refresh stops playback and revokes remote access before preparing an immutable
+catalog. Failure retains the previous pin, leaves hosting disabled and shows an
+error; successful replacement begins a new session. See [pack sources](packs.md).
 
-Examples:
+Each modal edits a draft. **Apply** validates before emitting an action; **Cancel**,
+close, backdrop or Escape discard edits. The form body scrolls in short windows
+while its heading and action footer remain visible. Background playback controls
+are blocked while configuring, but **STOP ALL** remains available. Controller-only
+launches reject local host/catalog Apply with an explanation because their catalog
+belongs to the remote host.
+
+Click a card to submit Play. Acceptance, preparation and actual Started state remain
+distinct. A card's Stop button targets its latest active occurrence; **STOP ALL**
+stops every occurrence. Remote mode displays the remote catalog and authoritative
+snapshot; disconnected commands have no local fallback or offline replay.
+
+Text entry supports Unicode/IME composition, arrows, Home/End, Backspace and
+Ctrl/Cmd+A replacement. Cmd/Ctrl+V pastes on macOS. Escape closes a modal/menu first,
+then leaves a focused editor, and otherwise stops playback. Space outside editing
+plays the first visible local tile. Bundled fonts have limited script coverage;
+missing glyphs do not discard the underlying search text.
+
+## Launch and persistence
 
 ```sh
-durop --mode local --pack ./sample-packs/podcast-pack --display 0
-durop --mode host --pack ./sample-packs/podcast-pack --listen-tailscale 100.64.0.10:48732
+durop --mode local --pack ./sample-packs/reactions --display 0
+durop --mode host --pack ./sample-packs/reactions --listen-tailscale 100.64.0.10:48732
 durop --mode controller --connect ws://100.64.0.10:48732/control
 durop --self-check
-durop --version
 ```
 
-Host mode starts with its primary panel hidden and does not take input. Controller mode needs no local pack and cannot start a local host. The display button cycles the selected display; the selection is remembered locally. Native fullscreen Spaces did not show the overlay on the qualification Mac, so use a normal desktop/windowed or borderless application. Display and system-audio capture are separate recording-software setup steps.
+Host mode starts with its panel hidden. Controller mode needs no local pack and
+cannot start a local host. Native fullscreen Spaces remain unsupported on the
+qualification Mac; use a normal desktop/windowed or borderless application.
 
-Hide/close preserves a deliberately enabled host. On macOS an explicit Dock reopen shows the existing panel, including in host mode, without a second process. Terminal commands `panel`, `hide`, `stop`, `play PACK/CLIP`, `displays`, `display N` and `quit` provide a second control path without global keyboard interception. If neither a native reopen hook nor terminal control is available, the panel stays available for stopping. Quit issues StopAll and waits for media-resource teardown acknowledgements before exiting.
+Dock reopen and terminal `panel`, `hide`, `stop`, `play PACK/CLIP`, `displays`,
+`display N` and `quit` provide controls without global keyboard interception. If
+neither Dock reopen nor terminal control is available, the panel stays available.
+Quit requests StopAll and waits for media-resource teardown.
 
-On macOS benign preferences live at `~/Library/Application Support/io.ramate.durop/preferences.json` and immutable pack snapshots at `~/Library/Caches/io.ramate.durop/packs`. Other platforms use `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` with `.config`/`.cache` fallbacks and the `io.ramate.durop` subdirectory. Preferences contain only pack source, query and display, use a bounded atomic JSON write, and never restore remote access or a remote destination. The bundled default pack is stored as a logical reference and resolved against the current app's Resources after relocation or upgrade; legacy absolute bundle-default paths migrate automatically. Explicit external pack paths remain unchanged. Bad preferences do not prevent the panel from starting. Shared pack metadata remains unchanged.
+Benign macOS preferences live at
+`~/Library/Application Support/io.ramate.durop/preferences.json`; immutable pack
+snapshots use `~/Library/Caches/io.ramate.durop/packs`. Other platforms use
+`XDG_CONFIG_HOME`/`XDG_CACHE_HOME` with `.config`/`.cache` fallbacks. Preferences
+contain only pack source, query and display. They never restore remote access or
+a remote destination. Bundled pack tokens follow app relocation; legacy bundle
+paths migrate automatically. Explicit external paths remain unchanged.
 
-The executable resolves `Contents/Resources/assets` and `Contents/Resources/sample-packs/podcast-pack` in a macOS bundle, independent of working directory. Development runs use the checkout resources. `--self-check` validates the bundled catalog, media and icons without launching a window, networking or audio.
+Bundles resolve assets and sample packs under `Contents/Resources`, independently
+of the working directory; development uses checkout resources. `--self-check`
+validates the bundled catalog without opening windows, networking or audio.
 
-Automated checks cover real KeyboardInput/IME messages, Unicode editing, the twelve-tile viewport over 10,000 entries, thumbnail bounds, preference corruption and the host/media/transport contracts. Native UI, actual playback composition and recorded audio synchronization still require desktop acceptance; unit tests do not establish recording correctness. Two-Mac acceptance is performed by the operator.
+## Design and verification
+
+The warm paper/ink palette and display typography are inspired by
+[Symbolic Software](https://symbolic.software/). Expletus Sans and IBM Plex Mono
+are bundled with their [OFL notices](../assets/fonts/README.md); no proprietary
+Berkeley Mono font or Symbolic artwork is copied.
+
+Tests cover real keyboard/IME and wheel messages, draft validation/cancellation,
+modal input isolation, controller-only routing, a 10,000-item virtualized catalog,
+thumbnail bounds and preference migration. The redesign was also inspected in a
+native development preview: grid, popup stacking, long titles, masked validation,
+cancel, catalog loading, scrollbar reachability and active card controls. A 720×520
+preview verified compact cards and form scrolling with persistent Apply/Cancel.
+The continuous-scroll revision was checked in the native preview: small gestures
+moved cards by 34px then 4px, crossing a virtual-row boundary retained the partial
+row offset, and the final row and filtered empty state remained reachable. Track
+clicks worked; automated native thumb dragging was inconclusive, while fractional
+dragging and grab-point preservation pass system tests.
+The window has a 400×520 minimum; desktop defaults remain 1160×820. Native
+muted probes completed for GIF, MP3 and MP4; all 31 assets passed full FFmpeg decode.
+These checks do not establish audible output, recorded A/V sync, fullscreen or
+two-Mac acceptance; those remain in the [operator acceptance](acceptance.md).

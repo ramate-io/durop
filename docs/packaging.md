@@ -50,6 +50,7 @@ Contents/
   Resources/
     Durop.icns
     assets/
+    sample-packs/reactions/
     sample-packs/podcast-pack/
     sample-packs/media-proof/
     notices/
@@ -60,6 +61,10 @@ The icon repackages Durop's independently authored overlay PNG. Version comes
 from Cargo.toml; the build record stores the exact source revision, compiler
 channel, SDK and minimum OS. Identity is `io.ramate.durop`. Build artifacts must
 not contain secrets or private configuration.
+
+The default reactions catalog is copied with its provenance and license records.
+The bundled Expletus Sans and IBM Plex Mono fonts retain their OFL texts under
+`assets/fonts/`; media and fonts do not inherit the application's MIT license.
 
 The recursive validator enumerates every Mach-O, including unreferenced plugins
 and nested libraries. It checks arm64 architecture, deployment versions,
@@ -146,3 +151,5 @@ This records build, loader, signature and resource evidence. It does not claim
 Finder/GPU/audio playback, the oldest declared OS, a development-free second Mac,
 Gatekeeper acceptance, or live Tailscale connectivity. Final artifact hashes and
 source revision are supplied in each output's BUILD-INFO/VALIDATION/checksum files.
+
+CI uses the supported `macos-15` arm64 runner; GitHub [retired macOS 14 runners](https://github.blog/changelog/2026-10-01-github-actions-macos-14-runner-image-retirement/) on November 2, 2026. The app deployment floor remains macOS 14, validated from Mach-O load commands. Building on macOS 15 does not substitute for runtime acceptance on macOS 14.

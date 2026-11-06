@@ -1,0 +1,21 @@
+{
+  "id": "mic-drop",
+  "title": "Obama: mic drop",
+  "asset": "mic-drop.gif",
+  "tags": [
+    "mic drop",
+    "done",
+    "obama",
+    "victory"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 3870
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}

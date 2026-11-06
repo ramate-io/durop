@@ -2,6 +2,8 @@
 
 Python CDK Terrain is the authoritative deployment source. It manages the complete policy of an **existing** tailnet, plus MagicDNS only when `magic_dns` is explicitly configured. OpenTofu owns state and deployment. No cloud playback server is created.
 
+For the end-to-end operator flow through the Tailscale admin console, device enrollment, reviewed deployment and Durop's Native/Tailscale UI, start with the [Tailnet quickstart](../../../docs/tailnet-quickstart.md). This document is the detailed policy/state/rollback reference.
+
 ## Toolchain and offline checks
 
 From the repository root, `nix develop .#infrastructure` enters a smaller shell; the default shell includes the same tools. The existing `flake.lock` pins Python **3.12.13**, Node **24.15.0**, uv **0.11.16**, and OpenTofu **1.11.8**. `uv.lock` pins CDK Terrain **0.25.0**, constructs **10.6.0**, and transitive Python dependencies. `package-lock.json` pins genuine `cdktn-cli` **0.25.0** and its dependencies; its Node requirement is >=22.23.4. The official provider is **tailscale/tailscale 0.29.2**, with signed checksums for Linux x86_64 and Apple Silicon. No archived CDKTF package is used.
@@ -36,7 +38,7 @@ Leave `magic_dns` absent unless this stack has explicitly taken ownership. Setti
 
 ## Credentials and persistent state
 
-An administrator creates a dedicated OAuth trust credential separately. For policy reads/validation use `policy_file:read`; for modification use `policy_file`. Current Tailscale scope dependencies also require `devices:posture_attributes` and `devices:core:read`. Add `dns:read` for DNS reads or `dns` for DNS modifications only when MagicDNS is owned. Confirm the current scope dependencies in [Tailscale's trust credential reference](https://tailscale.com/kb/1623/trust-credentials#scopes). Device enrollment/auth-key administration is a separate credential. Federated identity is supported through the provider's documented environment variables when configured separately; PR CI does not receive deployment credentials or OIDC permissions.
+An administrator creates a dedicated OAuth trust credential separately. For policy reads/validation use `policy_file:read`; for modification use `policy_file`. Policy-read scope dependencies are `devices:posture_attributes:read` and `devices:core:read`; policy modification requires `devices:posture_attributes` and `devices:core:read`. Add `dns:read` for DNS reads or `dns` for DNS modifications only when MagicDNS is owned. Confirm the current scope dependencies in [Tailscale's trust credential reference](https://tailscale.com/docs/reference/trust-credentials#scopes). Device enrollment/auth-key administration is a separate credential. Federated identity is supported through the provider's documented environment variables when configured separately; PR CI does not receive deployment credentials or OIDC permissions.
 
 Supply `TAILSCALE_OAUTH_CLIENT_ID`, `TAILSCALE_OAUTH_CLIENT_SECRET`, and explicit `TAILSCALE_TAILNET` using your secret manager/environment. Do not put their values in source, command history, generated JSON, or durop session tokens. Plan and apply require an explicit tailnet target. Do not use `TAILSCALE_BASE_URL` for normal deployments.
 
@@ -85,4 +87,4 @@ tailscale ping recording-mac
 tailscale netcheck
 ```
 
-Treat status output as private. Confirm both networks and the host TCP port, then start durop's local/host/controller modes when implemented. Each recording uses existing infrastructure; it needs no apply. Ending a durop session revokes application access and closes its listener, while Tailscale enrollment persists. Ephemeral CI node enrollment is out of scope and requires its own narrowly scoped credentials and cleanup.
+Treat status output as private. Confirm both networks and the host TCP port, then use Durop's **Host → Native → Share this Mac…** flow on the playback Mac and **Host → Tailscale** on the controller. The [Tailnet quickstart](../../../docs/tailnet-quickstart.md#4-pair-through-durops-native-ui) covers the actual fields and session credential; Durop has no hosted web portal. Each recording uses existing infrastructure; it needs no apply. Ending a durop session revokes application access and closes its listener, while Tailscale enrollment persists. Ephemeral CI node enrollment is out of scope and requires its own narrowly scoped credentials and cleanup.

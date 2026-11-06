@@ -17,8 +17,8 @@ permissions:
   contents: read
 jobs:
   package:
-    name: Build, sign and validate app bundle (macOS 14, arm64)
-    runs-on: macos-14
+    name: Build, sign and validate app bundle (macOS 15 arm64; target 14+)
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned native Rust
@@ -31,7 +31,7 @@ jobs:
           printf 'DUROP_NATIVE_CARGO=%s\n' "$native_cargo" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-macos-arm64-14-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: native-macos-arm64-15-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Test recursive Mach-O dependency validator
         run: python3 -m unittest discover -s packaging/macos -p 'test_*.py' -v
       - name: Build app and validate signature, dependencies and bundled resources

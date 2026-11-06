@@ -9,7 +9,10 @@ use std::{
 const LIMIT: usize = 16 * 1024;
 
 /// Relocatable reference to the sample pack inside the running application.
-const BUNDLED_PACK: &str = "@bundled/podcast-pack";
+const BUNDLED_PACK: &str = "@bundled/reactions";
+
+/// Legacy bundled token migrated to the currently shipped catalog.
+const LEGACY_BUNDLED_PACK: &str = "@bundled/podcast-pack";
 
 /// Persisted local UI settings; session credentials and destination are intentionally absent.
 #[derive(Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,7 +31,8 @@ impl Preferences {
     fn legacy_bundled_pack(source: &str) -> bool {
         let path = Path::new(source);
         path.is_absolute()
-            && path.ends_with("Contents/Resources/sample-packs/podcast-pack")
+            && (path.ends_with("Contents/Resources/sample-packs/podcast-pack")
+                || path.ends_with("Contents/Resources/sample-packs/reactions"))
             && path
                 .ancestors()
                 .nth(4)
@@ -40,6 +44,7 @@ impl Preferences {
     pub fn stored_pack(source: &str, current_default: &Path) -> String {
         if Path::new(source) == current_default
             || source == BUNDLED_PACK
+            || source == LEGACY_BUNDLED_PACK
             || Self::legacy_bundled_pack(source)
         {
             BUNDLED_PACK.into()
@@ -50,7 +55,11 @@ impl Preferences {
 
     /// Resolve the bundled token or a legacy path against the currently running app.
     pub fn resolved_pack(source: &str, current_default: &Path) -> PathBuf {
-        if source.is_empty() || source == BUNDLED_PACK || Self::legacy_bundled_pack(source) {
+        if source.is_empty()
+            || source == BUNDLED_PACK
+            || source == LEGACY_BUNDLED_PACK
+            || Self::legacy_bundled_pack(source)
+        {
             current_default.into()
         } else {
             source.into()
@@ -157,10 +166,14 @@ mod tests {
     fn relocated_bundle_defaults_follow_current_resources_and_external_packs_stay_exact() {
         let old = "/tmp/DuropSmoke.app/Contents/Resources/sample-packs/podcast-pack";
         let current =
-            Path::new("/Applications/Durop.app/Contents/Resources/sample-packs/podcast-pack");
+            Path::new("/Applications/Durop.app/Contents/Resources/sample-packs/reactions");
         assert_eq!(Preferences::stored_pack(old, current), BUNDLED_PACK);
         assert_eq!(Preferences::resolved_pack(old, current), current);
         assert_eq!(Preferences::resolved_pack(BUNDLED_PACK, current), current);
+        assert_eq!(
+            Preferences::resolved_pack(LEGACY_BUNDLED_PACK, current),
+            current
+        );
         for external in [
             "/Users/me/packs/podcast-pack",
             "/Users/me/Contents/Resources/sample-packs/podcast-pack",

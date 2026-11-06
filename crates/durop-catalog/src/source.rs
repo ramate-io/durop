@@ -140,6 +140,8 @@ pub struct GitCatalogSource {
     repository: GitRepository,
     // Only literal refs pass export validation; resolution produces the commit ID.
     reference: String,
+    // Optional validated pack directory within the immutable commit tree.
+    directory: Option<PathBuf>,
 }
 
 impl GitCatalogSource {
@@ -148,6 +150,7 @@ impl GitCatalogSource {
         Self {
             repository: GitRepository::Local(path.into()),
             reference: reference.into(),
+            directory: None,
         }
     }
 
@@ -158,7 +161,34 @@ impl GitCatalogSource {
         Self {
             repository: GitRepository::Https(url.into()),
             reference: reference.into(),
+            directory: None,
         }
+    }
+
+    /// Select a pack directory inside the repository instead of its root.
+    ///
+    /// Only that tree is exported; unrelated repository files never enter the pack.
+    /// Rejects absolute paths, traversal, empty/dot components and Git metadata.
+    pub fn in_directory(mut self, directory: impl Into<PathBuf>) -> Result<Self> {
+        let directory = directory.into();
+        let name = directory
+            .to_str()
+            .ok_or_else(|| CatalogError::new("pack directory must be UTF-8"))?;
+        if name.is_empty()
+            || name.contains(['\\', ':', '\0'])
+            || name
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".." | ".git"))
+            || directory
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(CatalogError::new(
+                "pack directory must be a relative path without traversal or Git metadata",
+            ));
+        }
+        self.directory = Some(directory);
+        Ok(self)
     }
 
     // Permit only the deliberately supported, credential-free HTTPS URL grammar.
@@ -191,24 +221,36 @@ impl CatalogSource for GitCatalogSource {
         let (identity, revision) = match &self.repository {
             GitRepository::Local(path) => {
                 let path = fs::canonicalize(path)?;
-                let revision = GitRunner::new(true).export(
+                let revision = GitRunner::new(true).export_directory(
                     scratch_root,
                     pack_root,
                     path.as_os_str(),
                     &self.reference,
+                    self.directory.as_deref(),
                 )?;
                 (format!("git-local:{}", path.display()), revision)
             }
             GitRepository::Https(url) => {
                 Self::validate_https(url)?;
-                let revision = GitRunner::new(false).export(
+                let revision = GitRunner::new(false).export_directory(
                     scratch_root,
                     pack_root,
                     OsStr::new(url),
                     &self.reference,
+                    self.directory.as_deref(),
                 )?;
                 (format!("git:{url}"), revision)
             }
+        };
+        let identity = if let Some(directory) = &self.directory {
+            format!(
+                "git-directory:{}:{}{}",
+                identity.len(),
+                identity,
+                directory.display()
+            )
+        } else {
+            identity
         };
         Ok(SourceRevision { identity, revision })
     }
@@ -236,6 +278,15 @@ pub enum PackSource {
         /// Literal branch, tag or commit ID resolved to an immutable commit.
         reference: String,
     },
+    /// Fetch a pack stored below the root of an HTTPS Git repository.
+    HttpsGitDirectory {
+        /// Credential-free HTTPS repository URL.
+        url: String,
+        /// Literal branch, tag or commit ID.
+        reference: String,
+        /// Relative directory containing this pack's `durop.json`.
+        directory: PathBuf,
+    },
 }
 
 impl CatalogSource for PackSource {
@@ -250,6 +301,13 @@ impl CatalogSource for PackSource {
             Self::HttpsGit { url, reference } => {
                 GitCatalogSource::https(url, reference).materialize(pack_root, scratch_root)
             }
+            Self::HttpsGitDirectory {
+                url,
+                reference,
+                directory,
+            } => GitCatalogSource::https(url, reference)
+                .in_directory(directory)?
+                .materialize(pack_root, scratch_root),
         }
     }
 }
@@ -450,12 +508,25 @@ impl GitRunner {
     }
 
     // Resolve the ref and export bounded regular blobs without worktree actions.
+    #[cfg(test)]
     pub(super) fn export(
         &self,
         staging: &Path,
         data: &Path,
         source: &std::ffi::OsStr,
         reference: &str,
+    ) -> Result<String> {
+        self.export_directory(staging, data, source, reference, None)
+    }
+
+    // Export one validated subtree while retaining the full immutable commit revision.
+    fn export_directory(
+        &self,
+        staging: &Path,
+        data: &Path,
+        source: &std::ffi::OsStr,
+        reference: &str,
+        directory: Option<&Path>,
     ) -> Result<String> {
         use std::ffi::OsStr;
         if reference.is_empty()
@@ -504,13 +575,17 @@ impl GitRunner {
         if ![40, 64].contains(&revision.len()) || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(CatalogError::new("Git did not resolve an immutable commit"));
         }
+        let tree = directory.map_or_else(
+            || revision.clone(),
+            |directory| format!("{revision}:{}", directory.display()),
+        );
         let listing = self.run(
             &repo,
             &[
                 OsStr::new("ls-tree"),
                 OsStr::new("-r"),
                 OsStr::new("-z"),
-                OsStr::new(&revision),
+                OsStr::new(&tree),
             ],
         )?;
         let mut total = 0u64;

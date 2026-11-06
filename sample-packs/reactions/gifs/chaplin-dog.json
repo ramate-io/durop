@@ -1,0 +1,21 @@
+{
+  "id": "chaplin-dog",
+  "title": "Chaplin: sharing with the dog",
+  "asset": "chaplin-dog.gif",
+  "tags": [
+    "chaplin",
+    "dog",
+    "friend",
+    "silent comedy"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4350
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}

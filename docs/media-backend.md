@@ -42,6 +42,23 @@ errors; physical output-device loss and default-device changes remain untested.
 A maximum duration of ten minutes bounds a session, including loops. Loop seeks
 wait for the native position to return to zero before resuming.
 
+Production preparation passes `volume: 1.0` from `src/app.rs`; the native owner
+applies that value with `AVPlayer::setVolume` before starting the same player.
+The command-line `--media-probe` deliberately passes `volume: 0.0`. Extracting
+video frames does not require a separate audio player or Bevy audio component.
+
+The bundled `sample-packs/reactions/videos/cat-chirps.mp4` contains H.264 video
+and AAC stereo audio retained from Ali T's CC BY 2.0 recording. Select **Holly the
+cat: bird chatter** in the default catalog to exercise production video with sound.
+The other six bundled MP4s have silent sources and no audio stream.
+For a synthetic combined A/V input, `fixtures/media/flash-beep.mp4`
+contains H.264 video and AAC mono audio at 44.1 kHz. Its soundtrack decoded to
+nonzero samples in the November 5, 2026 check (mean −26.3 dB, peak −11.7 dB).
+The muted native probe prepared, advanced and completed that combined asset;
+audible hardware output and recorded A/V synchronization still require separate
+acceptance. Launch with `--pack fixtures/media` to select the flash/beep video
+in the application when performing that check.
+
 Immutable CIImage values (explicitly Send/Sync in the binding) retain due native
 pixel buffers and cross a latest-only slot to the worker. Core Image renders
 explicit sRGB RGBA8 into one of at most three reusable CPU buffers. The worker
@@ -60,9 +77,9 @@ only the host's bounded `looping` option repeats the timeline.
 The host must keep the Bevy update loop running while any instance is preparing
 or playing, combining `media::needs_updates()` with its own instance/animation
 policy. This services native control requests; it is not permissible to stop
-updating while a native worker waits for readiness. The worker exposes
+updating while a native worker waits for readiness. The application consumes
 `latest_frame()` for reusable Bevy Image uploads, `position()` and
-`drain_events()`; the host/panel integration is a separate stacked change.
+`drain_events()` through its existing host/media integration.
 
 ## Bounds and tests
 

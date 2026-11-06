@@ -1,0 +1,15 @@
+{
+  "id": "small-step",
+  "title": "One small step",
+  "asset": "small-step.mp3",
+  "tags": [
+    "small step",
+    "milestone",
+    "apollo 11"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 8100
+  }
+}

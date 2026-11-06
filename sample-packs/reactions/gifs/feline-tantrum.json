@@ -1,0 +1,21 @@
+{
+  "id": "feline-tantrum",
+  "title": "Feline Follies: tantrum",
+  "asset": "feline-tantrum.gif",
+  "tags": [
+    "tantrum",
+    "angry",
+    "cartoon",
+    "feline follies"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4300
+  },
+  "visual": {
+    "anchor": "bottom-right",
+    "widthFraction": 0.32,
+    "fit": "contain"
+  }
+}

@@ -17,8 +17,8 @@ nix develop
 cargo run -p durop --bin durop --locked
 ```
 
-This opens the local catalog with bundled samples. Select **This Mac**, choose a
-display, and click a clip; **STOP ALL** stops playback. `cargo run --locked` also
+This opens the bundled [reaction catalog](sample-packs/reactions). Choose **Host →
+Native** to configure a display, search, and click a card; **STOP ALL** stops playback. `cargo run --locked` also
 works from the workspace root. Without entering the shell first:
 
 ```sh
@@ -27,6 +27,8 @@ nix develop --command cargo run -p durop --bin durop --locked
 
 For a standalone `.app`, follow [packaging](docs/packaging.md). For arguments,
 pack sources, host/controller modes and pairing, see the [session guide](docs/session-runbook.md).
+For Tailscale admin setup, CDK Terrain policy and pairing in the controller,
+follow the [Tailnet quickstart](docs/tailnet-quickstart.md).
 
 ## Work
 
@@ -47,4 +49,5 @@ workspace checks, symbol documentation and Conventional Commits.
 - [`docs/`](docs/): operator guides and measured acceptance evidence.
 - [`infra/`](infra/): optional Tailscale administration; see the [runbook](infra/cdktn/tailscale/README.md).
 
-Durop is [MIT licensed](LICENSE).
+Durop code is [MIT licensed](LICENSE); bundled media and fonts retain their
+[source licenses](sample-packs/reactions/README.md) and [font notices](assets/fonts/README.md).

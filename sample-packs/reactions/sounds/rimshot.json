@@ -1,0 +1,15 @@
+{
+  "id": "rimshot",
+  "title": "Rimshot beat",
+  "asset": "rimshot.mp3",
+  "tags": [
+    "rimshot",
+    "joke",
+    "drums"
+  ],
+  "playback": {
+    "retrigger": "restart",
+    "loop": false,
+    "maxDurationMs": 4100
+  }
+}
