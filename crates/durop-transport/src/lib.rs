@@ -836,21 +836,24 @@ fn find_tailscale(search: &std::ffi::OsStr, fallbacks: &[PathBuf]) -> Option<Pat
     std::env::split_paths(search)
         .map(|directory| directory.join("tailscale"))
         .chain(fallbacks.iter().cloned())
-        .find(|path| {
-            if !path.is_file() {
-                return false;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                path.metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            {
-                true
-            }
-        })
+        .find(|path| is_executable_file(path))
+}
+
+/// Validate a known candidate directly, without introducing a current-directory search.
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Use argument arrays and force the macOS app's CLI mode without opening its UI.
@@ -878,11 +881,8 @@ async fn tailscale_output(arguments: &[&str]) -> Result<Vec<u8>, TransportError>
         find_tailscale(&search, &fallbacks).ok_or(TransportError::TailnetUnavailable)?;
     let mut candidates = vec![executable];
     for fallback in &fallbacks {
-        if !candidates.contains(fallback)
-            && let Some(executable) =
-                find_tailscale(std::ffi::OsStr::new(""), std::slice::from_ref(fallback))
-        {
-            candidates.push(executable);
+        if !candidates.contains(fallback) && is_executable_file(fallback) {
+            candidates.push(fallback.clone());
         }
     }
     // A Nix CLI may target an absent open-source daemon while the GUI app is enrolled.

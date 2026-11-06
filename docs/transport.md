@@ -1,8 +1,9 @@
 # Remote-session adapter
 
-This is the independent issue #8 transport component. Application mode controls,
-the native host dispatcher, and two-Mac acceptance remain integration work. It does
-not start a listener by being compiled or by opening the bootstrap window.
+This library supplies authenticated input sessions, controller connections and
+host invitation administration. The application connects it to **From** inputs
+and the selected **To** destination. Merely opening Durop does not start a listener;
+sharing is explicit. Two-Mac acceptance remains a separate operator check.
 
 The application calls `transport::enable_with_registry` on its long-lived Tokio
 runtime, providing `SessionConfig`, `HostBridge`, `RemoteCatalog`, and a shared

@@ -56,12 +56,15 @@ nix develop --command cargo run -p durop --bin durop --locked
 ```
 
 1. In **To**, choose the local display. In **Catalog**, choose the clips to play.
-2. In **From**, local controls and remote controllers can remain enabled together.
-   Enter this Mac's Tailscale address and TCP 48732, then **Enable remote listener**.
-   Durop verifies the address belongs to the local enrolled node.
-3. Enter **New controller name** and choose **Add controller + create pairing token**.
-   If that user needs network access, choose **Create network invitation** on
-   their card. This shares only this host device with that user; it does not
+2. In **From**, choose **+ → Tailscale controller**, enter a name, and **Add controller**.
+   Buttons across the top select which source to edit; local and remote sources
+   stay independently enabled. In the new source's **Listener settings**, enter
+   this Mac's Tailscale address and TCP 48732, then **Enable remote listener**.
+   Durop verifies the address belongs to the local enrolled node. Listener settings
+   are shared by all Tailscale sources.
+3. If that user needs network access, open **Invitation credentials** to configure
+   the host token, then choose **Create network invitation** in their source form.
+   This shares only this host device with that user; it does not
    make them a member of the host's tailnet. The host needs its own user-owned
    `TAILSCALE_API_KEY` from its process environment or the UI's secure credential
    storage. Root `.env` is read by the infrastructure manager only; it does not

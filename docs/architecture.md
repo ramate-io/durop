@@ -36,6 +36,32 @@ revision and generation checks still apply, and a disconnected controller never
 queues actions for later replay. “Native” means local control, not an unauthenticated
 LAN socket.
 
+The panel separates **From** (independently enabled local and remote inputs),
+**To** (one local or remote playback destination), and **Catalog**. Each remote
+source has a host-issued credential and revocable lease. Source-scoped command
+identities prevent two controllers from colliding in the host's deduplication
+history. Disabling one source invalidates queued work without changing the other
+sources. Local input has its own revocable guard; application shutdown can still
+stop playback when local controls are disabled.
+
+A relay advertises the selected destination's session, catalog and snapshots,
+and returns its actual admission outcomes. It never falls back to local playback
+when disconnected. Changing destinations closes the old input session and rebuilds
+the explicitly enabled listener against the new destination; controllers must
+reconnect. Direct self-connections are rejected. Guarded forwarding cancels a
+revoked source's still-pending command through an authenticated per-connection
+cancellation barrier, preserving other sources. Cancellation cannot undo an
+operation the destination already accepted. Both relay and destination should run
+this version to support cancellation acknowledgments.
+
+`InvitationProvider` and `SecretStore` live in `durop-transport`, with no Bevy
+dependency. The application runs their HTTPS/Keychain work off the UI thread.
+Infrastructure OAuth credentials configure policy; a host's user-owned API token
+creates device-sharing invitations; per-controller Durop credentials authorize
+commands. These capabilities are distinct. The host token comes from its process
+environment or explicit secure storage and never enters a controller handoff.
+Controller credentials and source lists are session-only and are not preferences.
+
 Typestate makes lifecycle boundaries explicit: a materialized catalog must validate
 before it can publish, and a disconnected/connecting remote controller cannot use
 the connected controller's admission implementation. State transitions consume the

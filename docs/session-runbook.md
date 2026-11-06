@@ -53,14 +53,17 @@ Nix CLI's macOS daemon caveat. Durop does not enroll machines or apply policy.
 Do not expose its listener through a wildcard/LAN address or public forwarding.
 
 On the playback Mac, choose its local display in **To** and load the intended
-pack in **Catalog**. In **From**, enter this Mac's Tailscale IP and port (for
-example `100.x.y.z:48732`) and choose **Enable remote listener**. The listener
+pack in **Catalog**. In **From**, choose **+ → Tailscale controller**, enter a name,
+and **Add controller**. Select that source and open **Listener settings**, enter
+this Mac's Tailscale IP and port (for example `100.x.y.z:48732`), and choose
+**Enable remote listener**. The listener
 verifies that the address belongs to the authenticated local Tailscale node.
 Local controls and multiple remote controller sources can remain enabled together.
 
-In **From**, enter **New controller name**, then **Add controller + create pairing
-token**. Every controller receives a separate runtime credential. If the recipient
-needs access to this device, choose **Create network invitation** on their card;
+Buttons across the top of **From** select one source's form without changing
+which sources are enabled. Use **+** to add more sources; each receives a separate
+runtime credential. If the recipient needs access to this device, configure
+**Invitation credentials**, then choose **Create network invitation** in their form;
 this uses the host's user-owned `TAILSCALE_API_KEY` from its environment or secure
 UI storage. The invitation shares this one device and does not enroll the user
 in the host's tailnet. Network policy must admit shared guests on TCP 48732,
