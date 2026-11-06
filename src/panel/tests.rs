@@ -556,48 +556,69 @@ fn controller_catalog_apply_preserves_remote_destination_and_draft() {
 /// Scrolling a short form reaches its bounded body without moving the clip collection.
 #[test]
 fn modal_wheel_scroll_is_clamped_and_does_not_move_catalog_rows() {
-    let mut app = App::new();
-    let mut model = Model {
-        scroll: 903.,
-        matches: 10_000,
-        ..default()
-    };
-    model.open(
-        Provider::Catalog(CatalogProvider::GitHttps),
-        &provider_context(),
-    );
-    app.insert_resource(model)
-        .add_message::<MouseWheel>()
-        .add_systems(Update, scroll);
-    let window = app
-        .world_mut()
-        .spawn((PrimaryWindow, Window::default()))
-        .id();
-    let body = app
-        .world_mut()
-        .spawn((
-            ModalBody,
-            ComputedNode {
-                size: Vec2::new(500., 100.),
-                content_size: Vec2::new(500., 500.),
-                inverse_scale_factor: 1.,
-                ..default()
-            },
-            ScrollPosition::default(),
-        ))
-        .id();
-    app.world_mut().write_message(MouseWheel {
-        unit: bevy::input::mouse::MouseScrollUnit::Pixel,
-        phase: bevy::input::touch::TouchPhase::Moved,
-        x: 0.,
-        y: -800.,
-        window,
-    });
-    app.update();
-    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 400.);
-    let model = app.world().resource::<Model>();
-    assert_eq!(model.scroll, 903.);
-    assert_eq!(model.modal.as_ref().unwrap().scroll, 400.);
+    for source_controls in [false, true] {
+        let mut app = App::new();
+        let mut model = Model {
+            scroll: 903.,
+            matches: 10_000,
+            ..default()
+        };
+        if source_controls {
+            model.open_sources("100.101.102.103:7010");
+        } else {
+            model.open(
+                Provider::Catalog(CatalogProvider::GitHttps),
+                &provider_context(),
+            );
+        }
+        app.insert_resource(model)
+            .add_message::<MouseWheel>()
+            .add_systems(Update, scroll);
+        let window = app
+            .world_mut()
+            .spawn((PrimaryWindow, Window::default()))
+            .id();
+        let body = app
+            .world_mut()
+            .spawn((
+                ModalBody,
+                ComputedNode {
+                    size: Vec2::new(500., 100.),
+                    content_size: Vec2::new(500., 500.),
+                    inverse_scale_factor: 1.,
+                    ..default()
+                },
+                ScrollPosition::default(),
+            ))
+            .id();
+        app.world_mut().write_message(MouseWheel {
+            unit: bevy::input::mouse::MouseScrollUnit::Pixel,
+            phase: bevy::input::touch::TouchPhase::Moved,
+            x: 0.,
+            y: -800.,
+            window,
+        });
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 400.);
+        {
+            let model = app.world().resource::<Model>();
+            assert_eq!(model.scroll, 903.);
+            assert_eq!(model.modal.as_ref().unwrap().scroll, 400.);
+        }
+        // Rebuilding source controls after asynchronous updates must retain the user's position.
+        app.world_mut().resource_mut::<Model>().revision += 1;
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 400.);
+        // A source removal or viewport resize shrinks content and clamps stale travel.
+        app.world_mut()
+            .get_mut::<ComputedNode>(body)
+            .unwrap()
+            .content_size
+            .y = 150.;
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 50.);
+        assert_eq!(app.world().resource::<Model>().scroll, 903.);
+    }
 }
 
 /// A complete compact card retains its two-line title and action row below the preview.
