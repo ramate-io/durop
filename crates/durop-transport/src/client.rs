@@ -82,6 +82,27 @@ enum Packet {
     },
 }
 
+impl Packet {
+    /// Validate presentation bounds even when an event is stale or awaiting recovery.
+    fn has_valid_placement(&self) -> bool {
+        match self {
+            Self::Snapshot { snapshot } => snapshot.instances.iter().all(|instance| {
+                instance
+                    .placement
+                    .is_none_or(|placement| placement.is_valid())
+            }),
+            Self::Event { event } => match &event.event {
+                durop_protocol::EventKind::VisualChanged { placement } => {
+                    event.instance_id.is_some()
+                        && placement.is_none_or(|placement| placement.is_valid())
+                }
+                _ => true,
+            },
+            _ => true,
+        }
+    }
+}
+
 /// Correlate one outstanding request while allowing intervening snapshots/events.
 enum Expected {
     // No ID is needed for browse/state requests because the client sends them serially.
@@ -273,6 +294,13 @@ impl ControllerClient {
             || envelope.command_id.len() > 128
             || envelope.session_id != self.snapshot.session_id
             || envelope.protocol_version != PROTOCOL_VERSION
+            || match &envelope.command {
+                PlaybackCommand::PlayVisual { placement, .. } => !placement.is_valid(),
+                PlaybackCommand::SetVisual { placement, .. } => {
+                    placement.is_some_and(|value| !value.is_valid())
+                }
+                _ => false,
+            }
         {
             return Err(ControllerError::Protocol);
         }
@@ -516,7 +544,13 @@ impl ControllerClient {
             };
             match message {
                 Message::Text(text) => {
-                    return serde_json::from_str(&text).map_err(|_| ControllerError::Protocol);
+                    let packet: Packet =
+                        serde_json::from_str(&text).map_err(|_| ControllerError::Protocol)?;
+                    return if packet.has_valid_placement() {
+                        Ok(packet)
+                    } else {
+                        Err(ControllerError::Protocol)
+                    };
                 }
                 Message::Ping(bytes) => timeout(IO_TIMEOUT, socket.send(Message::Pong(bytes)))
                     .await

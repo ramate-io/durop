@@ -1,10 +1,10 @@
 //! Serialized host authority; native resources stay behind generation-tagged effects.
 #![deny(missing_docs)]
 
-use durop_catalog::{Catalog, Clip, Retrigger};
+use durop_catalog::{Anchor, Catalog, Clip, Retrigger};
 use durop_protocol::{
     ClipStatus, CommandOutcome, Envelope, EventKind, HostEvent, HostSnapshot, InstanceSnapshot,
-    InstanceState, PROTOCOL_VERSION, PlaybackCommand, Readiness, Rejection,
+    InstanceState, PROTOCOL_VERSION, PlaybackCommand, Readiness, Rejection, VisualPlacement,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -38,6 +38,15 @@ pub enum BackendEffect {
         token: BackendToken,
         /// Pinned catalog metadata and local resources to prepare.
         clip: Box<Clip>,
+        /// Explicit occurrence override, or none to use the catalog default.
+        placement: Option<VisualPlacement>,
+    },
+    /// Change presentation on the next frame without replacing decoder resources.
+    SetVisual {
+        /// Guard identifying the occurrence and generation for this action.
+        token: BackendToken,
+        /// Explicit occurrence override, or none to restore the catalog default.
+        placement: Option<VisualPlacement>,
     },
     /// Start an already prepared occurrence.
     Start {
@@ -151,6 +160,37 @@ impl Host {
         }
     }
 
+    /// Resolve immutable catalog placement for GIF/video clips; audio has no placement.
+    /// Missing visual metadata uses a centered fit box at 30% of display width.
+    /// Fractional authoring widths are rounded to the nearest valid basis point.
+    pub fn default_placement(clip: &Clip) -> Option<VisualPlacement> {
+        let extension = clip.asset_path.extension()?.to_str()?.to_ascii_lowercase();
+        if !["gif", "mp4", "mov", "webm"].contains(&extension.as_str()) {
+            return None;
+        }
+        let Some(visual) = &clip.metadata.visual else {
+            return Some(VisualPlacement {
+                width_bps: 3000,
+                x_bps: 5000,
+                y_bps: 5000,
+            });
+        };
+        let (x_bps, y_bps) = match visual.anchor {
+            Anchor::TopLeft => (0, 0),
+            Anchor::TopRight => (10_000, 0),
+            Anchor::BottomLeft => (0, 10_000),
+            Anchor::BottomRight => (10_000, 10_000),
+            Anchor::Center => (5000, 5000),
+        };
+        Some(VisualPlacement {
+            width_bps: (visual.width_fraction * 10_000.0)
+                .round()
+                .clamp(1.0, 10_000.0) as u16,
+            x_bps,
+            y_bps,
+        })
+    }
+
     /// Validate, deduplicate and apply one controller intention.
     pub fn accept(&mut self, envelope: Envelope) -> CommandOutcome {
         self.accept_inner(envelope, false)
@@ -204,13 +244,18 @@ impl Host {
     /// Resolve a command against bounded active/history state before emitting effects.
     fn decide(&mut self, command: &PlaybackCommand) -> Result<Option<String>, Rejection> {
         match command {
-            PlaybackCommand::Play { clip_id } => {
+            PlaybackCommand::Play { clip_id } | PlaybackCommand::PlayVisual { clip_id, .. } => {
                 let clip = self
                     .catalog
                     .clips
                     .iter()
                     .find(|c| &c.identity == clip_id)
                     .ok_or(Rejection::UnknownClip)?;
+                if let PlaybackCommand::PlayVisual { placement, .. } = command
+                    && (!placement.is_valid() || Self::default_placement(clip).is_none())
+                {
+                    return Err(Rejection::InvalidCommand);
+                }
                 let existing = self.instances.values().find(|i| {
                     i.snapshot.clip_id == *clip_id && i.snapshot.state != InstanceState::Stopping
                 });
@@ -229,6 +274,47 @@ impl Host {
                     .expect("instance sequence exhausted");
                 Ok(Some(format!("{}:{}", self.session_id, self.next_instance)))
             }
+            PlaybackCommand::SetVisual {
+                instance_id,
+                placement,
+            } => {
+                if placement.is_some_and(|value| !value.is_valid()) {
+                    return Err(Rejection::InvalidCommand);
+                }
+                let instance = self.instances.get(instance_id).ok_or_else(|| {
+                    if self
+                        .history
+                        .iter()
+                        .any(|value| value.instance_id == *instance_id)
+                    {
+                        Rejection::Superseded
+                    } else {
+                        Rejection::UnknownInstance
+                    }
+                })?;
+                if !matches!(
+                    instance.snapshot.state,
+                    InstanceState::Preparing | InstanceState::Playing
+                ) {
+                    return Err(Rejection::Superseded);
+                }
+                let clip = self
+                    .catalog
+                    .clips
+                    .iter()
+                    .find(|clip| clip.identity == instance.snapshot.clip_id)
+                    .unwrap();
+                if Self::default_placement(clip).is_none() {
+                    return Err(Rejection::InvalidCommand);
+                }
+                // Coalescing keeps one unsent presentation change per generation.
+                if self.effects.len() >= 64 && !self.effects.iter().any(|effect| {
+                    matches!(effect, BackendEffect::SetVisual { token, .. } if *token == instance.token())
+                }) {
+                    return Err(Rejection::Busy);
+                }
+                Ok(Some(instance_id.clone()))
+            }
             PlaybackCommand::Stop { instance_id } => {
                 if self.instances.contains_key(instance_id)
                     || self.history.iter().any(|i| i.instance_id == *instance_id)
@@ -244,8 +330,12 @@ impl Host {
 
     /// Apply an accepted policy decision and enqueue generation-guarded effects.
     fn perform(&mut self, command: PlaybackCommand, instance_id: Option<String>) {
+        let placement = match &command {
+            PlaybackCommand::PlayVisual { placement, .. } => Some(*placement),
+            _ => None,
+        };
         match command {
-            PlaybackCommand::Play { clip_id } => {
+            PlaybackCommand::Play { clip_id } | PlaybackCommand::PlayVisual { clip_id, .. } => {
                 let instance_id = instance_id.unwrap();
                 if self.instances.contains_key(&instance_id) {
                     return;
@@ -276,6 +366,7 @@ impl Host {
                         clip_id,
                         generation: self.next_instance,
                         state: InstanceState::Preparing,
+                        placement,
                     },
                     prepared: false,
                     blockers,
@@ -284,9 +375,29 @@ impl Host {
                 self.effects.push_back(BackendEffect::Prepare {
                     token: instance.token(),
                     clip: Box::new(clip),
+                    placement,
                 });
                 self.instances.insert(instance_id.clone(), instance);
-                self.emit(Some(instance_id), EventKind::Preparing);
+                self.emit(Some(instance_id.clone()), EventKind::Preparing);
+                if placement.is_some() {
+                    self.emit(Some(instance_id), EventKind::VisualChanged { placement });
+                }
+            }
+            PlaybackCommand::SetVisual {
+                instance_id,
+                placement,
+            } => {
+                let instance = self.instances.get_mut(&instance_id).unwrap();
+                instance.snapshot.placement = placement;
+                let token = instance.token();
+                self.effects.retain(|effect| {
+                    !matches!(effect,
+                        BackendEffect::SetVisual { token: queued, .. } if queued == &token
+                    )
+                });
+                self.effects
+                    .push_back(BackendEffect::SetVisual { token, placement });
+                self.emit(Some(instance_id), EventKind::VisualChanged { placement });
             }
             PlaybackCommand::Stop { instance_id } => self.stop(&instance_id),
             PlaybackCommand::StopAll => {
@@ -307,9 +418,9 @@ impl Host {
             let token = instance.token();
             // Cancel unsent work too. Every stop still gets a teardown acknowledgement.
             self.effects.retain(|effect| match effect {
-                BackendEffect::Prepare { token: t, .. } | BackendEffect::Start { token: t } => {
-                    t != &token
-                }
+                BackendEffect::Prepare { token: t, .. }
+                | BackendEffect::SetVisual { token: t, .. }
+                | BackendEffect::Start { token: t } => t != &token,
                 BackendEffect::Stop { .. } => true,
             });
             self.effects.push_back(BackendEffect::Stop { token });
@@ -384,6 +495,7 @@ impl Host {
         let token = instance.token();
         self.effects.retain(|effect| match effect {
             BackendEffect::Prepare { token: t, .. }
+            | BackendEffect::SetVisual { token: t, .. }
             | BackendEffect::Start { token: t }
             | BackendEffect::Stop { token: t } => t != &token,
         });
@@ -725,7 +837,7 @@ mod tests {
 
     fn envelope(id: &str, command: PlaybackCommand) -> Envelope {
         Envelope {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             session_id: "session".into(),
             command_id: id.into(),
             catalog_revision: "revision".into(),
@@ -750,7 +862,7 @@ mod tests {
         host.drain_effects()
             .into_iter()
             .find_map(|e| match e {
-                BackendEffect::Prepare { token, clip } => {
+                BackendEffect::Prepare { token, clip, .. } => {
                     assert_eq!(clip.metadata.playback.max_duration_ms, 1200);
                     Some(token)
                 }
@@ -827,7 +939,7 @@ mod tests {
             match reason {
                 Rejection::WrongSession => request.session_id = "old".into(),
                 Rejection::StaleCatalog => request.catalog_revision = "old".into(),
-                _ => request.protocol_version = 2,
+                _ => request.protocol_version = PROTOCOL_VERSION + 1,
             }
             assert_eq!(host.accept(request), CommandOutcome::Rejected { reason });
         }
@@ -1115,5 +1227,314 @@ mod tests {
         assert_eq!(host.sequence, 3900);
         assert_eq!(host.drain_events()[0].sequence, 3900 - EVENT_CAP as u64 + 1);
         assert!(!host.dedupe.contains_key("0"));
+    }
+
+    /// A visual fixture keeps authoring metadata immutable across occurrence edits.
+    fn visual_host(policy: Retrigger) -> Host {
+        let mut host = host(policy);
+        Arc::make_mut(&mut host.catalog).clips[0].asset_path = "clip.gif".into();
+        host
+    }
+
+    /// Reusable asymmetric placement detects accidental centering or axis swaps.
+    fn placement() -> VisualPlacement {
+        VisualPlacement {
+            width_bps: 4200,
+            x_bps: 1250,
+            y_bps: 8750,
+        }
+    }
+
+    /// Submit one occurrence-only visual request through the usual envelope guards.
+    fn play_visual(id: &str) -> Envelope {
+        envelope(
+            id,
+            PlaybackCommand::PlayVisual {
+                clip_id: "pack/clip".into(),
+                placement: placement(),
+            },
+        )
+    }
+
+    /// Submit one edit or reset without changing the occurrence identity.
+    fn set_visual(id: &str, token: &BackendToken, placement: Option<VisualPlacement>) -> Envelope {
+        envelope(
+            id,
+            PlaybackCommand::SetVisual {
+                instance_id: token.instance_id.clone(),
+                placement,
+            },
+        )
+    }
+
+    #[test]
+    fn defaults_map_visual_metadata_and_reject_audio_without_mutating_catalog() {
+        use durop_catalog::{Fit, Visual};
+        let host = visual_host(Retrigger::Stack);
+        let mut clip = host.catalog.clips[0].clone();
+        assert_eq!(
+            Host::default_placement(&clip),
+            Some(VisualPlacement {
+                width_bps: 3000,
+                x_bps: 5000,
+                y_bps: 5000
+            })
+        );
+        for (anchor, x_bps, y_bps) in [
+            (Anchor::TopLeft, 0, 0),
+            (Anchor::TopRight, 10_000, 0),
+            (Anchor::BottomLeft, 0, 10_000),
+            (Anchor::BottomRight, 10_000, 10_000),
+            (Anchor::Center, 5000, 5000),
+        ] {
+            clip.metadata.visual = Some(Visual {
+                anchor,
+                width_fraction: 0.4567,
+                fit: Fit::Cover,
+            });
+            assert_eq!(
+                Host::default_placement(&clip),
+                Some(VisualPlacement {
+                    width_bps: 4567,
+                    x_bps,
+                    y_bps
+                })
+            );
+        }
+        for extension in ["gif", "GIF", "mp4", "mov", "webm"] {
+            clip.asset_path = format!("clip.{extension}").into();
+            assert!(Host::default_placement(&clip).is_some());
+        }
+        clip.asset_path = "clip.wav".into();
+        assert_eq!(Host::default_placement(&clip), None);
+        assert!(host.catalog.clips[0].metadata.visual.is_none());
+    }
+
+    #[test]
+    fn visual_edit_preparing_playing_and_reset_keep_decoder_generation() {
+        let mut host = visual_host(Retrigger::Stack);
+        let token = prepared_token(&mut host, "play");
+        let edit = set_visual("edit", &token, Some(placement()));
+        let outcome = host.accept(edit.clone());
+        let sequence = host.sequence;
+        assert_eq!(host.accept(edit), outcome);
+        assert_eq!(host.sequence, sequence);
+        assert_eq!(host.instances.len(), 1);
+        assert_eq!(host.snapshot().instances[0].generation, token.generation);
+        assert_eq!(host.snapshot().instances[0].placement, Some(placement()));
+        assert!(
+            matches!(host.drain_effects().as_slice(), [BackendEffect::SetVisual { token: actual, placement: Some(value) }] if actual == &token && *value == placement())
+        );
+        assert!(host.drain_events().iter().any(|event| matches!(event.event, EventKind::VisualChanged { placement: Some(value) } if value == placement())));
+        start(&mut host, &token);
+        host.accept(set_visual("reset", &token, None));
+        assert_eq!(host.snapshot().instances[0].placement, None);
+        assert_eq!(host.snapshot().instances[0].state, InstanceState::Playing);
+        assert!(
+            matches!(host.drain_effects().as_slice(), [BackendEffect::SetVisual { token: actual, placement: None }] if actual == &token)
+        );
+        assert!(host.catalog.clips[0].metadata.visual.is_none());
+    }
+
+    #[test]
+    fn visual_play_obeys_ignore_stack_and_restart_policies() {
+        let mut ignore = visual_host(Retrigger::IgnoreIfPlaying);
+        let first = ignore.accept(play_visual("one"));
+        assert_eq!(ignore.accept(play("two")), first);
+        assert_eq!(ignore.snapshot().instances[0].placement, Some(placement()));
+        assert_eq!(ignore.drain_effects().len(), 1);
+        let mut stack = visual_host(Retrigger::Stack);
+        assert_ne!(
+            stack.accept(play_visual("one")),
+            stack.accept(play_visual("two"))
+        );
+        assert_eq!(stack.instances.len(), 2);
+        let mut restart = visual_host(Retrigger::Restart);
+        let old = prepared_token(&mut restart, "old");
+        restart.accept(play_visual("new"));
+        let effects = restart.drain_effects();
+        assert!(
+            matches!(effects.as_slice(), [BackendEffect::Stop { token }, BackendEffect::Prepare { placement: Some(value), .. }] if token == &old && *value == placement())
+        );
+        assert_eq!(
+            restart.instances[&old.instance_id].snapshot.state,
+            InstanceState::Stopping
+        );
+    }
+
+    #[test]
+    fn visual_commands_reject_audio_invalid_bounds_and_stale_context() {
+        let mut audio = host(Retrigger::Stack);
+        assert_eq!(
+            audio.accept(play_visual("audio")),
+            CommandOutcome::Rejected {
+                reason: Rejection::InvalidCommand
+            }
+        );
+        let audio_token = prepared_token(&mut audio, "audio-default");
+        assert_eq!(
+            audio.accept(set_visual("audio-edit", &audio_token, None)),
+            CommandOutcome::Rejected {
+                reason: Rejection::InvalidCommand
+            }
+        );
+        let mut host = visual_host(Retrigger::Stack);
+        for (index, value) in [
+            VisualPlacement {
+                width_bps: 0,
+                ..placement()
+            },
+            VisualPlacement {
+                width_bps: 10_001,
+                ..placement()
+            },
+            VisualPlacement {
+                x_bps: 10_001,
+                ..placement()
+            },
+            VisualPlacement {
+                y_bps: 10_001,
+                ..placement()
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = envelope(
+                &format!("bad-play-{index}"),
+                PlaybackCommand::PlayVisual {
+                    clip_id: "pack/clip".into(),
+                    placement: value,
+                },
+            );
+            assert_eq!(
+                host.accept(request),
+                CommandOutcome::Rejected {
+                    reason: Rejection::InvalidCommand
+                }
+            );
+        }
+        let token = prepared_token(&mut host, "valid");
+        assert_eq!(
+            host.accept(set_visual(
+                "invalid-edit",
+                &token,
+                Some(VisualPlacement {
+                    width_bps: 0,
+                    ..placement()
+                })
+            )),
+            CommandOutcome::Rejected {
+                reason: Rejection::InvalidCommand
+            }
+        );
+        let missing = BackendToken {
+            instance_id: "session:missing".into(),
+            generation: 999,
+        };
+        assert_eq!(
+            host.accept(set_visual("missing-edit", &missing, None)),
+            CommandOutcome::Rejected {
+                reason: Rejection::UnknownInstance
+            }
+        );
+        for (id, reason) in [
+            ("session", Rejection::WrongSession),
+            ("revision", Rejection::StaleCatalog),
+        ] {
+            let mut request = set_visual(id, &token, Some(placement()));
+            if id == "session" {
+                request.session_id = "old".into();
+            } else {
+                request.catalog_revision = "old".into();
+            }
+            assert_eq!(host.accept(request), CommandOutcome::Rejected { reason });
+        }
+        assert_eq!(host.snapshot().instances[0].placement, None);
+        assert!(host.drain_effects().is_empty());
+    }
+
+    #[test]
+    fn visual_effects_coalesce_and_stop_discards_queued_edits() {
+        let mut host = visual_host(Retrigger::Stack);
+        let token = prepared_token(&mut host, "play");
+        for index in 0..100 {
+            assert!(matches!(
+                host.accept(set_visual(
+                    &format!("edit-{index}"),
+                    &token,
+                    Some(VisualPlacement {
+                        x_bps: index,
+                        ..placement()
+                    })
+                )),
+                CommandOutcome::Accepted { .. }
+            ));
+        }
+        assert_eq!(host.effects.len(), 1);
+        host.accept(envelope("stop", PlaybackCommand::StopAll));
+        assert!(
+            matches!(host.drain_effects().as_slice(), [BackendEffect::Stop { token: actual }] if actual == &token)
+        );
+        assert_eq!(
+            host.accept(set_visual("late", &token, Some(placement()))),
+            CommandOutcome::Rejected {
+                reason: Rejection::Superseded
+            }
+        );
+        signal(&mut host, &token, BackendEventKind::Prepared);
+        assert!(host.drain_effects().is_empty());
+        signal(&mut host, &token, BackendEventKind::Stopped);
+        assert_eq!(
+            host.accept(set_visual("terminal", &token, None)),
+            CommandOutcome::Rejected {
+                reason: Rejection::Superseded
+            }
+        );
+        assert!(host.drain_effects().is_empty());
+    }
+
+    #[test]
+    fn stop_all_supersedes_queued_visual_play_and_edits() {
+        let mut host = visual_host(Retrigger::Stack);
+        let token = prepared_token(&mut host, "existing");
+        let (sender, mut inbox) = command_channel(|| {});
+        sender.try_send(play_visual("queued-play")).unwrap();
+        sender
+            .try_send(set_visual("queued-edit", &token, Some(placement())))
+            .unwrap();
+        sender
+            .try_send(envelope("barrier", PlaybackCommand::StopAll))
+            .unwrap();
+        let receipts = inbox.drain(&mut host);
+        assert_eq!(receipts.len(), 3);
+        assert!(receipts[1..].iter().all(|receipt| receipt.outcome
+            == CommandOutcome::Rejected {
+                reason: Rejection::Superseded
+            }));
+        assert_eq!(host.instances.len(), 1);
+        assert_eq!(host.snapshot().instances[0].state, InstanceState::Stopping);
+        assert_eq!(host.snapshot().instances[0].placement, None);
+        assert!(
+            matches!(host.drain_effects().as_slice(), [BackendEffect::Stop { token: actual }] if actual == &token)
+        );
+    }
+
+    #[test]
+    fn natural_completion_discards_pending_visual_effects_and_retains_override_history() {
+        let mut host = visual_host(Retrigger::Stack);
+        let token = prepared_token(&mut host, "play");
+        start(&mut host, &token);
+        host.accept(set_visual("edit", &token, Some(placement())));
+        signal(&mut host, &token, BackendEventKind::Finished);
+        assert!(host.drain_effects().is_empty());
+        assert_eq!(host.snapshot().instances[0].state, InstanceState::Finished);
+        assert_eq!(host.snapshot().instances[0].placement, Some(placement()));
+        assert_eq!(
+            host.accept(set_visual("terminal-edit", &token, None)),
+            CommandOutcome::Rejected {
+                reason: Rejection::Superseded
+            }
+        );
     }
 }

@@ -601,7 +601,7 @@ mod tests {
         let path = path();
         let (recorder, guard) = Recorder::create(&path, FILE_LIMIT).unwrap();
         let envelope = Envelope {
-            protocol_version: 1,
+            protocol_version: crate::commands::PROTOCOL_VERSION,
             session_id: "PRIVATE_SESSION".into(),
             command_id: "PRIVATE_COMMAND".into(),
             catalog_revision: "PRIVATE_REPOSITORY".into(),

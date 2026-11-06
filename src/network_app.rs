@@ -6,7 +6,10 @@
 use crate::{
     app::Runtime,
     catalog::Catalog,
-    commands::{CommandOutcome, Envelope, HostEvent, HostSnapshot, PlaybackCommand, Rejection},
+    commands::{
+        CommandOutcome, Envelope, HostEvent, HostSnapshot, PlaybackCommand, Rejection,
+        VisualPlacement,
+    },
     host::{CommandInbox, QueueError, command_channel},
     transport::{
         self, ControllerClient, ControllerUpdate, HostBridge, RemoteCatalog, RemoteCommand,
@@ -69,6 +72,9 @@ pub struct RemoteClip {
     pub category: String,
     /// Validated panel category: audio, video, or gif.
     pub media_type: String,
+    /// Host-resolved visual default; absent for audio clips or older projections.
+    #[serde(default)]
+    pub default_placement: Option<VisualPlacement>,
 }
 
 /// Bounded metadata projection for browsing one pinned authenticated catalog.
@@ -102,6 +108,9 @@ impl RemoteCatalogView {
                     && clip.tags.len() <= 32
                     && clip.tags.iter().all(|tag| tag.len() <= 64)
                     && ["audio", "video", "gif"].contains(&clip.media_type.as_str())
+                    && clip
+                        .default_placement
+                        .is_none_or(|placement| clip.media_type != "audio" && placement.is_valid())
             })
     }
 }
@@ -700,6 +709,7 @@ impl RemoteCatalogView {
                 tags: clip.metadata.tags.clone(),
                 category: clip.category.to_string_lossy().into_owned(),
                 media_type: media_type.into(),
+                default_placement: crate::host::Host::default_placement(clip),
             });
             let mut png = Vec::new();
             std::fs::File::open(&clip.icon_path)
@@ -1032,7 +1042,28 @@ mod tests {
             .unwrap();
         let address = session.address;
         let secret = SessionCredential::from_secret(session.credential.bearer().into()).unwrap();
-        let clip_id = catalog.clips[0].identity.clone();
+        let clip = catalog
+            .clips
+            .iter()
+            .find(|clip| crate::host::Host::default_placement(clip).is_some())
+            .unwrap();
+        let clip_id = clip.identity.clone();
+        let default_placement = crate::host::Host::default_placement(clip).unwrap();
+        let placement = VisualPlacement {
+            width_bps: 4200,
+            x_bps: 1234,
+            y_bps: 8765,
+        };
+        let expected_defaults: BTreeMap<_, _> = catalog
+            .clips
+            .iter()
+            .map(|clip| {
+                (
+                    clip.identity.clone(),
+                    crate::host::Host::default_placement(clip),
+                )
+            })
+            .collect();
         let revision = catalog.revision.clone();
         let (done, completed) = std::sync::mpsc::sync_channel(1);
         let task = network.runtime.spawn(async move {
@@ -1042,13 +1073,19 @@ mod tests {
             let metadata = client.catalog().await.unwrap();
             assert!(metadata.get("root").is_none());
             assert!(metadata["clips"][0].get("assetPath").is_none());
+            let view: RemoteCatalogView = serde_json::from_value(metadata).unwrap();
+            assert!(view.validate());
+            for clip in view.clips {
+                assert_eq!(clip.default_placement, expected_defaults[&clip.clip_id]);
+            }
             assert!(!client.icon(&clip_id).await.unwrap().is_empty());
             let accepted = client
                 .command(
                     "remote-play".into(),
                     revision.clone(),
-                    PlaybackCommand::Play {
+                    PlaybackCommand::PlayVisual {
                         clip_id: clip_id.clone(),
+                        placement,
                     },
                 )
                 .await
@@ -1058,11 +1095,35 @@ mod tests {
                 .command(
                     "remote-play".into(),
                     revision.clone(),
-                    PlaybackCommand::Play { clip_id },
+                    PlaybackCommand::PlayVisual { clip_id, placement },
                 )
                 .await
                 .unwrap();
             assert_eq!(accepted, duplicate);
+            let CommandOutcome::Accepted {
+                instance_id: Some(instance_id),
+            } = &accepted
+            else {
+                panic!("missing visual occurrence");
+            };
+            let snapshot = client.refresh_snapshot().await.unwrap();
+            assert_eq!(snapshot.instances[0].placement, Some(placement));
+            for (index, next) in [Some(default_placement), None].into_iter().enumerate() {
+                let outcome = client
+                    .command(
+                        format!("remote-placement-{index}"),
+                        revision.clone(),
+                        PlaybackCommand::SetVisual {
+                            instance_id: instance_id.clone(),
+                            placement: next,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(outcome, CommandOutcome::Accepted { .. }));
+                let snapshot = client.refresh_snapshot().await.unwrap();
+                assert_eq!(snapshot.instances[0].placement, next);
+            }
             let stopped = client
                 .command("remote-stop".into(), revision, PlaybackCommand::StopAll)
                 .await
@@ -1215,11 +1276,117 @@ mod tests {
                 tags: vec![],
                 category: "audio".into(),
                 media_type: "audio".into(),
+                default_placement: None,
             }],
         };
         assert!(view.validate());
+        let mut missing_default = serde_json::to_value(&view).unwrap();
+        missing_default["clips"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("defaultPlacement");
+        assert!(
+            serde_json::from_value::<RemoteCatalogView>(missing_default)
+                .unwrap()
+                .clips[0]
+                .default_placement
+                .is_none()
+        );
         let mut duplicates = view.clone();
         duplicates.clips.push(view.clips[0].clone());
         assert!(!duplicates.validate());
+        let mut visual = view.clone();
+        visual.clips[0].media_type = "gif".into();
+        visual.clips[0].default_placement = Some(VisualPlacement {
+            width_bps: 3000,
+            x_bps: 5000,
+            y_bps: 5000,
+        });
+        assert!(visual.validate());
+        let serialized = serde_json::to_value(&visual).unwrap();
+        assert_eq!(serialized["clips"][0]["defaultPlacement"]["widthBps"], 3000);
+        assert!(
+            serde_json::from_value::<RemoteCatalogView>(serialized)
+                .unwrap()
+                .validate()
+        );
+        visual.clips[0].default_placement.as_mut().unwrap().x_bps = 10_001;
+        assert!(!visual.validate());
+        visual.clips[0].default_placement.as_mut().unwrap().x_bps = 5000;
+        visual.clips[0].media_type = "audio".into();
+        assert!(!visual.validate());
+    }
+
+    #[test]
+    fn native_visual_commands_use_the_shared_host_path() {
+        let catalog = Arc::new(
+            crate::catalog::load_local(
+                &crate::app::resource_root().join("sample-packs/podcast-pack"),
+            )
+            .unwrap(),
+        );
+        let mut host = crate::host::Host::new("native-visual".into(), catalog.clone());
+        let mut network =
+            NetworkState::new(host.snapshot(), &NetworkConfig::default(), Arc::new(|| {}));
+        let clip = catalog
+            .clips
+            .iter()
+            .find(|clip| crate::host::Host::default_placement(clip).is_some())
+            .unwrap();
+        let placement = VisualPlacement {
+            width_bps: 4200,
+            x_bps: 1234,
+            y_bps: 8765,
+        };
+        let envelope = |id: &str, command| Envelope {
+            protocol_version: crate::commands::PROTOCOL_VERSION,
+            session_id: "native-visual".into(),
+            command_id: id.into(),
+            catalog_revision: catalog.revision.clone(),
+            command,
+        };
+        network
+            .queue_local(envelope(
+                "play",
+                PlaybackCommand::PlayVisual {
+                    clip_id: clip.identity.clone(),
+                    placement,
+                },
+            ))
+            .unwrap();
+        assert!(
+            network
+                .accept_pending(&mut host, "native-visual")
+                .is_empty()
+        );
+        let snapshot = host.snapshot();
+        assert_eq!(snapshot.instances[0].placement, Some(placement));
+        let instance_id = snapshot.instances[0].instance_id.clone();
+        for (index, next) in [
+            Some(VisualPlacement {
+                width_bps: 8000,
+                ..placement
+            }),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            network
+                .queue_local(envelope(
+                    &format!("set-{index}"),
+                    PlaybackCommand::SetVisual {
+                        instance_id: instance_id.clone(),
+                        placement: next,
+                    },
+                ))
+                .unwrap();
+            assert!(
+                network
+                    .accept_pending(&mut host, "native-visual")
+                    .is_empty()
+            );
+            assert_eq!(host.snapshot().instances[0].placement, next);
+        }
     }
 }

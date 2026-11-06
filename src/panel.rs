@@ -1,11 +1,13 @@
 //! Native controller panel with bounded virtualization and Unicode/IME editing.
 
 pub(crate) mod configuration;
+mod placement;
 #[cfg(test)]
 mod tests;
 mod theme;
 mod view;
 
+use crate::commands::VisualPlacement;
 use crate::{
     app::{Action, Actions, Destination, Mode, Runtime},
     catalog::Clip,
@@ -25,6 +27,7 @@ use configuration::{
     CatalogProvider, ConfigurationContext, ConfigurationDraft, ConfigurationIntent, DisplayChoice,
     HostProvider, Provider,
 };
+use placement::{PlacementModal, PlacementScope};
 use std::{
     collections::BTreeMap,
     io::Read,
@@ -40,6 +43,8 @@ enum Field {
     Search,
     /// Provider-specific editor inside the active configuration dialog.
     Configuration(usize),
+    /// Visual placement percentage in the active isolated draft.
+    Placement(usize),
 }
 
 /// Bounded Unicode editor with a byte-boundary cursor and separate IME preedit.
@@ -134,6 +139,14 @@ struct Model {
     dropdown: Option<Dropdown>,
     /// Pending provider settings; applying is the only path to side effects.
     modal: Option<Modal>,
+    /// Experimental visual placement form, mutually exclusive with provider forms.
+    placement_modal: Option<PlacementModal>,
+    /// Exact destination lifetime owning the bounded session adjustments.
+    placement_scope: Option<PlacementScope>,
+    /// At most 256 clip adjustments; catalog metadata is never modified.
+    placements: BTreeMap<String, VisualPlacement>,
+    /// Oldest-applied order for bounded override eviction.
+    placement_order: std::collections::VecDeque<String>,
     /// Current responsive grid geometry and scroll bounds.
     layout: GridLayout,
     /// Number of filtered clips used to clamp scrolling and scrollbar position.
@@ -157,6 +170,16 @@ struct Model {
 enum UiAction {
     /// Queue an application lifecycle/playback intent.
     Runtime(Action),
+    /// Play with the current session adjustment.
+    Play(String),
+    /// Open the isolated visual-only placement draft.
+    EditPlacement(String),
+    /// Reset the draft to catalog values without applying it.
+    ResetPlacement,
+    /// Nudge one visual percentage by one point for pointer-only adjustment.
+    StepPlacement(usize, i16),
+    /// Apply placement to active occurrences, optionally sending another play.
+    ApplyPlacement(bool),
     /// Move text focus to one editor.
     Focus(Field),
     /// Open or close a provider menu.
@@ -264,12 +287,30 @@ struct HoverColors {
 }
 
 impl Model {
+    /// Whether either isolated form owns input and scrolling.
+    fn has_modal(&self) -> bool {
+        self.modal.is_some() || self.placement_modal.is_some()
+    }
+
+    /// Access the scroll position of the isolated form currently owning input.
+    fn modal_scroll(&mut self) -> Option<&mut f32> {
+        if let Some(modal) = &mut self.modal {
+            Some(&mut modal.scroll)
+        } else {
+            self.placement_modal.as_mut().map(|modal| &mut modal.scroll)
+        }
+    }
+
     /// Block all background actions while a modal owns interaction, retaining the safety stop.
     fn allows(&self, action: &UiAction) -> bool {
-        self.modal.is_none()
+        !self.has_modal()
             || matches!(
                 action,
                 UiAction::Apply
+                    | UiAction::ApplyPlacement(_)
+                    | UiAction::ResetPlacement
+                    | UiAction::StepPlacement(_, _)
+                    | UiAction::Focus(Field::Placement(_))
                     | UiAction::Cancel
                     | UiAction::Cycle(_)
                     | UiAction::Focus(Field::Configuration(_))
@@ -328,6 +369,7 @@ impl Model {
 
     /// Begin a new provider draft without changing playback or network ownership.
     fn open(&mut self, provider: Provider, context: &ConfigurationContext) {
+        self.placement_modal = None;
         let draft = ConfigurationDraft::new(provider, context);
         let editors = draft
             .fields
@@ -351,6 +393,7 @@ impl Model {
 
     /// Discard modal state and transient menus; no provider intent is emitted.
     fn close(&mut self) {
+        self.placement_modal = None;
         if let Some(modal) = self.modal.take() {
             modal.draft.cancel();
         }
@@ -377,6 +420,7 @@ impl Model {
     fn editor(&mut self, field: Field) -> Option<&mut Editor> {
         match field {
             Field::Search => Some(&mut self.query),
+            Field::Placement(index) => self.placement_modal.as_mut()?.editors.get_mut(index),
             Field::Configuration(index) => {
                 let modal = self.modal.as_mut()?;
                 let field = modal.draft.fields.get(index)?;
@@ -392,7 +436,7 @@ impl Model {
     #[cfg(target_os = "macos")]
     fn is_secret(&self, field: Field) -> bool {
         match field {
-            Field::Search => false,
+            Field::Search | Field::Placement(_) => false,
             Field::Configuration(index) => self
                 .modal
                 .as_ref()
@@ -403,6 +447,13 @@ impl Model {
 
     /// Cycle keyboard focus through editable modal fields without leaking input to the catalog.
     fn focus_next(&mut self) {
+        if self.placement_modal.is_some() {
+            self.focus = Some(Field::Placement(match self.focus {
+                Some(Field::Placement(index)) => (index + 1) % 3,
+                _ => 0,
+            }));
+            return;
+        }
         let Some(modal) = &self.modal else {
             return;
         };
@@ -493,7 +544,7 @@ fn scrollbar(
     mut bodies: Query<&mut ScrollPosition, With<CatalogBody>>,
     mouse: Res<ButtonInput<MouseButton>>,
 ) {
-    if !mouse.pressed(MouseButton::Left) || model.modal.is_some() {
+    if !mouse.pressed(MouseButton::Left) || model.has_modal() {
         model.dragging = false;
         return;
     }
@@ -758,12 +809,40 @@ fn buttons(
     {
         return;
     }
+    model.sync_placements(PlacementScope::current(&runtime, &network));
     for (interaction, action) in &buttons {
         if *interaction != Interaction::Pressed || !model.allows(action) {
             continue;
         }
         model.revision = model.revision.wrapping_add(1);
         match action {
+            UiAction::Play(clip_id) => {
+                model.focus = None;
+                actions.0.push_back(model.play_action(clip_id));
+            }
+            UiAction::EditPlacement(clip_id) => model.open_placement(clip_id, &runtime, &network),
+            UiAction::ResetPlacement => {
+                if let Some(modal) = &mut model.placement_modal {
+                    modal.reset();
+                }
+                model.focus = None;
+            }
+            UiAction::StepPlacement(index, direction) => {
+                if let Some(modal) = &mut model.placement_modal {
+                    modal.step(*index, *direction);
+                }
+                model.focus = None;
+            }
+            UiAction::ApplyPlacement(send) => {
+                let snapshot = if runtime.destination == Destination::Remote {
+                    network.snapshot.as_ref()
+                } else {
+                    Some(&runtime.snapshot)
+                };
+                if let Some(snapshot) = snapshot {
+                    actions.0.extend(model.apply_placement(snapshot, *send));
+                }
+            }
             UiAction::Runtime(action) => {
                 model.focus = None;
                 model.dropdown = None;
@@ -1013,11 +1092,11 @@ fn text_input(
             continue;
         }
         model.revision = model.revision.wrapping_add(1);
-        if key.logical_key == Key::Escape && (model.modal.is_some() || model.dropdown.is_some()) {
+        if key.logical_key == Key::Escape && (model.has_modal() || model.dropdown.is_some()) {
             model.close();
             continue;
         }
-        if key.logical_key == Key::Tab && model.modal.is_some() {
+        if key.logical_key == Key::Tab && model.has_modal() {
             model.focus_next();
             continue;
         }
@@ -1069,13 +1148,14 @@ fn text_input(
                 Key::Escape => actions.0.push_back(Action::StopAll),
                 Key::Space
                     if runtime.destination == Destination::Local
-                        && model.modal.is_none()
+                        && !model.has_modal()
                         && model.dropdown.is_none() =>
                 {
                     if let Some(index) = model.visible(&runtime.catalog.clips).first() {
-                        actions.0.push_back(Action::Play(
-                            runtime.catalog.clips[*index].identity.clone(),
-                        ));
+                        let scope = PlacementScope::from_snapshot(false, &runtime.snapshot);
+                        let clip_id = runtime.catalog.clips[*index].identity.clone();
+                        model.sync_placements(Some(scope));
+                        actions.0.push_back(model.play_action(&clip_id));
                     }
                 }
                 _ => (),
@@ -1118,12 +1198,12 @@ fn scroll(
         position.y = model.scroll;
     }
     // Clamp modal bounds on resize even when no wheel message arrives.
-    if let Some(modal) = &mut model.modal {
+    if let Some(scroll) = model.modal_scroll() {
         for (node, mut position) in &mut bodies {
             let maximum =
                 ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
-            modal.scroll = modal.scroll.clamp(0., maximum);
-            position.y = modal.scroll;
+            *scroll = scroll.clamp(0., maximum);
+            position.y = *scroll;
         }
     }
     for event in wheel.read() {
@@ -1134,12 +1214,12 @@ fn scroll(
             bevy::input::mouse::MouseScrollUnit::Line => event.y * 40.,
             bevy::input::mouse::MouseScrollUnit::Pixel => event.y / scale_factor,
         };
-        if let Some(modal) = &mut model.modal {
+        if let Some(scroll) = model.modal_scroll() {
             for (node, mut position) in &mut bodies {
                 let maximum =
                     ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
-                modal.scroll = (position.y - delta).clamp(0., maximum);
-                position.y = modal.scroll;
+                *scroll = (position.y - delta).clamp(0., maximum);
+                position.y = *scroll;
             }
         } else if delta != 0. {
             model.dropdown = None;

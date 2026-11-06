@@ -179,7 +179,7 @@ fn pressed_stop_all_button_routes_to_shared_host_and_truthful_request_status() {
     runtime.host = crate::host::Host::new("ui-test".into(), catalog.clone());
     runtime.destination = Destination::Local;
     let envelope = crate::commands::Envelope {
-        protocol_version: 1,
+        protocol_version: crate::commands::PROTOCOL_VERSION,
         session_id: "ui-test".into(),
         command_id: "play".into(),
         catalog_revision: catalog.revision.clone(),
@@ -898,4 +898,349 @@ fn scrollbar_grab_preserves_offset_and_tracks_fractional_motion() {
     let moved = app.world().get::<ScrollPosition>(body).unwrap().y;
     assert!(moved > grabbed);
     assert!(moved.fract() > 0.);
+}
+
+/// Create the real mixed-media catalog with matching local host/session identities.
+fn placement_runtime() -> Runtime {
+    let mut runtime = Runtime::new(&config()).unwrap();
+    runtime.catalog = std::sync::Arc::new(
+        crate::catalog::load_local(&crate::app::resource_root().join("sample-packs/podcast-pack"))
+            .unwrap(),
+    );
+    runtime.host = crate::host::Host::new("placement-ui".into(), runtime.catalog.clone());
+    runtime.snapshot = runtime.host.snapshot();
+    runtime.destination = Destination::Local;
+    runtime
+}
+
+/// Select a real visual clip rather than assuming fixture ordering.
+fn visual_clip(runtime: &Runtime) -> &Clip {
+    runtime
+        .catalog
+        .clips
+        .iter()
+        .find(|clip| crate::host::Host::default_placement(clip).is_some())
+        .unwrap()
+}
+
+/// Strict decimal parsing preserves basis points and rejects non-finite or out-of-range input.
+#[test]
+fn placement_percentages_are_finite_bounded_and_exact() {
+    for (text, expected) in [("0.01", 1), ("2.5", 250), ("33.33", 3333), ("100", 10000)] {
+        assert_eq!(PlacementModal::percentage(text, true), Some(expected));
+    }
+    assert_eq!(PlacementModal::percentage("0", false), Some(0));
+    for text in [
+        "0", "-1", "NaN", "inf", "1e1", "100.01", "0.001", "", "1.2.3", "65535",
+    ] {
+        assert_eq!(PlacementModal::percentage(text, true), None, "{text}");
+    }
+}
+
+/// Apply changes all live copies of a clip, excludes stopping/history, and remembers future plays.
+#[test]
+fn placement_apply_updates_live_occurrences_without_playing_another_copy() {
+    use crate::commands::{InstanceSnapshot, InstanceState};
+    let mut runtime = placement_runtime();
+    let clip = visual_clip(&runtime).clone();
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut model = Model::default();
+    model.sync_placements(PlacementScope::current(&runtime, &network));
+    for (index, state) in [
+        InstanceState::Preparing,
+        InstanceState::Playing,
+        InstanceState::Stopping,
+        InstanceState::Finished,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime.snapshot.instances.push(InstanceSnapshot {
+            instance_id: format!("copy-{index}"),
+            clip_id: clip.identity.clone(),
+            generation: index as u64,
+            state,
+            placement: None,
+        });
+    }
+    runtime.snapshot.instances.push(InstanceSnapshot {
+        instance_id: "other".into(),
+        clip_id: "different/clip".into(),
+        generation: 9,
+        state: InstanceState::Playing,
+        placement: None,
+    });
+    model.open_placement(&clip.identity, &runtime, &network);
+    model.placement_modal.as_mut().unwrap().editors[0].text = "33.33".into();
+    let actions = model.apply_placement(&runtime.snapshot, false);
+    assert_eq!(actions.len(), 2);
+    for (index, action) in actions.iter().enumerate() {
+        assert!(
+            matches!(action, Action::SetVisual { instance_id, placement: Some(value) } if instance_id == &format!("copy-{index}") && value.width_bps == 3333)
+        );
+    }
+    assert!(model.placement_modal.is_none());
+    assert!(
+        matches!(model.play_action(&clip.identity), Action::PlayVisual { placement, .. } if placement.width_bps == 3333)
+    );
+}
+
+/// Invalid drafts emit nothing; Cancel also discards a pending Reset without touching remembered values.
+#[test]
+fn placement_validation_and_cancel_never_mutate_committed_values() {
+    let runtime = placement_runtime();
+    let clip = visual_clip(&runtime);
+    let defaults = crate::host::Host::default_placement(clip).unwrap();
+    let changed = VisualPlacement {
+        width_bps: 2345,
+        ..defaults
+    };
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut model = Model::default();
+    model.placements.insert(clip.identity.clone(), changed);
+    model.open_placement(&clip.identity, &runtime, &network);
+    model.placement_modal.as_mut().unwrap().editors[2].text = "NaN".into();
+    assert!(model.apply_placement(&runtime.snapshot, true).is_empty());
+    assert!(model.placement_modal.as_ref().unwrap().error.is_some());
+    assert_eq!(model.placements[&clip.identity], changed);
+    model.placement_modal.as_mut().unwrap().reset();
+    model.close();
+    assert_eq!(model.placements[&clip.identity], changed);
+}
+
+/// Reset is explicit: apply clears active overrides, and Send uses the original catalog playback path.
+#[test]
+fn placement_reset_and_send_restore_catalog_defaults() {
+    use crate::commands::{InstanceSnapshot, InstanceState};
+    let mut runtime = placement_runtime();
+    let clip = visual_clip(&runtime).clone();
+    let defaults = crate::host::Host::default_placement(&clip).unwrap();
+    let changed = VisualPlacement {
+        width_bps: 2345,
+        ..defaults
+    };
+    runtime.snapshot.instances.push(InstanceSnapshot {
+        instance_id: "live".into(),
+        clip_id: clip.identity.clone(),
+        generation: 1,
+        state: InstanceState::Playing,
+        placement: Some(changed),
+    });
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut model = Model::default();
+    model.placements.insert(clip.identity.clone(), changed);
+    model.open_placement(&clip.identity, &runtime, &network);
+    model.placement_modal.as_mut().unwrap().reset();
+    let actions = model.apply_placement(&runtime.snapshot, true);
+    assert!(
+        matches!(&actions[0], Action::SetVisual { instance_id, placement: None } if instance_id == "live")
+    );
+    assert!(matches!(&actions[1], Action::Play(id) if id == &clip.identity));
+    assert!(model.placements.is_empty());
+    assert_eq!(crate::host::Host::default_placement(&clip), Some(defaults));
+}
+
+/// A normal Send commits the edited percentages and appends exactly one adjusted play.
+#[test]
+fn placement_send_uses_the_validated_draft() {
+    let runtime = placement_runtime();
+    let clip = visual_clip(&runtime);
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut model = Model::default();
+    model.open_placement(&clip.identity, &runtime, &network);
+    model.placement_modal.as_mut().unwrap().editors[1].text = "12.34".into();
+    let actions = model.apply_placement(&runtime.snapshot, true);
+    assert!(
+        matches!(actions.as_slice(), [Action::PlayVisual { clip_id, placement }] if clip_id == &clip.identity && placement.x_bps == 1234)
+    );
+}
+
+/// Active authoritative state wins over a controller's stale remembered draft; audio has no editor.
+#[test]
+fn placement_editor_uses_authoritative_active_state_and_excludes_audio() {
+    use crate::commands::{InstanceSnapshot, InstanceState};
+    let mut runtime = placement_runtime();
+    let clip = visual_clip(&runtime).clone();
+    let defaults = crate::host::Host::default_placement(&clip).unwrap();
+    let current = VisualPlacement {
+        width_bps: 7654,
+        ..defaults
+    };
+    let stale = VisualPlacement {
+        width_bps: 1234,
+        ..defaults
+    };
+    runtime.snapshot.instances.push(InstanceSnapshot {
+        instance_id: "other-controller".into(),
+        clip_id: clip.identity.clone(),
+        generation: 1,
+        state: InstanceState::Playing,
+        placement: Some(current),
+    });
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut model = Model::default();
+    model.placements.insert(clip.identity.clone(), stale);
+    model.open_placement(&clip.identity, &runtime, &network);
+    assert_eq!(
+        model.placement_modal.as_ref().unwrap().placement().unwrap(),
+        current
+    );
+    assert!(!model.allows(&UiAction::Play(clip.identity.clone())));
+    assert!(model.allows(&UiAction::Runtime(Action::StopAll)));
+    model.close();
+    let audio = runtime
+        .catalog
+        .clips
+        .iter()
+        .find(|clip| crate::host::Host::default_placement(clip).is_none())
+        .unwrap();
+    model.open_placement(&audio.identity, &runtime, &network);
+    assert!(model.placement_modal.is_none());
+}
+
+/// Destination, host lifetime, revision and disconnection each invalidate session-only overrides.
+#[test]
+fn placement_adjustments_never_cross_destination_session_or_revision() {
+    let runtime = placement_runtime();
+    let clip = visual_clip(&runtime);
+    let defaults = crate::host::Host::default_placement(clip).unwrap();
+    let original = PlacementScope::from_snapshot(false, &runtime.snapshot);
+    for scope in [
+        Some(PlacementScope {
+            remote: true,
+            ..original.clone()
+        }),
+        Some(PlacementScope {
+            session: "next-session".into(),
+            ..original.clone()
+        }),
+        Some(PlacementScope {
+            revision: "next-revision".into(),
+            ..original.clone()
+        }),
+        None,
+    ] {
+        let mut model = Model::default();
+        model.sync_placements(Some(original.clone()));
+        model.placements.insert(clip.identity.clone(), defaults);
+        model.placement_order.push_back(clip.identity.clone());
+        model.placement_modal = Some(PlacementModal::new(
+            clip.identity.clone(),
+            clip.metadata.title.clone(),
+            defaults,
+            defaults,
+        ));
+        model.focus = Some(Field::Placement(0));
+        model.sync_placements(scope);
+        assert!(model.placements.is_empty());
+        assert!(model.placement_order.is_empty());
+        assert!(model.placement_modal.is_none());
+        assert!(model.focus.is_none());
+    }
+}
+
+/// Large local catalogs cannot grow the experimental remembered adjustments without bound.
+#[test]
+fn placement_override_storage_evicts_the_oldest_applied_clip() {
+    let runtime = placement_runtime();
+    let clip = visual_clip(&runtime);
+    let defaults = crate::host::Host::default_placement(clip).unwrap();
+    let mut model = Model::default();
+    for index in 0..257 {
+        model.placement_modal = Some(PlacementModal::new(
+            format!("pack/clip-{index}"),
+            "Clip".into(),
+            defaults,
+            defaults,
+        ));
+        model.apply_placement(&runtime.snapshot, false);
+    }
+    assert_eq!(model.placements.len(), 256);
+    assert_eq!(model.placement_order.len(), 256);
+    assert!(!model.placements.contains_key("pack/clip-0"));
+    assert!(model.placements.contains_key("pack/clip-256"));
+}
+
+/// Remote editing uses host-supplied placement defaults instead of reconstructing local catalog metadata.
+#[test]
+fn placement_remote_defaults_and_reset_come_from_the_host_projection() {
+    let mut runtime = placement_runtime();
+    runtime.destination = Destination::Remote;
+    let remote_defaults = VisualPlacement {
+        width_bps: 4321,
+        x_bps: 2345,
+        y_bps: 6789,
+    };
+    let mut network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    network.connected = true;
+    network.snapshot = Some(runtime.snapshot.clone());
+    network.remote_catalog = Some(crate::network_app::RemoteCatalogView {
+        pack_id: "remote".into(),
+        title: "Host pack".into(),
+        revision: runtime.snapshot.catalog_revision.clone(),
+        clips: vec![crate::network_app::RemoteClip {
+            clip_id: "remote/visual".into(),
+            title: "Remote visual".into(),
+            tags: Vec::new(),
+            category: "reactions".into(),
+            media_type: "gif".into(),
+            default_placement: Some(remote_defaults),
+        }],
+    });
+    let mut model = Model::default();
+    model.sync_placements(PlacementScope::current(&runtime, &network));
+    model.open_placement("remote/visual", &runtime, &network);
+    let modal = model.placement_modal.as_mut().unwrap();
+    assert_eq!(modal.placement().unwrap(), remote_defaults);
+    modal.step(0, 1);
+    modal.reset();
+    assert_eq!(modal.placement().unwrap(), remote_defaults);
+    assert!(
+        matches!(model.apply_placement(network.snapshot.as_ref().unwrap(), true).as_slice(), [Action::Play(id)] if id == "remote/visual")
+    );
+}
+
+/// Keyboard edits remain isolated, and pointer nudges clamp to the same validated percentage range.
+#[test]
+fn placement_fields_route_keyboard_input_and_nudges_preserve_bounds() {
+    let (mut app, window) = input_app();
+    let defaults = VisualPlacement {
+        width_bps: 1,
+        x_bps: 0,
+        y_bps: 10000,
+    };
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        model.placement_modal = Some(PlacementModal::new(
+            "test/clip".into(),
+            "Test clip".into(),
+            defaults,
+            defaults,
+        ));
+        model.focus = Some(Field::Placement(0));
+        model.placement_modal.as_mut().unwrap().editors[0].select_all = true;
+    }
+    key(
+        &mut app,
+        window,
+        Key::Character("33.33".into()),
+        KeyCode::Digit3,
+        Some("33.33"),
+    );
+    app.update();
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        let modal = model.placement_modal.as_mut().unwrap();
+        assert_eq!(modal.placement().unwrap().width_bps, 3333);
+        modal.reset();
+        modal.step(0, -1);
+        modal.step(1, -1);
+        modal.step(2, 1);
+        assert_eq!(modal.placement().unwrap(), defaults);
+    }
+    assert!(app.world().resource::<Actions>().0.is_empty());
+    key(&mut app, window, Key::Escape, KeyCode::Escape, None);
+    app.update();
+    assert!(app.world().resource::<Model>().placement_modal.is_none());
+    assert!(app.world().resource::<Actions>().0.is_empty());
 }

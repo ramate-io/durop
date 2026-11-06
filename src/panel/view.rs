@@ -196,11 +196,10 @@ impl View<'_> {
         layout: GridLayout,
         status: &str,
         stop: Option<&str>,
+        editable: bool,
     ) {
         parent
             .spawn((
-                Button,
-                UiAction::Runtime(Action::Play(clip.identity.clone())),
                 Node {
                     width: px(layout.card_width),
                     height: px(layout.card_height),
@@ -221,6 +220,8 @@ impl View<'_> {
             ))
             .with_children(|card| {
                 card.spawn((
+                    Button,
+                    UiAction::Play(clip.identity.clone()),
                     Node {
                         width: percent(100),
                         height: px(layout.preview_height),
@@ -298,10 +299,45 @@ impl View<'_> {
                             },
                         ))
                         .with_children(|stop| self.label(stop, "STOP", 9., PAPER));
-                    } else {
-                        self.label(row, status, 9., PURPLE);
                     }
+                    if editable {
+                        self.card_control(
+                            row,
+                            "Edit",
+                            UiAction::EditPlacement(clip.identity.clone()),
+                            false,
+                        );
+                    }
+                    self.card_control(row, status, UiAction::Play(clip.identity.clone()), true);
                 });
+            });
+    }
+
+    /// Keep card actions distinct and compact enough for narrow collection columns.
+    fn card_control(
+        &self,
+        parent: &mut ChildSpawnerCommands,
+        label: &str,
+        action: UiAction,
+        primary: bool,
+    ) {
+        parent
+            .spawn((
+                Button,
+                action,
+                Node {
+                    padding: UiRect::axes(px(6), px(2)),
+                    border_radius: BorderRadius::all(px(3)),
+                    ..default()
+                },
+                BackgroundColor(if primary { PURPLE } else { BACKGROUND }),
+                HoverColors {
+                    resting: if primary { PURPLE } else { BACKGROUND },
+                    hovered: RULE,
+                },
+            ))
+            .with_children(|button| {
+                self.label(button, label, 9., if primary { PAPER } else { INK })
             });
     }
 
@@ -429,6 +465,68 @@ impl View<'_> {
         if let Some(error) = &modal.error {
             self.label(dialog, error, 12., PURPLE);
         }
+    }
+
+    /// Edit one clip's visual placement while preserving modal scrolling and stop access.
+    fn placement_modal(
+        &self,
+        root: &mut ChildSpawnerCommands,
+        modal: &PlacementModal,
+        focus: Option<Field>,
+    ) {
+        root.spawn((Button, UiAction::Cancel, Node {
+            position_type: PositionType::Absolute, left: px(0), top: px(0),
+            width: percent(100), height: percent(100),
+            align_items: AlignItems::Center, justify_content: JustifyContent::Center,
+            padding: UiRect::all(px(20)), ..default()
+        }, BackgroundColor(Color::srgba(0.102, 0.102, 0.102, 0.48)), GlobalZIndex(100), FocusPolicy::Block))
+        .with_children(|backdrop| {
+            backdrop.spawn((Node {
+                width: px(650), max_width: percent(100), max_height: percent(100),
+                padding: UiRect::all(px(24)), border: UiRect::all(px(1)),
+                border_radius: BorderRadius::all(px(10)), flex_direction: FlexDirection::Column,
+                row_gap: px(16), ..default()
+            }, BackgroundColor(PAPER), BorderColor::all(RULE), FocusPolicy::Block))
+            .with_children(|dialog| {
+                self.label(dialog, "VISUAL PLACEMENT · EXPERIMENTAL", 10., PURPLE);
+                dialog.spawn((Text::new(format!("Edit {}", modal.title)), self.fonts.display(26.), TextColor(INK)));
+                self.label(dialog, &modal.clip_id, 10., MUTED);
+                dialog.spawn((ModalBody, ScrollPosition(Vec2::new(0., modal.scroll)), Node {
+                    width: percent(100), min_height: px(0), overflow: Overflow::scroll_y(), ..default()
+                })).with_children(|body| {
+                    body.spawn(Node { width: percent(100), flex_direction: FlexDirection::Column, row_gap: px(14), flex_shrink: 0., ..default() })
+                    .with_children(|fields| {
+                        self.label(fields, "Percentages use the host display. Position keeps media on screen.", 11., MUTED);
+                        for (index, label) in ["Scale (% of host width)", "Horizontal (% left → right)", "Vertical (% top → bottom)"].into_iter().enumerate() {
+                            self.label(fields, label, 11., MUTED);
+                            let selected = focus == Some(Field::Placement(index));
+                            let editor = &modal.editors[index];
+                            fields.spawn(Node { width: percent(100), column_gap: px(8), ..default() }).with_children(|row| {
+                                self.button(row, "−", UiAction::StepPlacement(index, -1), false);
+                                row.spawn((Button, UiAction::Focus(Field::Placement(index)), Node {
+                                    flex_grow: 1., min_width: px(0), min_height: px(42), padding: UiRect::axes(px(14), px(10)),
+                                    border: UiRect::all(px(1)), border_radius: BorderRadius::all(px(5)), overflow: Overflow::clip(), ..default()
+                                }, BackgroundColor(BACKGROUND), BorderColor::all(if selected { PURPLE } else { RULE }),
+                                HoverColors { resting: BACKGROUND, hovered: PAPER }))
+                                .with_children(|input| self.label(input, if selected { editor.label() } else { editor.text.clone() }, 12., INK));
+                                self.button(row, "+", UiAction::StepPlacement(index, 1), false);
+                            });
+                        }
+                        self.label(fields, "Apply updates active plays and remembers this session. Send also requests playback.", 11., MUTED);
+                        if modal.reset && modal.placement().ok() == Some(modal.defaults) { self.label(fields, "Catalog defaults selected. Apply or Send to restore them.", 11., GREEN); }
+                        if let Some(error) = &modal.error { self.label(fields, error, 11., PURPLE); }
+                    });
+                });
+                dialog.spawn(Node { width: percent(100), column_gap: px(8), row_gap: px(8), flex_wrap: FlexWrap::Wrap, flex_shrink: 0., ..default() })
+                .with_children(|footer| {
+                    self.button(footer, "Reset to defaults", UiAction::ResetPlacement, false);
+                    self.button(footer, "Cancel", UiAction::Cancel, false);
+                    self.button(footer, "Apply", UiAction::ApplyPlacement(false), false);
+                    self.button(footer, "Send →", UiAction::ApplyPlacement(true), true);
+                    self.button(footer, "STOP ALL", UiAction::Runtime(Action::StopAll), false);
+                });
+            });
+        });
     }
 
     /// Render provider-specific fields over a focus-blocking, dimmed collection.
@@ -588,6 +686,7 @@ pub(super) fn render(
     fonts: Res<Fonts>,
     primary: Single<&Window, With<PrimaryWindow>>,
 ) {
+    model.sync_placements(PlacementScope::current(&runtime, &network));
     let remote = runtime.destination == Destination::Remote;
     let compact = primary.width() < 760.;
     let provider_width = ((primary.width() - 70.) * 0.5).max(150.);
@@ -972,6 +1071,22 @@ pub(super) fn render(
                                                 status,
                                                 active
                                                     .map(|instance| instance.instance_id.as_str()),
+                                                if remote {
+                                                    network
+                                                        .remote_catalog
+                                                        .as_ref()
+                                                        .and_then(|catalog| {
+                                                            catalog.clips.iter().find(|remote| {
+                                                                remote.clip_id == clip.identity
+                                                            })
+                                                        })
+                                                        .is_some_and(|remote| {
+                                                            remote.default_placement.is_some()
+                                                        })
+                                                } else {
+                                                    crate::host::Host::default_placement(clip)
+                                                        .is_some()
+                                                },
                                             );
                                         }
                                     });
@@ -1068,6 +1183,9 @@ pub(super) fn render(
             });
         if let Some(modal) = &model.modal {
             view.modal(parent, modal, model.focus, &network, &runtime);
+        }
+        if let Some(modal) = &model.placement_modal {
+            view.placement_modal(parent, modal, model.focus);
         }
     });
 }

@@ -172,3 +172,119 @@ async fn cancelling_gap_recovery_accepts_late_snapshot_before_next_reply() {
     client.disconnect().await;
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn visual_commands_and_events_roundtrip_without_losing_reset() {
+    use durop_protocol::{EventKind, VisualPlacement};
+    let placement = VisualPlacement {
+        width_bps: 3200,
+        x_bps: 1000,
+        y_bps: 9000,
+    };
+    let commands = [
+        PlaybackCommand::PlayVisual {
+            clip_id: "pack/clip".into(),
+            placement,
+        },
+        PlaybackCommand::SetVisual {
+            instance_id: "session:1".into(),
+            placement: Some(placement),
+        },
+        PlaybackCommand::SetVisual {
+            instance_id: "session:1".into(),
+            placement: None,
+        },
+    ];
+    let expected = commands.clone();
+    let (listener, address) = fake_host().await;
+    let server = tokio::spawn(async move {
+        let mut socket = accept(listener).await;
+        for (index, command) in expected.into_iter().enumerate() {
+            let message = socket.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_eq!(
+                request["envelope"]["command"],
+                serde_json::to_value(command).unwrap()
+            );
+            let event = HostEvent {
+                sequence: index as u64 + 1,
+                instance_id: Some("session:1".into()),
+                event: EventKind::VisualChanged {
+                    placement: if index == 2 { None } else { Some(placement) },
+                },
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"type":"event","event":event})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket.send(Message::Text(serde_json::json!({"type":"outcome","command_id":index.to_string(),"outcome":CommandOutcome::Accepted { instance_id: Some("session:1".into()) }}).to_string().into())).await.unwrap();
+        }
+        let _ = socket.next().await;
+    });
+    let mut client = ControllerClient::connect_loopback(
+        address,
+        SessionCredential::from_secret("a".repeat(64)).unwrap(),
+    )
+    .await
+    .unwrap();
+    for (index, command) in commands.into_iter().enumerate() {
+        client
+            .command(index.to_string(), "revision".into(), command)
+            .await
+            .unwrap();
+        let ControllerUpdate::Event(event) = client.next_update().await.unwrap() else {
+            panic!("expected visual event")
+        };
+        assert_eq!(
+            event.event,
+            EventKind::VisualChanged {
+                placement: if index == 2 { None } else { Some(placement) }
+            }
+        );
+    }
+    client.disconnect().await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_visual_event_bounds_disconnect_the_controller() {
+    let (listener, address) = fake_host().await;
+    let server = tokio::spawn(async move {
+        let mut socket = accept(listener).await;
+        socket.send(Message::Text(serde_json::json!({"type":"event","event":{"sequence":1,"instanceId":"session:1","event":{"type":"visual_changed","placement":{"widthBps":0,"xBps":0,"yBps":0}}}}).to_string().into())).await.unwrap();
+        let _ = socket.next().await;
+    });
+    let mut client = ControllerClient::connect_loopback(
+        address,
+        SessionCredential::from_secret("a".repeat(64)).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        client.next_update().await,
+        Err(ControllerError::Protocol)
+    ));
+    assert!(!client.is_connected());
+    server.await.unwrap();
+}
+
+#[test]
+fn invalid_visual_snapshot_bounds_are_rejected_before_state_replacement() {
+    let mut snapshot = snapshot(0);
+    snapshot.instances.push(durop_protocol::InstanceSnapshot {
+        instance_id: "session:1".into(),
+        clip_id: "pack/clip".into(),
+        generation: 1,
+        state: durop_protocol::InstanceState::Playing,
+        placement: Some(durop_protocol::VisualPlacement {
+            width_bps: 1,
+            x_bps: 10_001,
+            y_bps: 0,
+        }),
+    });
+    assert!(!Packet::Snapshot { snapshot }.has_valid_placement());
+}
