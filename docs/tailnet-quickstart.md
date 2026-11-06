@@ -9,10 +9,13 @@ covers complete-policy ownership, credentials, durable state and recovery.
 
 1. Select your existing tailnet in the [Tailscale admin console](https://login.tailscale.com/admin).
    Install and sign into the [Tailscale macOS app](https://tailscale.com/docs/install/mac)
-   on each Mac; approve devices when required. Keep laptops owned by their users.
+   on each Mac; approve devices when required. Keep laptops owned by their users;
+   guests can remain signed into their own tailnets.
 2. Ensure policy permits intended controllers to reach the playback Mac on TCP
-   **48732**, with authorized and unauthorized policy tests. Existing broader
-   grants still apply. If policy already allows this, skip provisioning.
+   **48732**, with authorized and unauthorized policy tests. For device-share
+   guests, include the sample's `autogroup:shared` → `durop-host` grant for
+   `tcp:48732`; a same-tailnet user group alone does not cover shared guests.
+   Existing broader grants still apply. If policy already allows this, skip provisioning.
 3. For policy changes, export and privately back up the **complete** current
    policy first. Create `infra/cdktn/tailscale/network.config.json` containing
    `{"policy": <complete ordinary JSON policy object>}`; preserve unrelated rules.
@@ -53,15 +56,19 @@ nix develop --command cargo run -p durop --bin durop --locked
 ```
 
 1. In **To**, choose the local display. In **Catalog**, choose the clips to play.
-2. In **From**, enable local controls and/or remote controllers. Both can remain
-   enabled together. Enable remote access using this Mac's Tailscale address and
-   TCP 48732; Durop verifies the address belongs to the local enrolled node.
-3. Use **From → Remote controllers** to invite an intended user. The host needs
-   its own user-owned `TAILSCALE_API_KEY`, supplied in the host process environment
-   or through the UI's secure credential storage. A repository `.env` is loaded
-   by the infrastructure manager only; it does not export variables into Durop.
-   An invitation joins the network; share the separately generated Durop session
-   pairing credential privately with that controller.
+2. In **From**, local controls and remote controllers can remain enabled together.
+   Enter this Mac's Tailscale address and TCP 48732, then **Enable remote listener**.
+   Durop verifies the address belongs to the local enrolled node.
+3. Enter **New controller name** and choose **Add controller + create pairing token**.
+   If that user needs network access, choose **Create network invitation** on
+   their card. This shares only this host device with that user; it does not
+   make them a member of the host's tailnet. The host needs its own user-owned
+   `TAILSCALE_API_KEY` from its process environment or the UI's secure credential
+   storage. Root `.env` is read by the infrastructure manager only; it does not
+   export variables into Durop.
+4. Choose **Copy invitation link + pairing details**, or **Copy Durop pairing
+   details** when no invitation is needed. Send these privately to that controller.
+   Each named controller has a separate Durop token.
 
 Keep invitation and pairing credentials out of recordings. The administrator's
 OAuth policy credential, the host's invitation API token, Tailscale device login,
@@ -70,8 +77,9 @@ excludes `TAILSCALE_API_KEY` from its provider environment.
 
 ## Controller: connect to the host
 
-Accept the host's invitation when needed, install Tailscale and sign into the
-same tailnet. Run Durop in controller mode:
+Accept the host's device-share invitation when needed, install Tailscale and
+sign into your own account. Shared guests can stay in their own tailnets; users
+already authorized in the host's tailnet need no share. Run Durop in controller mode:
 
 ```sh
 nix develop --command cargo run -p durop --bin durop --locked -- --mode controller
@@ -81,8 +89,19 @@ In **To**, choose the remote host, enter its Tailscale address and **Durop sessi
 pairing credential**, then connect. Do not enter a Tailscale API key or OAuth
 secret in the pairing field. The remote host supplies the catalog and playback
 state; media plays on the host's display. Try a clip, its Stop action and
-**STOP ALL**. On the host revoke remote access and verify commands stop; enabling
-sharing again requires a fresh pairing credential.
+**STOP ALL**. On the host use the controller card's **Disable** or **Revoke
+controller** and verify that controller's commands stop. Disable preserves its
+token for re-enabling; revocation removes it. Revoke and add the controller again,
+or restart the host app and add it, to issue a new token. **Disable remote
+listener** stops all remote access but retains individual tokens for re-enabling
+during this app run. Removing Durop permission does not remove accepted Tailscale
+device sharing; manage that separately in Tailscale administration.
+
+The narrow shared-user grant permits accepted sharing recipients to reach the
+Durop port on this host. It does not share other devices or replace the separate
+Durop authentication step. Both sides' custom network policies can affect access.
+See Tailscale's [device sharing guide](https://tailscale.com/docs/features/sharing)
+and [inviting versus sharing](https://tailscale.com/docs/reference/inviting-vs-sharing).
 
 For connectivity checks, both Nix shells include `tailscale`. On macOS that
 open-source CLI may target a different daemon from the installed GUI app. Use

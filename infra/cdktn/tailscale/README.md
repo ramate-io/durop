@@ -73,6 +73,13 @@ TCP 48732 grants with authorized and unauthorized tests. The example configurati
 is suitable only for a dedicated test tailnet; replacing a real policy with it
 would remove unrelated access. Existing broad grants remain effective.
 
+The dedicated sample includes both a same-tailnet controller group and a narrow
+`autogroup:shared` → `durop-host` / `tcp:48732` grant. The latter covers users who
+accepted a share of this device; the group alone does not admit shared guests.
+It grants only the Durop port on the named host and does not share additional
+devices. Review any broader rules in both tailnets and test with a real recipient.
+See Tailscale's [sharing/access-control guidance](https://tailscale.com/docs/features/sharing).
+
 The `tailscale_acl` resource owns the whole policy. Synthesis preserves every
 supplied policy section; it never fetches or merges the live document. Local
 validation checks shapes, identities, IP/CIDR addresses, selectors and ports;
@@ -109,12 +116,13 @@ Malformed files fail without echoing their contents. Copy `.env.example` as a
 starting point and keep secret files outside Git. Avoid secrets in arguments,
 recorded terminal input or generated policy JSON.
 
-The host's user-owned `TAILSCALE_API_KEY` is solely for its invitation UI, supplied
+The host's user-owned `TAILSCALE_API_KEY` is solely for its device-share invitation UI, supplied
 through the host's environment or secure UI storage. The manager removes it
 before invoking dependencies or the provider to avoid conflicting authentication.
 It never substitutes that token for OAuth credentials. Device enrollment uses
-Tailscale login; Durop pairing uses an ephemeral application credential generated
-by the running host. Neither is produced by infrastructure provisioning.
+Tailscale login; Durop pairing uses a separate runtime credential per named
+controller. Disabling a source or the listener retains that token until revoked
+or the host app exits. Neither is produced by infrastructure provisioning.
 
 ## Persistent state, review and apply
 
