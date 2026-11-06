@@ -179,6 +179,12 @@ enum UiAction {
     AddController,
     /// Transfer the masked draft to the secure credential store asynchronously.
     SaveAdminSecret,
+    /// Select a source form without changing that source's permission.
+    SelectSource(SourceSelection),
+    /// Return from an uncommitted new-source draft without creating a controller.
+    CancelSource,
+    /// Expand one optional host setting inside the selected remote source.
+    SourceDetails(SourceDetails),
 }
 
 /// Header menu whose choices configure a host or catalog provider.
@@ -209,7 +215,63 @@ enum ModalDraft {
     /// Provider edits become effective only after a validated Apply.
     Configuration(ConfigurationDraft),
     /// Source controls enqueue individual operations; editors hold name, API key and listener address.
-    Sources,
+    Sources(SourcesDraft),
+}
+
+/// The selected form is independent of each source's enabled permission.
+#[derive(Clone, PartialEq, Eq)]
+enum SourceSelection {
+    /// The singleton source for this Mac's buttons and shortcuts.
+    Local,
+    /// One already configured remote source, identified without its secret.
+    Remote(String),
+    /// Source-type chooser opened by the empty plus slot.
+    ChooseType,
+    /// Empty Tailscale controller form that emits no action until Add.
+    NewRemote,
+}
+
+/// Only one optional shared-host setting is expanded at a time.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SourceDetails {
+    /// Show the selected source's ordinary controls only.
+    #[default]
+    None,
+    /// Configure the shared inbound listener without changing To.
+    Listener,
+    /// Explicitly edit the host's protected Tailscale invitation credential.
+    Credentials,
+}
+
+/// Track one explicit Add until the runtime supplies the created source identity.
+struct PendingSource {
+    /// Validated name used only to recognize the result of this Add.
+    name: String,
+    /// Existing identities prevent a duplicate name from selecting an older source.
+    known_ids: Vec<String>,
+}
+
+/// Panel-only navigation and uncommitted add ownership; never grants source permission.
+struct SourcesDraft {
+    /// One currently displayed source or uncommitted provider form.
+    selection: SourceSelection,
+    /// Source to restore when the plus/type/new-source flow is canceled.
+    previous: Option<SourceSelection>,
+    /// Optional host detail opened explicitly by the user.
+    details: SourceDetails,
+    /// A queued Add awaiting a concrete runtime-owned source.
+    pending: Option<PendingSource>,
+}
+
+impl Default for SourcesDraft {
+    fn default() -> Self {
+        Self {
+            selection: SourceSelection::Local,
+            previous: None,
+            details: SourceDetails::None,
+            pending: None,
+        }
+    }
 }
 
 impl Modal {
@@ -217,7 +279,74 @@ impl Modal {
     fn provider(&self) -> Option<Provider> {
         match &self.draft {
             ModalDraft::Configuration(draft) => Some(draft.provider),
-            ModalDraft::Sources => None,
+            ModalDraft::Sources(_) => None,
+        }
+    }
+
+    /// Navigate source forms without queuing permission or creation actions.
+    fn select_source(&mut self, selection: SourceSelection) {
+        let ModalDraft::Sources(sources) = &mut self.draft else {
+            return;
+        };
+        if matches!(selection, SourceSelection::ChooseType)
+            && matches!(
+                sources.selection,
+                SourceSelection::Local | SourceSelection::Remote(_)
+            )
+        {
+            sources.previous = Some(sources.selection.clone());
+        } else if matches!(
+            selection,
+            SourceSelection::Local | SourceSelection::Remote(_)
+        ) {
+            sources.previous = None;
+        }
+        sources.selection = selection;
+        sources.details = SourceDetails::None;
+        sources.pending = None;
+        self.editors[0] = Editor::default();
+        self.editors[1] = Editor::default();
+        self.error = None;
+        self.scroll = 0.;
+    }
+
+    /// Cancel only the uncommitted plus flow and discard its sensitive or name edits.
+    fn cancel_source(&mut self) {
+        let ModalDraft::Sources(sources) = &mut self.draft else {
+            return;
+        };
+        let selection = sources.previous.take().unwrap_or(SourceSelection::Local);
+        self.select_source(selection);
+    }
+
+    /// Reveal a host setting explicitly; closing or switching always discards a key draft.
+    fn show_source_details(&mut self, details: SourceDetails) {
+        let ModalDraft::Sources(sources) = &mut self.draft else {
+            return;
+        };
+        if !matches!(sources.selection, SourceSelection::Remote(_)) {
+            return;
+        }
+        sources.details = if sources.details == details {
+            SourceDetails::None
+        } else {
+            details
+        };
+        self.editors[1] = Editor::default();
+        self.error = None;
+        self.scroll = 0.;
+    }
+
+    /// Only visible source editors can own keyboard or IME input.
+    fn source_fields(&self) -> Vec<usize> {
+        let ModalDraft::Sources(sources) = &self.draft else {
+            return vec![];
+        };
+        match (&sources.selection, sources.details) {
+            (SourceSelection::NewRemote, _) if sources.pending.is_none() => vec![0],
+            (SourceSelection::Remote(_), SourceDetails::Listener) => vec![2],
+            (SourceSelection::Remote(_), SourceDetails::Credentials) => vec![1],
+            _ => vec![],
         }
     }
 }
@@ -303,6 +432,9 @@ impl Model {
                     | UiAction::EnableListener
                     | UiAction::AddController
                     | UiAction::SaveAdminSecret
+                    | UiAction::SelectSource(_)
+                    | UiAction::CancelSource
+                    | UiAction::SourceDetails(_)
                     | UiAction::Runtime(Action::StopAll | Action::Stop(_))
             )
     }
@@ -393,7 +525,7 @@ impl Model {
     /// Open live source controls with fresh, ephemeral name and API-key editors.
     fn open_sources(&mut self, listen_address: &str) {
         self.modal = Some(Modal {
-            draft: ModalDraft::Sources,
+            draft: ModalDraft::Sources(SourcesDraft::default()),
             editors: vec![
                 Editor::default(),
                 Editor::default(),
@@ -409,6 +541,34 @@ impl Model {
         self.dropdown = None;
         self.focus = None;
         self.dragging = false;
+    }
+
+    /// Select the result of an explicit Add and recover if a selected source was revoked.
+    fn reconcile_sources(&mut self, network: &crate::network_app::NetworkState) {
+        let Some(modal) = &mut self.modal else {
+            return;
+        };
+        let ModalDraft::Sources(sources) = &mut modal.draft else {
+            return;
+        };
+        if let Some(pending) = &sources.pending {
+            if let Some(source) = network.controllers.iter().find(|source| {
+                source.name == pending.name && !pending.known_ids.contains(&source.id)
+            }) {
+                let selection = SourceSelection::Remote(source.id.clone());
+                modal.select_source(selection);
+            } else if !network.actions.iter().any(|action| {
+                matches!(action,
+                crate::network_app::NetworkAction::AddController {name} if name == &pending.name)
+            }) {
+                sources.pending = None;
+                modal.error = Some(network.status.clone());
+            }
+        } else if matches!(&sources.selection, SourceSelection::Remote(id)
+            if !network.controllers.iter().any(|source| &source.id == id))
+        {
+            modal.select_source(SourceSelection::Local);
+        }
     }
 
     /// Summarize enabled sources without implying they are mutually exclusive or connected.
@@ -459,6 +619,8 @@ impl Model {
                     if field.read_only || !field.choices.is_empty() {
                         return None;
                     }
+                } else if !modal.source_fields().contains(&index) {
+                    return None;
                 }
                 modal.editors.get_mut(index)
             }
@@ -475,7 +637,7 @@ impl Model {
                     ModalDraft::Configuration(draft) => {
                         draft.fields.get(index).is_some_and(|field| field.secret)
                     }
-                    ModalDraft::Sources => index == 1,
+                    ModalDraft::Sources(_) => index == 1,
                 })
             }
         }
@@ -494,7 +656,7 @@ impl Model {
                 .filter(|(_, field)| !field.read_only && field.choices.is_empty())
                 .map(|(index, _)| index)
                 .collect(),
-            ModalDraft::Sources => vec![0, 2, 1],
+            ModalDraft::Sources(_) => modal.source_fields(),
         };
         if fields.is_empty() {
             return;
@@ -905,15 +1067,16 @@ fn buttons(
                     && let Some(modal) = &mut model.modal
                 {
                     let restriction = match modal.provider() {
-                        Some(Provider::Host(
-                            HostProvider::Native | HostProvider::TailscaleListener,
-                        )) => Some(
-                            "This launch is controller-only. Restart Durop in local mode to play or share this Mac.",
+                        Some(Provider::Host(HostProvider::Native)) => Some(
+                            "This launch is controller-only. Restart Durop in local mode to play on this Mac.",
                         ),
                         Some(Provider::Catalog(_)) => Some(
                             "Catalog is supplied by the remote host. Restart Durop in local mode to use local catalog sources.",
                         ),
-                        Some(Provider::Host(HostProvider::Tailscale)) | None => None,
+                        Some(Provider::Host(
+                            HostProvider::Tailscale | HostProvider::TailscaleListener,
+                        ))
+                        | None => None,
                     };
                     if let Some(message) = restriction {
                         modal.error = Some(message.into());
@@ -965,12 +1128,30 @@ fn buttons(
                     }
                 }
             }
+            UiAction::SelectSource(selection) => {
+                if let Some(modal) = &mut model.modal {
+                    modal.select_source(selection.clone());
+                }
+                model.focus = None;
+            }
+            UiAction::CancelSource => {
+                if let Some(modal) = &mut model.modal {
+                    modal.cancel_source();
+                }
+                model.focus = None;
+            }
+            UiAction::SourceDetails(details) => {
+                if let Some(modal) = &mut model.modal {
+                    modal.show_source_details(*details);
+                }
+                model.focus = None;
+            }
             UiAction::Network(action) => network.actions.push_back(action.clone()),
             UiAction::EnableListener => {
                 let Some(modal) = &mut model.modal else {
                     continue;
                 };
-                if !matches!(modal.draft, ModalDraft::Sources) {
+                if !modal.source_fields().contains(&2) {
                     continue;
                 }
                 let mut context = Model::configuration_context(&runtime, &network, &monitors);
@@ -995,7 +1176,14 @@ fn buttons(
                 let Some(modal) = &mut model.modal else {
                     continue;
                 };
-                if !matches!(modal.draft, ModalDraft::Sources) {
+                let ModalDraft::Sources(sources) = &mut modal.draft else {
+                    continue;
+                };
+                if sources.selection != SourceSelection::NewRemote || sources.pending.is_some() {
+                    continue;
+                }
+                if network.controllers.len() >= 16 {
+                    modal.error = Some("At most 16 remote sources are supported. Revoke a source before adding another.".into());
                     continue;
                 }
                 let name = modal.editors[0].text.trim();
@@ -1006,6 +1194,14 @@ fn buttons(
                     );
                     continue;
                 }
+                sources.pending = Some(PendingSource {
+                    name: name.to_owned(),
+                    known_ids: network
+                        .controllers
+                        .iter()
+                        .map(|source| source.id.clone())
+                        .collect(),
+                });
                 network
                     .actions
                     .push_back(crate::network_app::NetworkAction::AddController {
@@ -1019,7 +1215,7 @@ fn buttons(
                 let Some(modal) = &mut model.modal else {
                     continue;
                 };
-                if !matches!(modal.draft, ModalDraft::Sources) {
+                if !modal.source_fields().contains(&1) {
                     continue;
                 }
                 let secret = modal.editors[1].text.trim();
