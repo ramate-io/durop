@@ -314,14 +314,23 @@ fn ten_thousand_catalog_items_render_only_visible_rows_and_search_all_fields() {
             clip
         })
         .collect();
-    assert_eq!(
-        Model::visible_indices(&clips, "sound music", 100).len(),
-        COLUMNS * ROWS
-    );
-    assert_eq!(Model::visible_indices(&clips, "sound music", 100)[0], 400);
-    assert_eq!(Model::visible_indices(&clips, "Title 9999", 0), vec![9999]);
-    assert!(Model::visible_indices(&clips, "absent", 0).is_empty());
-    assert_eq!(Model::visible_indices(&clips, "", usize::MAX).len(), 0);
+    let mut model = Model {
+        matches: clips.len(),
+        viewport_height: 450.,
+        ..default()
+    };
+    model.layout.rows = 2;
+    model.query.text = "sound music".into();
+    model.scroll = 100. * model.row_stride() + 0.5;
+    assert_eq!(model.visible(&clips).len(), model.layout.columns * 4);
+    assert_eq!(model.visible(&clips)[0], 400);
+    model.scroll = model.max_scroll();
+    assert_eq!(model.visible(&clips).last(), Some(&9999));
+    model.scroll = 0.;
+    model.query.text = "Title 9999".into();
+    assert_eq!(model.visible(&clips), vec![9999]);
+    model.query.text = "absent".into();
+    assert!(model.visible(&clips).is_empty());
 }
 
 /// Build provider inputs without touching native monitors, credentials or disk state.
@@ -415,15 +424,14 @@ fn responsive_grid_and_scrollbar_keep_large_catalogs_bounded_and_reachable() {
         matches: 10_000,
         ..default()
     };
-    model.seek_scrollbar(1.);
-    assert_eq!(model.first_row, model.max_row());
-    assert!(model.first_row > 2000);
-    model.seek_scrollbar(0.);
-    assert_eq!(model.first_row, 0);
+    model.scroll = model.max_scroll();
+    assert!(model.first_row() > 2000);
+    let (top, height) = model.thumb_geometry(500.);
+    assert_eq!(top + height, 500.);
+    assert_eq!(height, 24.);
     model.matches = 0;
-    model.seek_scrollbar(1.);
-    assert_eq!(model.first_row, 0);
-    assert_eq!(model.max_row(), 0);
+    assert_eq!(model.max_scroll(), 0.);
+    assert_eq!(model.thumb_geometry(500.), (0., 500.));
 }
 
 /// A controller-only launch cannot silently become an empty native playback host.
@@ -472,6 +480,11 @@ fn scrollbar_drag_tracks_pointer_and_modal_cancels_capture() {
         .world_mut()
         .spawn((
             Scrollbar,
+            ComputedNode {
+                size: Vec2::new(8., 500.),
+                inverse_scale_factor: 1.,
+                ..default()
+            },
             Interaction::Pressed,
             bevy::ui::RelativeCursorPosition {
                 normalized: Some(Vec2::new(0., 0.5)),
@@ -482,7 +495,7 @@ fn scrollbar_drag_tracks_pointer_and_modal_cancels_capture() {
     app.update();
     let model = app.world().resource::<Model>();
     assert!(model.dragging);
-    assert_eq!(model.first_row, model.max_row());
+    assert_eq!(model.scroll, model.max_scroll());
     app.world_mut().entity_mut(track).insert((
         Interaction::None,
         bevy::ui::RelativeCursorPosition {
@@ -491,7 +504,7 @@ fn scrollbar_drag_tracks_pointer_and_modal_cancels_capture() {
         },
     ));
     app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 0);
+    assert_eq!(app.world().resource::<Model>().scroll, 0.);
     app.world_mut()
         .resource_mut::<Model>()
         .open(Provider::Host(HostProvider::Native), &provider_context());
@@ -505,7 +518,7 @@ fn scrollbar_drag_tracks_pointer_and_modal_cancels_capture() {
     app.update();
     let model = app.world().resource::<Model>();
     assert!(!model.dragging);
-    assert_eq!(model.first_row, 0);
+    assert_eq!(model.scroll, 0.);
 }
 
 /// Catalog selection cannot switch a controller-only runtime into local playback.
@@ -545,7 +558,8 @@ fn controller_catalog_apply_preserves_remote_destination_and_draft() {
 fn modal_wheel_scroll_is_clamped_and_does_not_move_catalog_rows() {
     let mut app = App::new();
     let mut model = Model {
-        first_row: 3,
+        scroll: 903.,
+        matches: 10_000,
         ..default()
     };
     model.open(
@@ -555,7 +569,10 @@ fn modal_wheel_scroll_is_clamped_and_does_not_move_catalog_rows() {
     app.insert_resource(model)
         .add_message::<MouseWheel>()
         .add_systems(Update, scroll);
-    let window = app.world_mut().spawn(PrimaryWindow).id();
+    let window = app
+        .world_mut()
+        .spawn((PrimaryWindow, Window::default()))
+        .id();
     let body = app
         .world_mut()
         .spawn((
@@ -579,7 +596,7 @@ fn modal_wheel_scroll_is_clamped_and_does_not_move_catalog_rows() {
     app.update();
     assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 400.);
     let model = app.world().resource::<Model>();
-    assert_eq!(model.first_row, 3);
+    assert_eq!(model.scroll, 903.);
     assert_eq!(model.modal.as_ref().unwrap().scroll, 400.);
 }
 
@@ -603,18 +620,33 @@ fn short_window_cards_fit_titles_and_controls_inside_the_collection() {
     assert_eq!(GridLayout::for_window(720., 520.).preview_height, 34.);
 }
 
-/// Build the actual wheel-routing system without a renderer or native window.
-fn wheel_app(first_row: usize) -> (App, Entity) {
+/// Build the real wheel-routing system with measured viewport geometry and no renderer.
+fn wheel_app(offset: f32) -> (App, Entity, Entity) {
     let mut app = App::new();
     app.insert_resource(Model {
-        first_row,
+        scroll: offset,
         matches: 10_000,
         ..default()
     })
     .add_message::<MouseWheel>()
     .add_systems(Update, scroll);
-    let window = app.world_mut().spawn(PrimaryWindow).id();
-    (app, window)
+    let window = app
+        .world_mut()
+        .spawn((PrimaryWindow, Window::default()))
+        .id();
+    let body = app
+        .world_mut()
+        .spawn((
+            CatalogBody,
+            ComputedNode {
+                size: Vec2::new(1000., 450.),
+                inverse_scale_factor: 1.,
+                ..default()
+            },
+            ScrollPosition(Vec2::new(0., offset)),
+        ))
+        .id();
+    (app, window, body)
 }
 
 /// Send proportional wheel input through the same message path used by the desktop.
@@ -628,80 +660,45 @@ fn wheel_input(app: &mut App, window: Entity, unit: bevy::input::mouse::MouseScr
     });
 }
 
-/// Small trackpad events accumulate across frames instead of each advancing a row.
+/// Every fractional trackpad event moves the native viewport without changing virtual row origin.
 #[test]
-fn tiny_trackpad_deltas_require_a_complete_scroll_threshold() {
-    let (mut app, window) = wheel_app(0);
-    for _ in 0..119 {
+fn tiny_trackpad_deltas_scroll_immediately_in_fractional_pixels() {
+    let (mut app, window, body) = wheel_app(0.);
+    for frame in 1..=8 {
         wheel_input(
             &mut app,
             window,
             bevy::input::mouse::MouseScrollUnit::Pixel,
-            -1.,
+            -0.25,
         );
         app.update();
-        assert_eq!(app.world().resource::<Model>().first_row, 0);
-    }
-    wheel_input(
-        &mut app,
-        window,
-        bevy::input::mouse::MouseScrollUnit::Pixel,
-        -1.,
-    );
-    app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 1);
-}
-
-/// Three line-wheel units share the same deliberate threshold as trackpad pixels.
-#[test]
-fn line_wheel_units_are_normalized_before_advancing_catalog_rows() {
-    let (mut app, window) = wheel_app(0);
-    wheel_input(
-        &mut app,
-        window,
-        bevy::input::mouse::MouseScrollUnit::Line,
-        -2.,
-    );
-    app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 0);
-    wheel_input(
-        &mut app,
-        window,
-        bevy::input::mouse::MouseScrollUnit::Line,
-        -1.,
-    );
-    app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 1);
-}
-
-/// Reversing direction starts fresh rather than fighting old residual motion.
-#[test]
-fn reversing_trackpad_direction_discards_the_previous_partial_row() {
-    let (mut app, window) = wheel_app(5);
-    for delta in [-119., 119.] {
-        wheel_input(
-            &mut app,
-            window,
-            bevy::input::mouse::MouseScrollUnit::Pixel,
-            delta,
+        assert_eq!(
+            app.world().get::<ScrollPosition>(body).unwrap().y,
+            frame as f32 * 0.25
         );
-        app.update();
-        assert_eq!(app.world().resource::<Model>().first_row, 5);
+        assert_eq!(app.world().resource::<Model>().first_row(), 0);
     }
-    wheel_input(
-        &mut app,
-        window,
-        bevy::input::mouse::MouseScrollUnit::Pixel,
-        1.,
-    );
-    app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 4);
 }
 
-/// Inertial/coalesced bursts stay bounded and do not queue hidden travel for later frames.
+/// Line input has a fixed logical distance while direction changes retain every pixel.
 #[test]
-fn wheel_bursts_are_bounded_and_discard_overshoot_at_catalog_edges() {
-    let (mut app, window) = wheel_app(0);
+fn line_wheels_and_reversed_trackpad_travel_remain_continuous() {
+    let (mut app, window, body) = wheel_app(500.);
+    for (unit, delta, expected) in [
+        (bevy::input::mouse::MouseScrollUnit::Line, -2., 580.),
+        (bevy::input::mouse::MouseScrollUnit::Pixel, 0.5, 579.5),
+        (bevy::input::mouse::MouseScrollUnit::Pixel, -0.25, 579.75),
+    ] {
+        wheel_input(&mut app, window, unit, delta);
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, expected);
+    }
+}
+
+/// Coalesced and OS momentum deltas have no frame cap, inertia or deferred overshoot.
+#[test]
+fn wheel_bursts_apply_all_travel_and_clamp_only_at_content_edges() {
+    let (mut app, window, body) = wheel_app(0.);
     for _ in 0..100 {
         wheel_input(
             &mut app,
@@ -711,49 +708,64 @@ fn wheel_bursts_are_bounded_and_discard_overshoot_at_catalog_edges() {
         );
     }
     app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 2);
+    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 100_000.);
     wheel_input(
         &mut app,
         window,
         bevy::input::mouse::MouseScrollUnit::Pixel,
-        -1.,
+        -1_000_000.,
     );
     app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 2);
-    let maximum = app.world().resource::<Model>().max_row();
-    app.world_mut().resource_mut::<Model>().first_row = maximum - 1;
+    let maximum = app.world().resource::<Model>().max_scroll();
+    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, maximum);
     wheel_input(
         &mut app,
         window,
         bevy::input::mouse::MouseScrollUnit::Pixel,
-        -10000.,
+        0.5,
     );
     app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, maximum);
-    assert_eq!(app.world().resource::<Model>().wheel.pending_pixels, 0.);
-    wheel_input(
-        &mut app,
-        window,
-        bevy::input::mouse::MouseScrollUnit::Pixel,
-        119.,
+    assert_eq!(
+        app.world().get::<ScrollPosition>(body).unwrap().y,
+        maximum - 0.5
     );
     app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, maximum);
-    wheel_input(
-        &mut app,
-        window,
-        bevy::input::mouse::MouseScrollUnit::Pixel,
-        1.,
+    assert_eq!(
+        app.world().get::<ScrollPosition>(body).unwrap().y,
+        maximum - 0.5
     );
-    app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, maximum - 1);
 }
 
-/// Search edits, provider navigation and explicit scrollbar movement discard prior wheel travel.
+/// Logical viewport measurements govern bounds and changes in filtering clamp immediately.
 #[test]
-fn navigation_and_search_reset_fractional_wheel_motion() {
+fn measured_viewport_and_filter_changes_clamp_native_scroll_bounds() {
+    let (mut app, _, body) = wheel_app(1_000_000.);
+    app.world_mut().entity_mut(body).insert(ComputedNode {
+        size: Vec2::new(2000., 1067.),
+        inverse_scale_factor: 0.5,
+        ..default()
+    });
+    app.update();
+    let model = app.world().resource::<Model>();
+    assert_eq!(model.viewport_height, 533.5);
+    assert_eq!(model.max_scroll(), model.content_height() - 533.5);
+    assert_eq!(
+        app.world().get::<ScrollPosition>(body).unwrap().y,
+        model.max_scroll()
+    );
+    app.world_mut().resource_mut::<Model>().matches = 1;
+    app.update();
+    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 0.);
+    app.world_mut().resource_mut::<Model>().matches = 10_000;
+    app.update();
+    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 0.);
+}
+
+/// Search starts at the first result while a provider dialog preserves catalog position.
+#[test]
+fn search_resets_pixel_offset_and_modal_navigation_preserves_it() {
     let (mut app, window) = input_app();
-    app.world_mut().resource_mut::<Model>().wheel.pending_pixels = -119.;
+    app.world_mut().resource_mut::<Model>().scroll = 123.5;
     key(
         &mut app,
         window,
@@ -762,48 +774,128 @@ fn navigation_and_search_reset_fractional_wheel_motion() {
         Some("x"),
     );
     app.update();
-    assert_eq!(app.world().resource::<Model>().wheel.pending_pixels, 0.);
+    assert_eq!(app.world().resource::<Model>().scroll, 0.);
     let mut model = app.world_mut().resource_mut::<Model>();
-    model.wheel.pending_pixels = -119.;
-    model.seek_scrollbar(0.5);
-    assert_eq!(model.wheel.pending_pixels, 0.);
-    model.wheel.pending_pixels = -119.;
+    model.scroll = 123.5;
     model.open(
         Provider::Catalog(CatalogProvider::GitHttps),
         &provider_context(),
     );
-    assert_eq!(model.wheel.pending_pixels, 0.);
+    assert_eq!(model.scroll, 123.5);
 }
 
-/// Retina scaling changes physical deltas, not the logical distance needed for a row.
+/// Retina normalization applies equally to catalog and modal pixel deltas; lines stay logical.
 #[test]
-fn trackpad_threshold_uses_logical_pixels_on_scaled_windows() {
-    let (mut app, window) = wheel_app(0);
-    let mut native_window = Window::default();
-    native_window.resolution.set_scale_factor_override(Some(2.));
-    app.world_mut().entity_mut(window).insert(native_window);
+fn trackpad_offsets_use_logical_pixels_on_scaled_windows() {
+    let (mut app, window, body) = wheel_app(0.);
+    app.world_mut()
+        .get_mut::<Window>(window)
+        .unwrap()
+        .resolution
+        .set_scale_factor_override(Some(2.));
     wheel_input(
         &mut app,
         window,
         bevy::input::mouse::MouseScrollUnit::Pixel,
-        -120.,
+        -0.5,
     );
     app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 0);
-    wheel_input(
-        &mut app,
-        window,
-        bevy::input::mouse::MouseScrollUnit::Pixel,
-        -120.,
-    );
-    app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 1);
+    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 0.25);
     wheel_input(
         &mut app,
         window,
         bevy::input::mouse::MouseScrollUnit::Line,
-        -3.,
+        -1.,
     );
     app.update();
-    assert_eq!(app.world().resource::<Model>().first_row, 2);
+    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 40.25);
+    app.world_mut().resource_mut::<Model>().open(
+        Provider::Catalog(CatalogProvider::GitHttps),
+        &provider_context(),
+    );
+    let modal = app
+        .world_mut()
+        .spawn((
+            ModalBody,
+            ComputedNode {
+                size: Vec2::new(1000., 200.),
+                content_size: Vec2::new(1000., 1000.),
+                inverse_scale_factor: 0.5,
+                ..default()
+            },
+            ScrollPosition::default(),
+        ))
+        .id();
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Pixel,
+        -1.,
+    );
+    app.update();
+    assert_eq!(app.world().get::<ScrollPosition>(modal).unwrap().y, 0.5);
+    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 40.25);
+}
+
+/// Secondary-window and non-finite input never changes the primary collection.
+#[test]
+fn wheel_ignores_other_windows_and_nonfinite_offsets() {
+    let (mut app, window, body) = wheel_app(123.5);
+    let secondary = app.world_mut().spawn(Window::default()).id();
+    for (target, delta) in [
+        (secondary, -200.),
+        (window, f32::INFINITY),
+        (window, f32::NAN),
+    ] {
+        wheel_input(
+            &mut app,
+            target,
+            bevy::input::mouse::MouseScrollUnit::Pixel,
+            delta,
+        );
+    }
+    app.update();
+    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 123.5);
+}
+
+/// Grabbing an existing thumb retains its fractional offset until the pointer actually moves.
+#[test]
+fn scrollbar_grab_preserves_offset_and_tracks_fractional_motion() {
+    let (mut app, _, body) = wheel_app(1000.5);
+    let mut mouse = ButtonInput::<MouseButton>::default();
+    mouse.press(MouseButton::Left);
+    app.insert_resource(mouse)
+        .add_systems(Update, scrollbar.after(scroll));
+    app.update();
+    let (top, _) = app.world().resource::<Model>().thumb_geometry(500.);
+    let pointer = top + 5.;
+    let track = app
+        .world_mut()
+        .spawn((
+            Scrollbar,
+            Interaction::Pressed,
+            ComputedNode {
+                size: Vec2::new(8., 1000.),
+                inverse_scale_factor: 0.5,
+                ..default()
+            },
+            bevy::ui::RelativeCursorPosition {
+                normalized: Some(Vec2::new(0., pointer / 500. - 0.5)),
+                ..default()
+            },
+        ))
+        .id();
+    app.update();
+    let grabbed = app.world().get::<ScrollPosition>(body).unwrap().y;
+    assert!((grabbed - 1000.5).abs() < 0.05);
+    app.world_mut()
+        .entity_mut(track)
+        .insert(bevy::ui::RelativeCursorPosition {
+            normalized: Some(Vec2::new(0., (pointer + 0.25) / 500. - 0.5)),
+            ..default()
+        });
+    app.update();
+    let moved = app.world().get::<ScrollPosition>(body).unwrap().y;
+    assert!(moved > grabbed);
+    assert!(moved.fract() > 0.);
 }

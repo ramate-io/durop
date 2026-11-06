@@ -244,6 +244,7 @@ impl View<'_> {
                                 width: px(dimensions.x * scale),
                                 height: px(dimensions.y * scale),
                                 flex_shrink: 0.,
+                                flex_direction: FlexDirection::Column,
                                 ..default()
                             },
                         ));
@@ -647,13 +648,16 @@ pub(super) fn render(
         .iter()
         .filter(|clip| Model::matching(clip, &model.query.text))
         .count();
-    model.first_row = model.first_row.min(model.max_row());
+    model.layout.rows = (model.viewport_height() / model.row_stride())
+        .ceil()
+        .max(1.) as usize;
+    model.scroll = model.scroll.clamp(0., model.max_scroll());
     let signature = format!(
-        "{}|{:?}|{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{:?}|{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         model.revision,
         model.focus,
         model.dropdown,
-        model.first_row,
+        model.first_row(),
         snapshot.sequence,
         runtime.status,
         runtime.catalog.revision,
@@ -666,7 +670,9 @@ pub(super) fn render(
         primary.width(),
         primary.height(),
         model.query.label(),
-        network.hosting
+        network.hosting,
+        model.layout.rows,
+        model.viewport_height()
     );
     if signature == model.signature {
         return;
@@ -827,110 +833,150 @@ pub(super) fn render(
             })
             .with_children(|collection| {
                 collection
-                    .spawn(Node {
-                        flex_grow: 1.,
-                        flex_direction: FlexDirection::Column,
-                        row_gap: px(20),
-                        overflow: Overflow::clip(),
-                        ..default()
-                    })
-                    .with_children(|grid| {
-                        let visible = model.visible(clips);
-                        if visible.is_empty() {
-                            grid.spawn(Node {
+                    .spawn((
+                        CatalogBody,
+                        ScrollPosition(Vec2::new(0., model.scroll)),
+                        Node {
+                            flex_grow: 1.,
+                            min_width: px(0),
+                            min_height: px(0),
+                            flex_direction: FlexDirection::Column,
+                            overflow: Overflow::scroll_y(),
+                            ..default()
+                        },
+                    ))
+                    .with_children(|viewport| {
+                        // The full extent keeps native bounds stable while only nearby rows exist.
+                        viewport
+                            .spawn(Node {
                                 width: percent(100),
-                                flex_grow: 1.,
+                                height: px(model.content_height().max(model.viewport_height())),
+                                min_height: px(model.content_height().max(model.viewport_height())),
+                                flex_shrink: 0.,
                                 flex_direction: FlexDirection::Column,
-                                align_items: AlignItems::Center,
-                                justify_content: JustifyContent::Center,
-                                row_gap: px(14),
                                 ..default()
                             })
-                            .with_children(|empty| {
-                                empty.spawn((
-                                    Text::new(if runtime.loading {
-                                        "Gathering your collection…"
-                                    } else if remote && !network.connected {
-                                        "Connect your host"
-                                    } else {
-                                        "Nothing here, yet."
-                                    }),
-                                    fonts.display(28.),
-                                    TextColor(INK),
-                                ));
-                                view.label(
-                                    empty,
-                                    if remote && !network.connected {
-                                        "Choose Tailscale above to pair with a remote host."
-                                    } else {
-                                        "Try another search or choose a catalog above."
-                                    },
-                                    12.,
-                                    MUTED,
-                                );
-                            });
-                        }
-                        for indices in visible.chunks(model.layout.columns) {
-                            grid.spawn(Node {
-                                column_gap: px(20),
-                                min_height: px(model.layout.card_height),
-                                ..default()
-                            })
-                            .with_children(|row| {
-                                for index in indices {
-                                    let clip = &clips[*index];
-                                    let key = format!(
-                                        "{}:{}:{}:{}",
-                                        remote,
-                                        snapshot.catalog_revision,
-                                        clip.identity,
-                                        remote && network.remote_icons.contains_key(&clip.identity)
-                                    );
-                                    if !icons.0.contains_key(&key) {
-                                        let bytes = if remote {
-                                            network.remote_icons.get(&clip.identity).cloned()
-                                        } else {
-                                            Icons::read_icon(&clip.icon_path).ok()
-                                        };
-                                        let handle = bytes
-                                            .and_then(|bytes| Icons::icon_image(&bytes).ok())
-                                            .map(|image| images.add(image));
-                                        if icons.0.len() >= 128 {
-                                            let old = icons.0.keys().next().cloned().unwrap();
-                                            if let Some(Some(handle)) = icons.0.remove(&old) {
-                                                images.remove(handle.id());
-                                            }
-                                        }
-                                        icons.0.insert(key.clone(), handle);
-                                    }
-                                    let image = icons.0.get(&key).cloned().flatten();
-                                    let dimensions = image
-                                        .as_ref()
-                                        .and_then(|handle| images.get(handle))
-                                        .map(|image| {
-                                            Vec2::new(image.width() as f32, image.height() as f32)
-                                        });
-                                    let active = snapshot.instances.iter().rev().find(|instance| {
-                                        instance.clip_id == clip.identity
-                                            && !instance.state.is_terminal()
+                            .with_children(|grid| {
+                                let visible = model.visible(clips);
+                                if visible.is_empty() {
+                                    grid.spawn(Node {
+                                        width: percent(100),
+                                        flex_grow: 1.,
+                                        flex_direction: FlexDirection::Column,
+                                        align_items: AlignItems::Center,
+                                        justify_content: JustifyContent::Center,
+                                        row_gap: px(14),
+                                        ..default()
+                                    })
+                                    .with_children(|empty| {
+                                        empty.spawn((
+                                            Text::new(if runtime.loading {
+                                                "Gathering your collection…"
+                                            } else if remote && !network.connected {
+                                                "Connect your host"
+                                            } else {
+                                                "Nothing here, yet."
+                                            }),
+                                            fonts.display(28.),
+                                            TextColor(INK),
+                                        ));
+                                        view.label(
+                                            empty,
+                                            if remote && !network.connected {
+                                                "Choose Tailscale above to pair with a remote host."
+                                            } else {
+                                                "Try another search or choose a catalog above."
+                                            },
+                                            12.,
+                                            MUTED,
+                                        );
                                     });
-                                    let status = if runtime.errors.contains_key(&clip.identity) {
-                                        "ERROR"
-                                    } else {
-                                        "PLAY →"
-                                    };
-                                    view.card(
-                                        row,
-                                        clip,
-                                        image,
-                                        dimensions,
-                                        model.layout,
-                                        status,
-                                        active.map(|instance| instance.instance_id.as_str()),
-                                    );
+                                }
+                                for (row_index, indices) in
+                                    visible.chunks(model.layout.columns).enumerate()
+                                {
+                                    grid.spawn(Node {
+                                        position_type: PositionType::Absolute,
+                                        top: px((model.first_row() + row_index) as f32
+                                            * model.row_stride()),
+                                        width: percent(100),
+                                        height: px(model.layout.card_height),
+                                        column_gap: px(20),
+                                        min_height: px(model.layout.card_height),
+                                        ..default()
+                                    })
+                                    .with_children(|row| {
+                                        for index in indices {
+                                            let clip = &clips[*index];
+                                            let key = format!(
+                                                "{}:{}:{}:{}",
+                                                remote,
+                                                snapshot.catalog_revision,
+                                                clip.identity,
+                                                remote
+                                                    && network
+                                                        .remote_icons
+                                                        .contains_key(&clip.identity)
+                                            );
+                                            if !icons.0.contains_key(&key) {
+                                                let bytes = if remote {
+                                                    network
+                                                        .remote_icons
+                                                        .get(&clip.identity)
+                                                        .cloned()
+                                                } else {
+                                                    Icons::read_icon(&clip.icon_path).ok()
+                                                };
+                                                let handle = bytes
+                                                    .and_then(|bytes| {
+                                                        Icons::icon_image(&bytes).ok()
+                                                    })
+                                                    .map(|image| images.add(image));
+                                                if icons.0.len() >= 128 {
+                                                    let old =
+                                                        icons.0.keys().next().cloned().unwrap();
+                                                    if let Some(Some(handle)) = icons.0.remove(&old)
+                                                    {
+                                                        images.remove(handle.id());
+                                                    }
+                                                }
+                                                icons.0.insert(key.clone(), handle);
+                                            }
+                                            let image = icons.0.get(&key).cloned().flatten();
+                                            let dimensions = image
+                                                .as_ref()
+                                                .and_then(|handle| images.get(handle))
+                                                .map(|image| {
+                                                    Vec2::new(
+                                                        image.width() as f32,
+                                                        image.height() as f32,
+                                                    )
+                                                });
+                                            let active =
+                                                snapshot.instances.iter().rev().find(|instance| {
+                                                    instance.clip_id == clip.identity
+                                                        && !instance.state.is_terminal()
+                                                });
+                                            let status =
+                                                if runtime.errors.contains_key(&clip.identity) {
+                                                    "ERROR"
+                                                } else {
+                                                    "PLAY →"
+                                                };
+                                            view.card(
+                                                row,
+                                                clip,
+                                                image,
+                                                dimensions,
+                                                model.layout,
+                                                status,
+                                                active
+                                                    .map(|instance| instance.instance_id.as_str()),
+                                            );
+                                        }
+                                    });
                                 }
                             });
-                        }
                     });
                 collection
                     .spawn((
@@ -948,19 +994,22 @@ pub(super) fn render(
                         FocusPolicy::Block,
                     ))
                     .with_children(|track| {
-                        let total_rows = model.matches.div_ceil(model.layout.columns).max(1);
-                        let fraction = (model.layout.rows as f32 / total_rows as f32).min(1.);
+                        let (top, height) = model.thumb_geometry(model.viewport_height());
                         track.spawn((
+                            ScrollThumb,
                             Node {
                                 position_type: PositionType::Absolute,
-                                top: percent(100. * model.first_row as f32 / total_rows as f32),
+                                top: px(top),
                                 width: percent(100),
-                                height: percent(100. * fraction),
-                                min_height: px(24),
+                                height: px(height),
                                 border_radius: BorderRadius::all(px(4)),
                                 ..default()
                             },
-                            BackgroundColor(if model.max_row() == 0 { RULE } else { PURPLE }),
+                            BackgroundColor(if model.max_scroll() == 0. {
+                                RULE
+                            } else {
+                                PURPLE
+                            }),
                             FocusPolicy::Pass,
                         ));
                     });

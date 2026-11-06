@@ -10,8 +10,10 @@ The top row contains **Host**, **Catalog** and search. At compact widths, search
 moves below the two selectors. Cards show real PNG previews, titles, media kinds
 and playback controls; the responsive grid renders only visible rows plus a partial
 row. Wheel/trackpad scrolling and the draggable scrollbar reach the whole collection.
-Wheel input accumulates distance before advancing a row, so tiny trackpad events
-do not each jump a full row; bursts are bounded and navigation discards residual motion.
+The collection uses Bevy UI’s `ScrollPosition` and vertical scroll overflow.
+Trackpad movement updates a continuous logical-pixel offset, including fractional
+deltas and OS-provided momentum; there are no row thresholds or snapping. Mouse
+wheel lines convert to pixels, and the scrollbar follows the same continuous offset.
 Search matches every word across title, tags and category. Thumbnails are bounded
 before decode (one MiB, 512×512), with a bounded 128-entry cache including failures.
 Remote icons additionally satisfy the transport's 32 KiB limit.
@@ -93,6 +95,11 @@ thumbnail bounds and preference migration. The redesign was also inspected in a
 native development preview: grid, popup stacking, long titles, masked validation,
 cancel, catalog loading, scrollbar reachability and active card controls. A 720×520
 preview verified compact cards and form scrolling with persistent Apply/Cancel.
+The continuous-scroll revision was checked in the native preview: small gestures
+moved cards by 34px then 4px, crossing a virtual-row boundary retained the partial
+row offset, and the final row and filtered empty state remained reachable. Track
+clicks worked; automated native thumb dragging was inconclusive, while fractional
+dragging and grab-point preservation pass system tests.
 The window has a 400×520 minimum; desktop defaults remain 1160×820. Native
 muted probes completed for GIF, MP3 and MP4; all 31 assets passed full FFmpeg decode.
 These checks do not establish audible output, recorded A/V sync, fullscreen or

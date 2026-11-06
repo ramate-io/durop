@@ -33,14 +33,6 @@ use std::{
 };
 use theme::Fonts;
 
-/// Reference desktop grid width used by contract tests.
-#[cfg(test)]
-const COLUMNS: usize = 4;
-
-/// Reference visible row bound used by contract tests.
-#[cfg(test)]
-const ROWS: usize = 3;
-
 /// Identify the editor receiving committed keyboard and IME input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
@@ -130,10 +122,10 @@ struct Model {
     query: Editor,
     /// Editor currently owning text input.
     focus: Option<Field>,
-    /// First visible row after filtering.
-    first_row: usize,
-    /// Fractional wheel travel; navigation and direction changes discard stale motion.
-    wheel: CatalogScroll,
+    /// Logical pixel offset mirrored into the native UI scroll viewport.
+    scroll: f32,
+    /// Measured logical height of the collection viewport; zero until its first layout.
+    viewport_height: f32,
     /// Last render-state fingerprint used to avoid unnecessary tree rebuilds.
     signature: String,
     /// Current panel widget subtree.
@@ -150,6 +142,8 @@ struct Model {
     revision: u64,
     /// Whether scrollbar dragging has captured the pointer.
     dragging: bool,
+    /// Logical pointer distance from the thumb top, retained throughout a drag.
+    drag_offset: f32,
     /// Last persisted benign state, avoiding unchanged disk writes.
     saved_preferences: Option<crate::preferences::Preferences>,
     /// Modifier state reconstructed from ordered keyboard events.
@@ -244,49 +238,13 @@ impl GridLayout {
     }
 }
 
-/// Convert proportional wheel travel into deliberate, bounded virtual-row steps.
-#[derive(Default)]
-struct CatalogScroll {
-    /// Signed logical pixels below one complete row step.
-    pending_pixels: f32,
-}
+/// Native scroll viewport containing only the visible catalog rows and full-height spacing.
+#[derive(Component)]
+struct CatalogBody;
 
-impl CatalogScroll {
-    /// Three ordinary wheel lines or 120 trackpad pixels advance one catalog row.
-    const PIXELS_PER_ROW: f32 = 120.;
-
-    /// Normalize line-wheel input to the same scale as trackpad pixels.
-    const PIXELS_PER_LINE: f32 = 40.;
-
-    /// Discard travel when focus, source, search, scrollbar or gesture ownership changes.
-    fn reset(&mut self) {
-        self.pending_pixels = 0.;
-    }
-
-    /// Accumulate fractional travel, dropping excess burst motion once the frame budget is spent.
-    fn rows(&mut self, delta: f32, budget: &mut usize) -> i32 {
-        if !delta.is_finite() || delta == 0. {
-            return 0;
-        }
-        if *budget == 0 {
-            self.reset();
-            return 0;
-        }
-        if self.pending_pixels.signum() != delta.signum() {
-            self.reset();
-        }
-        let travel = self.pending_pixels + delta;
-        let whole = (travel.abs() / Self::PIXELS_PER_ROW).floor() as usize;
-        let admitted = whole.min(*budget);
-        *budget -= admitted;
-        self.pending_pixels = if *budget == 0 {
-            0.
-        } else {
-            travel % Self::PIXELS_PER_ROW
-        };
-        admitted as i32 * if travel > 0. { 1 } else { -1 }
-    }
-}
+/// Thumb geometry is updated directly during scrolling without rebuilding the widget tree.
+#[derive(Component)]
+struct ScrollThumb;
 
 /// Scrollbar track captures pointer coordinates without creating a node per catalog item.
 #[derive(Component)]
@@ -389,12 +347,10 @@ impl Model {
         self.dropdown = None;
         self.focus = None;
         self.dragging = false;
-        self.wheel.reset();
     }
 
     /// Discard modal state and transient menus; no provider intent is emitted.
     fn close(&mut self) {
-        self.wheel.reset();
         if let Some(modal) = self.modal.take() {
             modal.draft.cancel();
         }
@@ -471,53 +427,117 @@ impl Model {
         self.focus = Some(Field::Configuration(fields[next]));
     }
 
-    /// Clamp the first virtual row against the complete filtered result count.
-    fn max_row(&self) -> usize {
-        self.matches
-            .div_ceil(self.layout.columns)
-            .saturating_sub(self.layout.rows)
+    /// Exact content extent includes the inter-row gaps, with no trailing gap.
+    fn content_height(&self) -> f32 {
+        let rows = self.matches.div_ceil(self.layout.columns);
+        rows as f32 * self.row_stride() - if rows == 0 { 0. } else { 20. }
     }
 
-    /// Include one clipped preview row beyond complete rows without making the last row unreachable.
+    /// Logical distance between successive row origins.
+    fn row_stride(&self) -> f32 {
+        self.layout.card_height + 20.
+    }
+
+    /// Use measured viewport geometry once Bevy has performed layout.
+    fn viewport_height(&self) -> f32 {
+        if self.viewport_height > 0. {
+            self.viewport_height
+        } else {
+            self.layout.rows as f32 * self.row_stride() - 20.
+        }
+    }
+
+    /// Scroll bounds depend on actual viewport size rather than complete visible rows.
+    fn max_scroll(&self) -> f32 {
+        (self.content_height() - self.viewport_height()).max(0.)
+    }
+
+    /// Row origin changes invalidate virtualized content, while fractional travel does not.
+    fn first_row(&self) -> usize {
+        (self.scroll / self.row_stride()).floor() as usize
+    }
+
+    /// Render intersecting rows plus one overscan row, independently of catalog size.
     fn visible(&self, clips: &[Clip]) -> Vec<usize> {
         clips
             .iter()
             .enumerate()
             .filter(|(_, clip)| Self::matching(clip, &self.query.text))
-            .skip(self.first_row.saturating_mul(self.layout.columns))
-            .take(self.layout.columns * (self.layout.rows + 1))
+            .skip(self.first_row().saturating_mul(self.layout.columns))
+            .take(self.layout.columns * (self.layout.rows + 2))
             .map(|(index, _)| index)
             .collect()
     }
 
-    /// Map a track-relative pointer coordinate to the nearest available row.
-    fn seek_scrollbar(&mut self, fraction: f32) {
-        self.wheel.reset();
-        let total = self.matches.div_ceil(self.layout.columns).max(1);
-        let thumb = (self.layout.rows as f32 / total as f32).min(1.);
-        let progress = ((fraction - thumb * 0.5) / (1. - thumb).max(f32::EPSILON)).clamp(0., 1.);
-        self.first_row = (progress * self.max_row() as f32).round() as usize;
+    /// Return thumb top and extent in logical track pixels, including its minimum hit size.
+    fn thumb_geometry(&self, track_height: f32) -> (f32, f32) {
+        let height = (track_height * self.viewport_height() / self.content_height().max(1.))
+            .max(24.)
+            .min(track_height);
+        let progress = (self.scroll / self.max_scroll().max(f32::EPSILON)).clamp(0., 1.);
+        (progress * (track_height - height), height)
     }
 }
 
-/// Drag the virtual scrollbar, retaining capture across subtree rebuilds and pointer exits.
+/// Drag continuously, preserving the initial grab point and capture across row rebuilds.
 fn scrollbar(
     mut model: ResMut<Model>,
-    tracks: Query<(&Interaction, &bevy::ui::RelativeCursorPosition), With<Scrollbar>>,
+    tracks: Query<
+        (
+            &Interaction,
+            &bevy::ui::RelativeCursorPosition,
+            &ComputedNode,
+        ),
+        With<Scrollbar>,
+    >,
+    mut bodies: Query<&mut ScrollPosition, With<CatalogBody>>,
     mouse: Res<ButtonInput<MouseButton>>,
 ) {
     if !mouse.pressed(MouseButton::Left) || model.modal.is_some() {
         model.dragging = false;
         return;
     }
-    for (interaction, cursor) in &tracks {
-        if *interaction == Interaction::Pressed {
-            model.dragging = true;
+    for (interaction, cursor, node) in &tracks {
+        let Some(position) = cursor.normalized else {
+            continue;
+        };
+        let track_height = node.size().y * node.inverse_scale_factor();
+        if track_height <= 0. {
+            continue;
         }
-        if model.dragging
-            && let Some(position) = cursor.normalized
-        {
-            model.seek_scrollbar(position.y + 0.5);
+        let pointer = (position.y + 0.5) * track_height;
+        let (top, height) = model.thumb_geometry(track_height);
+        if *interaction == Interaction::Pressed && !model.dragging {
+            model.dragging = true;
+            model.drag_offset = if (top..=top + height).contains(&pointer) {
+                pointer - top
+            } else {
+                height * 0.5
+            };
+        }
+        if model.dragging {
+            let progress = ((pointer - model.drag_offset)
+                / (track_height - height).max(f32::EPSILON))
+            .clamp(0., 1.);
+            model.scroll = progress * model.max_scroll();
+            for mut body in &mut bodies {
+                body.y = model.scroll;
+            }
+        }
+    }
+}
+
+/// Reflect every pixel of native scrolling in the scrollbar without invalidating the view.
+fn scroll_thumb(
+    model: Res<Model>,
+    tracks: Query<&ComputedNode, With<Scrollbar>>,
+    mut thumbs: Query<&mut Node, With<ScrollThumb>>,
+) {
+    for track in &tracks {
+        let (top, height) = model.thumb_geometry(track.size().y * track.inverse_scale_factor());
+        for mut thumb in &mut thumbs {
+            thumb.top = px(top);
+            thumb.height = px(height);
         }
     }
 }
@@ -595,7 +615,15 @@ impl Plugin for PanelPlugin {
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
-                (buttons, text_input, scroll, scrollbar, hover, terminal)
+                (
+                    buttons,
+                    text_input,
+                    scroll,
+                    scrollbar,
+                    scroll_thumb,
+                    hover,
+                    terminal,
+                )
                     .chain()
                     .before(crate::app::actions),
             )
@@ -712,19 +740,6 @@ impl Model {
                     .any(|tag| tag.to_lowercase().contains(part))
         })
     }
-
-    /// Select only the current page of matching catalog entries for rendering.
-    #[cfg(test)]
-    fn visible_indices(clips: &[Clip], query: &str, row: usize) -> Vec<usize> {
-        clips
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| Model::matching(c, query))
-            .skip(row.saturating_mul(COLUMNS))
-            .take(COLUMNS * ROWS)
-            .map(|(i, _)| i)
-            .collect()
-    }
 }
 
 /// Dispatch one pointer press; rebuilding widgets must not repeat a held click.
@@ -748,7 +763,6 @@ fn buttons(
             continue;
         }
         model.revision = model.revision.wrapping_add(1);
-        model.wheel.reset();
         match action {
             UiAction::Runtime(action) => {
                 model.focus = None;
@@ -921,7 +935,6 @@ fn text_input(
     }
     let mut committed = false;
     for event in ime.read() {
-        model.wheel.reset();
         model.revision = model.revision.wrapping_add(1);
         let Some(field) = model.focus else {
             continue;
@@ -935,6 +948,9 @@ fn text_input(
                 edit.preedit.clear();
                 edit.insert(value);
                 committed = true;
+                if field == Field::Search {
+                    model.scroll = 0.;
+                }
             }
             Ime::Disabled { window } if *window == entity => edit.preedit.clear(),
             _ => (),
@@ -1045,8 +1061,9 @@ fn text_input(
                 }
                 _ => (),
             }
-            model.first_row = 0;
-            model.wheel.reset();
+            if field == Field::Search {
+                model.scroll = 0.;
+            }
         } else if !key.repeat && !raw_modified.unwrap_or(model.modifiers != 0) {
             match key.logical_key {
                 Key::Escape => actions.0.push_back(Action::StopAll),
@@ -1067,65 +1084,68 @@ fn text_input(
     }
 }
 
-/// Route wheel input to the active form body or bounded collection rows.
+/// Apply unmodified OS wheel/momentum travel to native, logical-pixel scroll positions.
+#[expect(
+    clippy::type_complexity,
+    reason = "Catalog and modal scroll queries exclude each other to permit independent mutable positions"
+)]
 fn scroll(
     mut wheel: MessageReader<MouseWheel>,
-    primary: Single<(Entity, Option<&Window>), With<PrimaryWindow>>,
+    primary: Single<(Entity, &Window), With<PrimaryWindow>>,
     mut model: ResMut<Model>,
-    mut bodies: Query<(&ComputedNode, &mut ScrollPosition), With<ModalBody>>,
+    mut bodies: Query<
+        (&ComputedNode, &mut ScrollPosition),
+        (With<ModalBody>, Without<CatalogBody>),
+    >,
+    mut catalogs: Query<
+        (&ComputedNode, &mut ScrollPosition),
+        (With<CatalogBody>, Without<ModalBody>),
+    >,
 ) {
     let (primary, window) = primary.into_inner();
-    // Winit forwards physical pixel deltas; normalize catalog travel for Retina displays.
-    let scale_factor = window.map_or(1., Window::scale_factor).max(f32::EPSILON);
-    // A coalesced or inertial burst can move at most two rows in one update.
-    let mut row_budget = 2;
+    // Winit forwards physical pixel deltas, including fractional OS momentum on Retina.
+    let scale_factor = window.scale_factor().max(f32::EPSILON);
+    for (node, mut position) in &mut catalogs {
+        let height = node.size().y * node.inverse_scale_factor();
+        if height <= 0. {
+            continue;
+        }
+        model.viewport_height = height;
+        model.layout.rows = (model.viewport_height() / model.row_stride())
+            .ceil()
+            .max(1.) as usize;
+        model.scroll = model.scroll.clamp(0., model.max_scroll());
+        position.y = model.scroll;
+    }
+    // Clamp modal bounds on resize even when no wheel message arrives.
+    if let Some(modal) = &mut model.modal {
+        for (node, mut position) in &mut bodies {
+            let maximum =
+                ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
+            modal.scroll = modal.scroll.clamp(0., maximum);
+            position.y = modal.scroll;
+        }
+    }
     for event in wheel.read() {
         if event.window != primary || !event.y.is_finite() {
             continue;
         }
+        let delta = match event.unit {
+            bevy::input::mouse::MouseScrollUnit::Line => event.y * 40.,
+            bevy::input::mouse::MouseScrollUnit::Pixel => event.y / scale_factor,
+        };
         if let Some(modal) = &mut model.modal {
             for (node, mut position) in &mut bodies {
                 let maximum =
                     ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
-                let delta = match event.unit {
-                    bevy::input::mouse::MouseScrollUnit::Line => event.y * 32.,
-                    bevy::input::mouse::MouseScrollUnit::Pixel => event.y,
-                };
                 modal.scroll = (position.y - delta).clamp(0., maximum);
                 position.y = modal.scroll;
             }
-        } else {
-            if event.phase == bevy::input::touch::TouchPhase::Started {
-                model.wheel.reset();
-            }
-            if event.y != 0. {
-                model.dropdown = None;
-                let delta = match event.unit {
-                    bevy::input::mouse::MouseScrollUnit::Line => {
-                        event.y * CatalogScroll::PIXELS_PER_LINE
-                    }
-                    bevy::input::mouse::MouseScrollUnit::Pixel => event.y / scale_factor,
-                };
-                let steps = model.wheel.rows(delta, &mut row_budget);
-                model.first_row = if steps > 0 {
-                    model.first_row.saturating_sub(steps as usize)
-                } else {
-                    model
-                        .first_row
-                        .saturating_add(steps.unsigned_abs() as usize)
-                        .min(model.max_row())
-                };
-                if (delta > 0. && model.first_row == 0)
-                    || (delta < 0. && model.first_row == model.max_row())
-                {
-                    model.wheel.reset();
-                }
-            }
-            if matches!(
-                event.phase,
-                bevy::input::touch::TouchPhase::Ended | bevy::input::touch::TouchPhase::Canceled
-            ) {
-                model.wheel.reset();
+        } else if delta != 0. {
+            model.dropdown = None;
+            model.scroll = (model.scroll - delta).clamp(0., model.max_scroll());
+            for (_, mut position) in &mut catalogs {
+                position.y = model.scroll;
             }
         }
     }
