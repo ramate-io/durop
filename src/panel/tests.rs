@@ -602,3 +602,208 @@ fn short_window_cards_fit_titles_and_controls_inside_the_collection() {
     assert_eq!(GridLayout::for_window(1160., 820.).preview_height, 172.);
     assert_eq!(GridLayout::for_window(720., 520.).preview_height, 34.);
 }
+
+/// Build the actual wheel-routing system without a renderer or native window.
+fn wheel_app(first_row: usize) -> (App, Entity) {
+    let mut app = App::new();
+    app.insert_resource(Model {
+        first_row,
+        matches: 10_000,
+        ..default()
+    })
+    .add_message::<MouseWheel>()
+    .add_systems(Update, scroll);
+    let window = app.world_mut().spawn(PrimaryWindow).id();
+    (app, window)
+}
+
+/// Send proportional wheel input through the same message path used by the desktop.
+fn wheel_input(app: &mut App, window: Entity, unit: bevy::input::mouse::MouseScrollUnit, y: f32) {
+    app.world_mut().write_message(MouseWheel {
+        unit,
+        phase: bevy::input::touch::TouchPhase::Moved,
+        x: 0.,
+        y,
+        window,
+    });
+}
+
+/// Small trackpad events accumulate across frames instead of each advancing a row.
+#[test]
+fn tiny_trackpad_deltas_require_a_complete_scroll_threshold() {
+    let (mut app, window) = wheel_app(0);
+    for _ in 0..119 {
+        wheel_input(
+            &mut app,
+            window,
+            bevy::input::mouse::MouseScrollUnit::Pixel,
+            -1.,
+        );
+        app.update();
+        assert_eq!(app.world().resource::<Model>().first_row, 0);
+    }
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Pixel,
+        -1.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, 1);
+}
+
+/// Three line-wheel units share the same deliberate threshold as trackpad pixels.
+#[test]
+fn line_wheel_units_are_normalized_before_advancing_catalog_rows() {
+    let (mut app, window) = wheel_app(0);
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Line,
+        -2.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, 0);
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Line,
+        -1.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, 1);
+}
+
+/// Reversing direction starts fresh rather than fighting old residual motion.
+#[test]
+fn reversing_trackpad_direction_discards_the_previous_partial_row() {
+    let (mut app, window) = wheel_app(5);
+    for delta in [-119., 119.] {
+        wheel_input(
+            &mut app,
+            window,
+            bevy::input::mouse::MouseScrollUnit::Pixel,
+            delta,
+        );
+        app.update();
+        assert_eq!(app.world().resource::<Model>().first_row, 5);
+    }
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Pixel,
+        1.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, 4);
+}
+
+/// Inertial/coalesced bursts stay bounded and do not queue hidden travel for later frames.
+#[test]
+fn wheel_bursts_are_bounded_and_discard_overshoot_at_catalog_edges() {
+    let (mut app, window) = wheel_app(0);
+    for _ in 0..100 {
+        wheel_input(
+            &mut app,
+            window,
+            bevy::input::mouse::MouseScrollUnit::Pixel,
+            -1000.,
+        );
+    }
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, 2);
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Pixel,
+        -1.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, 2);
+    let maximum = app.world().resource::<Model>().max_row();
+    app.world_mut().resource_mut::<Model>().first_row = maximum - 1;
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Pixel,
+        -10000.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, maximum);
+    assert_eq!(app.world().resource::<Model>().wheel.pending_pixels, 0.);
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Pixel,
+        119.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, maximum);
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Pixel,
+        1.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, maximum - 1);
+}
+
+/// Search edits, provider navigation and explicit scrollbar movement discard prior wheel travel.
+#[test]
+fn navigation_and_search_reset_fractional_wheel_motion() {
+    let (mut app, window) = input_app();
+    app.world_mut().resource_mut::<Model>().wheel.pending_pixels = -119.;
+    key(
+        &mut app,
+        window,
+        Key::Character("x".into()),
+        KeyCode::KeyX,
+        Some("x"),
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().wheel.pending_pixels, 0.);
+    let mut model = app.world_mut().resource_mut::<Model>();
+    model.wheel.pending_pixels = -119.;
+    model.seek_scrollbar(0.5);
+    assert_eq!(model.wheel.pending_pixels, 0.);
+    model.wheel.pending_pixels = -119.;
+    model.open(
+        Provider::Catalog(CatalogProvider::GitHttps),
+        &provider_context(),
+    );
+    assert_eq!(model.wheel.pending_pixels, 0.);
+}
+
+/// Retina scaling changes physical deltas, not the logical distance needed for a row.
+#[test]
+fn trackpad_threshold_uses_logical_pixels_on_scaled_windows() {
+    let (mut app, window) = wheel_app(0);
+    let mut native_window = Window::default();
+    native_window.resolution.set_scale_factor_override(Some(2.));
+    app.world_mut().entity_mut(window).insert(native_window);
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Pixel,
+        -120.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, 0);
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Pixel,
+        -120.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, 1);
+    wheel_input(
+        &mut app,
+        window,
+        bevy::input::mouse::MouseScrollUnit::Line,
+        -3.,
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().first_row, 2);
+}

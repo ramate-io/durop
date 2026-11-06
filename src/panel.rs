@@ -132,6 +132,8 @@ struct Model {
     focus: Option<Field>,
     /// First visible row after filtering.
     first_row: usize,
+    /// Fractional wheel travel; navigation and direction changes discard stale motion.
+    wheel: CatalogScroll,
     /// Last render-state fingerprint used to avoid unnecessary tree rebuilds.
     signature: String,
     /// Current panel widget subtree.
@@ -242,6 +244,50 @@ impl GridLayout {
     }
 }
 
+/// Convert proportional wheel travel into deliberate, bounded virtual-row steps.
+#[derive(Default)]
+struct CatalogScroll {
+    /// Signed logical pixels below one complete row step.
+    pending_pixels: f32,
+}
+
+impl CatalogScroll {
+    /// Three ordinary wheel lines or 120 trackpad pixels advance one catalog row.
+    const PIXELS_PER_ROW: f32 = 120.;
+
+    /// Normalize line-wheel input to the same scale as trackpad pixels.
+    const PIXELS_PER_LINE: f32 = 40.;
+
+    /// Discard travel when focus, source, search, scrollbar or gesture ownership changes.
+    fn reset(&mut self) {
+        self.pending_pixels = 0.;
+    }
+
+    /// Accumulate fractional travel, dropping excess burst motion once the frame budget is spent.
+    fn rows(&mut self, delta: f32, budget: &mut usize) -> i32 {
+        if !delta.is_finite() || delta == 0. {
+            return 0;
+        }
+        if *budget == 0 {
+            self.reset();
+            return 0;
+        }
+        if self.pending_pixels.signum() != delta.signum() {
+            self.reset();
+        }
+        let travel = self.pending_pixels + delta;
+        let whole = (travel.abs() / Self::PIXELS_PER_ROW).floor() as usize;
+        let admitted = whole.min(*budget);
+        *budget -= admitted;
+        self.pending_pixels = if *budget == 0 {
+            0.
+        } else {
+            travel % Self::PIXELS_PER_ROW
+        };
+        admitted as i32 * if travel > 0. { 1 } else { -1 }
+    }
+}
+
 /// Scrollbar track captures pointer coordinates without creating a node per catalog item.
 #[derive(Component)]
 struct Scrollbar;
@@ -343,10 +389,12 @@ impl Model {
         self.dropdown = None;
         self.focus = None;
         self.dragging = false;
+        self.wheel.reset();
     }
 
     /// Discard modal state and transient menus; no provider intent is emitted.
     fn close(&mut self) {
+        self.wheel.reset();
         if let Some(modal) = self.modal.take() {
             modal.draft.cancel();
         }
@@ -444,6 +492,7 @@ impl Model {
 
     /// Map a track-relative pointer coordinate to the nearest available row.
     fn seek_scrollbar(&mut self, fraction: f32) {
+        self.wheel.reset();
         let total = self.matches.div_ceil(self.layout.columns).max(1);
         let thumb = (self.layout.rows as f32 / total as f32).min(1.);
         let progress = ((fraction - thumb * 0.5) / (1. - thumb).max(f32::EPSILON)).clamp(0., 1.);
@@ -699,6 +748,7 @@ fn buttons(
             continue;
         }
         model.revision = model.revision.wrapping_add(1);
+        model.wheel.reset();
         match action {
             UiAction::Runtime(action) => {
                 model.focus = None;
@@ -871,6 +921,7 @@ fn text_input(
     }
     let mut committed = false;
     for event in ime.read() {
+        model.wheel.reset();
         model.revision = model.revision.wrapping_add(1);
         let Some(field) = model.focus else {
             continue;
@@ -995,6 +1046,7 @@ fn text_input(
                 _ => (),
             }
             model.first_row = 0;
+            model.wheel.reset();
         } else if !key.repeat && !raw_modified.unwrap_or(model.modifiers != 0) {
             match key.logical_key {
                 Key::Escape => actions.0.push_back(Action::StopAll),
@@ -1018,12 +1070,17 @@ fn text_input(
 /// Route wheel input to the active form body or bounded collection rows.
 fn scroll(
     mut wheel: MessageReader<MouseWheel>,
-    primary: Single<Entity, With<PrimaryWindow>>,
+    primary: Single<(Entity, Option<&Window>), With<PrimaryWindow>>,
     mut model: ResMut<Model>,
     mut bodies: Query<(&ComputedNode, &mut ScrollPosition), With<ModalBody>>,
 ) {
+    let (primary, window) = primary.into_inner();
+    // Winit forwards physical pixel deltas; normalize catalog travel for Retina displays.
+    let scale_factor = window.map_or(1., Window::scale_factor).max(f32::EPSILON);
+    // A coalesced or inertial burst can move at most two rows in one update.
+    let mut row_budget = 2;
     for event in wheel.read() {
-        if event.window != *primary || event.y == 0.0 {
+        if event.window != primary || !event.y.is_finite() {
             continue;
         }
         if let Some(modal) = &mut model.modal {
@@ -1038,12 +1095,38 @@ fn scroll(
                 position.y = modal.scroll;
             }
         } else {
-            model.dropdown = None;
-            model.first_row = if event.y > 0.0 {
-                model.first_row.saturating_sub(1)
-            } else {
-                (model.first_row + 1).min(model.max_row())
-            };
+            if event.phase == bevy::input::touch::TouchPhase::Started {
+                model.wheel.reset();
+            }
+            if event.y != 0. {
+                model.dropdown = None;
+                let delta = match event.unit {
+                    bevy::input::mouse::MouseScrollUnit::Line => {
+                        event.y * CatalogScroll::PIXELS_PER_LINE
+                    }
+                    bevy::input::mouse::MouseScrollUnit::Pixel => event.y / scale_factor,
+                };
+                let steps = model.wheel.rows(delta, &mut row_budget);
+                model.first_row = if steps > 0 {
+                    model.first_row.saturating_sub(steps as usize)
+                } else {
+                    model
+                        .first_row
+                        .saturating_add(steps.unsigned_abs() as usize)
+                        .min(model.max_row())
+                };
+                if (delta > 0. && model.first_row == 0)
+                    || (delta < 0. && model.first_row == model.max_row())
+                {
+                    model.wheel.reset();
+                }
+            }
+            if matches!(
+                event.phase,
+                bevy::input::touch::TouchPhase::Ended | bevy::input::touch::TouchPhase::Canceled
+            ) {
+                model.wheel.reset();
+            }
         }
     }
 }
