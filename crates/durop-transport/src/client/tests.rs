@@ -172,3 +172,102 @@ async fn cancelling_gap_recovery_accepts_late_snapshot_before_next_reply() {
     client.disconnect().await;
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn cancellation_barrier_drains_a_racing_outcome_before_the_next_request() {
+    let (listener, address) = fake_host().await;
+    let server = tokio::spawn(async move {
+        let mut socket = accept(listener).await;
+        let cancel = socket.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(cancel.to_text().unwrap()).unwrap()["type"],
+            "cancel"
+        );
+        for packet in [
+            serde_json::json!({"type":"outcome","command_id":"abandoned","outcome":CommandOutcome::Accepted { instance_id: None }}),
+            serde_json::json!({"type":"canceled","command_id":"abandoned"}),
+        ] {
+            socket
+                .send(Message::Text(packet.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let catalog = socket.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(catalog.to_text().unwrap()).unwrap()["type"],
+            "catalog"
+        );
+        socket
+            .send(Message::Text(
+                serde_json::json!({"type":"catalog","catalog":{"clips":[]}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = socket.next().await;
+    });
+    let mut client = ControllerClient::connect_loopback(
+        address,
+        SessionCredential::from_secret("a".repeat(64)).unwrap(),
+    )
+    .await
+    .unwrap();
+    client
+        .roundtrip(
+            serde_json::json!({"type":"cancel","command_id":"abandoned"}),
+            Expected::Canceled("abandoned".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client.catalog().await.unwrap(),
+        serde_json::json!({"clips":[]})
+    );
+    client.disconnect().await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn unsupported_cancellation_fails_closed() {
+    let (listener, address) = fake_host().await;
+    let active = Arc::new(AtomicBool::new(true));
+    let revoke = active.clone();
+    let server = tokio::spawn(async move {
+        let mut socket = accept(listener).await;
+        let command = socket.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(command.to_text().unwrap()).unwrap()["type"],
+            "command"
+        );
+        revoke.store(false, Ordering::Release);
+        let cancel = socket.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(cancel.to_text().unwrap()).unwrap()["type"],
+            "cancel"
+        );
+        // Older peers reject unknown frames by closing the authenticated connection.
+        socket.close(None).await.unwrap();
+    });
+    let mut client = ControllerClient::connect_loopback(
+        address,
+        SessionCredential::from_secret("a".repeat(64)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let envelope = Envelope {
+        protocol_version: PROTOCOL_VERSION,
+        session_id: "session".into(),
+        command_id: "legacy-cancel".into(),
+        catalog_revision: "revision".into(),
+        command: PlaybackCommand::StopAll,
+    };
+    assert!(
+        client
+            .submit_guarded_envelope(envelope, &|| active.load(Ordering::Acquire))
+            .await
+            .is_err()
+    );
+    assert!(!client.is_connected());
+    server.await.unwrap();
+}

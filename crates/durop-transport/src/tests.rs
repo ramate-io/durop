@@ -660,3 +660,87 @@ async fn registry_scopes_command_ids_and_revokes_only_one_source() {
     assert_eq!(receive(&mut bob).await["type"], "snapshot");
     fixture.session.close().await;
 }
+
+#[tokio::test]
+async fn guarded_submission_cancels_destination_admission_and_reuses_connection() {
+    let mut fixture = fixture().await;
+    let mut client = ControllerClient::connect_loopback(
+        fixture.session.address,
+        pairing_secret(&fixture.session),
+    )
+    .await
+    .unwrap();
+    let active = Arc::new(AtomicBool::new(true));
+    let guard = || active.load(Ordering::Acquire);
+    let envelope = Envelope {
+        protocol_version: PROTOCOL_VERSION,
+        session_id: "test-session".into(),
+        command_id: "cancel-me".into(),
+        catalog_revision: "abc".into(),
+        command: PlaybackCommand::Play {
+            clip_id: "applause".into(),
+        },
+    };
+    let (outcome, ()) = tokio::join!(client.submit_guarded_envelope(envelope, &guard), async {
+        let queued = fixture.commands.recv().await.unwrap();
+        assert!(queued.is_active());
+        active.store(false, Ordering::Release);
+        timeout(Duration::from_secs(1), async {
+            while queued.is_active() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation must invalidate the destination queue");
+    });
+    assert_eq!(outcome.unwrap(), None);
+    assert!(client.is_connected());
+    assert!(
+        client.catalog().await.is_ok(),
+        "cancel barrier must leave a usable socket"
+    );
+    client.disconnect().await;
+    fixture.session.close().await;
+}
+
+#[tokio::test]
+async fn cancel_is_scoped_to_its_connection_and_snapshot_changes_are_pushed() {
+    let mut fixture = fixture().await;
+    let mut first = connect(&fixture.session).await;
+    let mut second = connect(&fixture.session).await;
+    send_json(
+        &mut first,
+        command(
+            "same",
+            serde_json::json!({"type":"play","clip_id":"applause"}),
+        ),
+    )
+    .await;
+    let first_queued = fixture.commands.recv().await.unwrap();
+    send_json(
+        &mut second,
+        command(
+            "same",
+            serde_json::json!({"type":"play","clip_id":"applause"}),
+        ),
+    )
+    .await;
+    let second_queued = fixture.commands.recv().await.unwrap();
+    send_json(
+        &mut first,
+        serde_json::json!({"type":"cancel","command_id":"same"}),
+    )
+    .await;
+    assert_eq!(receive(&mut first).await["type"], "canceled");
+    assert!(!first_queued.is_active());
+    assert!(
+        second_queued.is_active(),
+        "same wire ID on another connection must survive"
+    );
+    fixture
+        .snapshot
+        .send_modify(|snapshot| snapshot.sequence = 42);
+    assert_eq!(receive(&mut first).await["snapshot"]["sequence"], 42);
+    assert_eq!(receive(&mut second).await["snapshot"]["sequence"], 42);
+    fixture.session.close().await;
+}

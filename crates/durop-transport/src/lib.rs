@@ -480,6 +480,8 @@ struct PendingReply {
 enum ClientMessage {
     // Carries canonical policy data; the host still validates revision and clip identity.
     Command { envelope: Envelope },
+    // Cancellation affects only the same authenticated socket's outstanding request.
+    Cancel { command_id: String },
     // Reconnect/gap recovery always asks for complete authoritative state.
     Snapshot,
     // Browsing stays on the authenticated socket rather than a second HTTP server.
@@ -498,6 +500,7 @@ impl ClientMessage {
             "snapshot" | "catalog" => &["type"],
             "icon" => &["type", "clip_id"],
             "command" => &["type", "envelope"],
+            "cancel" => &["type", "command_id"],
             _ => return None,
         };
         if object.len() != allowed.len()
@@ -530,6 +533,10 @@ enum ServerMessage<'a> {
     Outcome {
         command_id: &'a str,
         outcome: CommandOutcome,
+    },
+    // A distinct barrier lets a client drain a racing abandoned outcome without ambiguity.
+    Canceled {
+        command_id: &'a str,
     },
     // Sequenced host transitions do not imply physical presentation.
     Event {
@@ -642,7 +649,8 @@ async fn connection(
         return;
     }
     let mut events = state.bridge.events.subscribe();
-    let snapshot = state.bridge.snapshot.borrow().clone();
+    let mut snapshots = state.bridge.snapshot.clone();
+    let snapshot = snapshots.borrow_and_update().clone();
     if !send(
         &mut ws,
         &ServerMessage::Snapshot {
@@ -691,6 +699,14 @@ async fn connection(
                 };
                 let Some(request) = ClientMessage::parse(&text) else { break; };
                 let response = match request {
+                    ClientMessage::Cancel { command_id } => {
+                        if command_id.is_empty() || command_id.len() > 128 { break; }
+                        if pending.as_ref().is_some_and(|pending| pending.command_id == command_id) {
+                            // Dropping the reply receiver synchronously invalidates host admission.
+                            pending = None;
+                        }
+                        send(&mut ws, &ServerMessage::Canceled { command_id: &command_id }).await
+                    }
                     ClientMessage::Snapshot => { let snapshot = state.bridge.snapshot.borrow().clone(); send(&mut ws, &ServerMessage::Snapshot { snapshot: &snapshot }).await },
                     ClientMessage::Catalog => send(&mut ws, &ServerMessage::Catalog { catalog: &state.catalog.metadata }).await,
                     ClientMessage::Icon { clip_id } => match state.catalog.icons.get(&clip_id) { Some(png) => send(&mut ws, &ServerMessage::Icon { clip_id: &clip_id, png }).await, None => send(&mut ws, &ServerMessage::Error { code: "unknown_icon" }).await },
@@ -739,6 +755,12 @@ async fn connection(
                     }
                     _ => break,
                 }
+            }
+            changed = snapshots.changed() => {
+                if changed.is_err() { break; }
+                let snapshot = snapshots.borrow_and_update().clone();
+                if snapshot.session_id != state.session_id { break; }
+                if !send(&mut ws, &ServerMessage::Snapshot { snapshot: &snapshot }).await { break; }
             }
             event = events.recv() => {
                 let delivered = match event {
@@ -844,7 +866,6 @@ fn tailscale_command(executable: &Path, arguments: &[&str]) -> tokio::process::C
 /// Read at most 256 KiB within two seconds; cancellation kills the child process.
 /// Callers supply only read-only status, netcheck, or ping arguments.
 async fn tailscale_output(arguments: &[&str]) -> Result<Vec<u8>, TransportError> {
-    use std::process::Stdio;
     let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
     #[cfg(target_os = "macos")]
     let fallbacks = [
@@ -855,7 +876,32 @@ async fn tailscale_output(arguments: &[&str]) -> Result<Vec<u8>, TransportError>
     let fallbacks = [];
     let executable =
         find_tailscale(&search, &fallbacks).ok_or(TransportError::TailnetUnavailable)?;
-    let mut child = tailscale_command(&executable, arguments)
+    let mut candidates = vec![executable];
+    for fallback in &fallbacks {
+        if !candidates.contains(fallback)
+            && let Some(executable) =
+                find_tailscale(std::ffi::OsStr::new(""), std::slice::from_ref(fallback))
+        {
+            candidates.push(executable);
+        }
+    }
+    // A Nix CLI may target an absent open-source daemon while the GUI app is enrolled.
+    // Try only known executable candidates; all calls remain bounded and read-only.
+    for executable in candidates {
+        if let Ok(output) = tailscale_output_from(&executable, arguments).await {
+            return Ok(output);
+        }
+    }
+    Err(TransportError::TailnetUnavailable)
+}
+
+/// Bound one read-only CLI attempt and suppress subprocess error text that may contain identities.
+async fn tailscale_output_from(
+    executable: &Path,
+    arguments: &[&str],
+) -> Result<Vec<u8>, TransportError> {
+    use std::process::Stdio;
+    let mut child = tailscale_command(executable, arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
