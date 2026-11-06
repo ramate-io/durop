@@ -13,6 +13,8 @@
 **/*.tfplan
 **/reviewed.json
 **/.env
+**/.env.*
+!.env.example
 
 # Native distributable outputs.
 /dist/

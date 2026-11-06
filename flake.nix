@@ -17,12 +17,12 @@
           pkgs = import nixpkgs { inherit system; overlays = [ (import rust-overlay) ]; };
         in {
           infrastructure = pkgs.mkShell {
-            packages = with pkgs; [ python312 uv nodejs_24 opentofu ];
+            packages = with pkgs; [ python312 uv nodejs_24 opentofu tailscale ];
           };
           default = pkgs.mkShell {
             packages = with pkgs; [
               (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-              git jq opentofu python312 uv nodejs_24 pkg-config
+              git jq opentofu python312 uv nodejs_24 tailscale pkg-config
             ] ++ lib.optionals stdenv.isLinux [ xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr libxkbcommon ];
             LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux
               (pkgs.lib.makeLibraryPath (with pkgs; [ xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr libxkbcommon ]));

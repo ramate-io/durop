@@ -7,6 +7,13 @@ import unittest
 from unittest.mock import patch
 
 import main
+import importlib.util
+
+
+# Exercise the public manager against the actual saved-plan lifecycle implementation.
+manager_spec = importlib.util.spec_from_file_location('durop_manage', main.ROOT.parents[1] / 'manage.py')
+manager = importlib.util.module_from_spec(manager_spec)
+manager_spec.loader.exec_module(manager)
 
 
 class WrapperTests(unittest.TestCase):
@@ -20,15 +27,18 @@ class WrapperTests(unittest.TestCase):
         self.state = self.base / 'persistent state'
         self.out = self.base / 'generated output'
         self.calls = []
-        target = patch.dict('os.environ', {'TAILSCALE_TAILNET': 'test-tailnet'})
+        target = patch.dict('os.environ', {'TAILSCALE_TAILNET': 'test-tailnet',
+                            'TAILSCALE_OAUTH_CLIENT_ID': 'test-client',
+                            'TAILSCALE_OAUTH_CLIENT_SECRET': 'test-secret'})
         target.start()
         self.addCleanup(target.stop)
 
-    def fake_run(self, argv, *, check):
+    def fake_run(self, argv, *, check, **kwargs):
         self.assertTrue(check)
         self.calls.append(argv)
         if 'plan' in argv:
             Path(next(x.removeprefix('-out=') for x in argv if x.startswith('-out='))).write_bytes(b'review me')
+        return subprocess.CompletedProcess(argv, 0, stdout='tailscale_acl.policy\n')
 
     def execute(self, command):
         with patch('main.subprocess.run', side_effect=self.fake_run):
@@ -70,9 +80,10 @@ class WrapperTests(unittest.TestCase):
         self.execute('plan')
         self.calls.clear()
         original = main.digest
-        for changed in ['network.py', '.terraform.lock.hcl']:
+        for changed in [main.ROOT / 'network.py', main.ROOT / '.terraform.lock.hcl',
+                        main.ROOT.parents[1] / 'manage.py']:
             def modified(path):
-                return 'changed' if path == main.ROOT / changed else original(path)
+                return 'changed' if path == changed else original(path)
             with patch('main.digest', side_effect=modified):
                 with self.assertRaisesRegex(ValueError, 'stale or modified plan'):
                     self.execute('apply')
@@ -103,6 +114,62 @@ class WrapperTests(unittest.TestCase):
         for state in [main.ROOT / 'state', self.out / 'state']:
             with self.assertRaisesRegex(ValueError, 'outside'):
                 main.execute('synth', self.config, state, self.out)
+
+    def test_public_manager_review_and_import_lifecycle(self):
+        arguments = ['durop-network', '--no-env', '--config', str(self.config),
+                     '--state-dir', str(self.state), '--output', str(self.out)]
+        with patch('main.subprocess.run', side_effect=self.fake_run):
+            self.assertEqual(manager.main(['plan', *arguments]), 0)
+            self.assertEqual(manager.main(['show', *arguments]), 0)
+            self.assertEqual(self.calls[-1][-2:], ['show', str(self.state / 'reviewed.tfplan')])
+            self.assertEqual(manager.main(['apply', *arguments]), 0)
+            self.calls.clear()
+            self.assertEqual(manager.main(['apply', *arguments]), 1)
+            self.assertEqual(self.calls, [])
+
+    def test_import_skips_owned_policy_and_imports_configured_dns(self):
+        self.execute('plan')
+        self.calls.clear()
+        (self.state / 'terraform.tfstate').write_text('{}')
+        data = json.loads(self.config.read_text())
+        data['magic_dns'] = True
+        self.config.write_text(json.dumps(data))
+        self.execute('import')
+        imports = [call for call in self.calls if 'import' in call]
+        self.assertEqual([call[-2:] for call in imports],
+                         [['tailscale_dns_preferences.dns', 'dns_preferences']])
+        self.assertFalse((self.state / 'reviewed.json').exists())
+        self.assertFalse((self.state / 'reviewed.tfplan').exists())
+
+    def test_fresh_import_only_adopts_policy_when_dns_unowned(self):
+        self.execute('import')
+        imports = [call for call in self.calls if 'import' in call]
+        self.assertEqual([call[-2:] for call in imports], [['tailscale_acl.policy', 'acl']])
+
+    def test_show_refuses_modified_plan_without_subprocess(self):
+        self.execute('plan')
+        self.calls.clear()
+        (self.state / 'reviewed.tfplan').write_bytes(b'changed')
+        with self.assertRaisesRegex(ValueError, 'stale or modified plan'):
+            self.execute('show')
+        self.assertEqual(self.calls, [])
+
+    def test_live_commands_require_oauth_provisioner(self):
+        with patch.dict('os.environ', {'TAILSCALE_OAUTH_CLIENT_SECRET': ''}):
+            for command in ('import', 'plan', 'apply'):
+                with self.assertRaisesRegex(ValueError, 'TAILSCALE_OAUTH_CLIENT_SECRET'):
+                    self.execute(command)
+        self.assertEqual(self.calls, [])
+
+    def test_invalid_config_invalidates_previous_plan(self):
+        self.execute('plan')
+        self.calls.clear()
+        self.config.write_text('not JSON')
+        with self.assertRaises(ValueError):
+            self.execute('plan')
+        self.assertFalse((self.state / 'reviewed.json').exists())
+        self.assertFalse((self.state / 'reviewed.tfplan').exists())
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == '__main__':
