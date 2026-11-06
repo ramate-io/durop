@@ -13,6 +13,11 @@ struct Fixture {
     events: broadcast::Sender<HostEvent>,
 }
 async fn fixture() -> Fixture {
+    fixture_with_registry(None).await
+}
+
+// Optional registry makes legacy and per-source modes share the same real socket fixture.
+async fn fixture_with_registry(registry: Option<SourceAccessRegistry>) -> Fixture {
     let (commands, commands_rx) = mpsc::channel(1);
     let (emergency, emergency_rx) = mpsc::channel(1);
     let (snapshot, snapshot_rx) = watch::channel(HostSnapshot {
@@ -33,7 +38,7 @@ async fn fixture() -> Fixture {
     .unwrap();
     // The loopback bypass exists only under cfg(test); production enable rejects it.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let session = start(
+    let session = start_with_access(
         listener,
         vec!["https://panel.example".into()],
         HostBridge {
@@ -44,6 +49,7 @@ async fn fixture() -> Fixture {
         },
         catalog,
         BindingGuard::Loopback,
+        registry,
     )
     .unwrap();
     Fixture {
@@ -579,5 +585,78 @@ async fn production_client_rejects_snapshot_behind_observed_event() {
         Err(ControllerError::Protocol)
     ));
     assert!(!client.is_connected());
+    fixture.session.close().await;
+}
+
+// Authenticate using an independently issued source secret, never the compatibility token.
+async fn connect_source(session: &RemoteSession, credential: &SessionCredential) -> Client {
+    let mut request = request(session);
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", credential.bearer()).parse().unwrap(),
+    );
+    let (mut client, _) = connect_async(request).await.unwrap();
+    assert_eq!(receive(&mut client).await["type"], "snapshot");
+    client
+}
+
+#[tokio::test]
+async fn registry_scopes_command_ids_and_revokes_only_one_source() {
+    let registry = SourceAccessRegistry::default();
+    let a = registry.issue("alice".into()).unwrap();
+    let b = registry.issue("bob".into()).unwrap();
+    let mut fixture = fixture_with_registry(Some(registry.clone())).await;
+    assert!(
+        connect_async(request(&fixture.session)).await.is_err(),
+        "compatibility credential must not bypass the registry"
+    );
+    let mut alice = connect_source(&fixture.session, &a).await;
+    let mut bob = connect_source(&fixture.session, &b).await;
+    send_json(
+        &mut alice,
+        command("same", serde_json::json!({"type":"stop_all"})),
+    )
+    .await;
+    let alice_command = fixture.emergency.recv().await.unwrap();
+    send_json(
+        &mut bob,
+        command("same", serde_json::json!({"type":"stop_all"})),
+    )
+    .await;
+    let bob_command = fixture.emergency.recv().await.unwrap();
+    assert_ne!(
+        alice_command.envelope.command_id,
+        bob_command.envelope.command_id
+    );
+    assert_eq!(alice_command.source_id.as_deref(), Some("alice"));
+    assert_eq!(bob_command.source_id.as_deref(), Some("bob"));
+    assert!(registry.set_enabled("alice", false));
+    assert!(
+        !alice_command.is_active(),
+        "revocation is synchronous for host admission"
+    );
+    assert!(bob_command.is_active());
+    disconnected(&mut alice).await;
+    bob_command
+        .reply
+        .send(CommandOutcome::Accepted { instance_id: None })
+        .unwrap();
+    assert_eq!(
+        receive(&mut bob).await["command_id"],
+        "same",
+        "wire reply uses original correlation identity"
+    );
+    send_json(&mut bob, serde_json::json!({"type":"catalog"})).await;
+    assert_eq!(receive(&mut bob).await["type"], "catalog");
+    assert!(registry.set_enabled("alice", true));
+    assert!(
+        !alice_command.is_active(),
+        "re-enabling never revives a queued request"
+    );
+    let mut alice_again = connect_source(&fixture.session, &a).await;
+    assert!(registry.revoke("alice"));
+    disconnected(&mut alice_again).await;
+    send_json(&mut bob, serde_json::json!({"type":"snapshot"})).await;
+    assert_eq!(receive(&mut bob).await["type"], "snapshot");
     fixture.session.close().await;
 }

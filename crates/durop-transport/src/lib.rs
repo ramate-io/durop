@@ -200,10 +200,15 @@ impl RemoteCatalog {
 /// Drain with try_recv on the host thread. Check is_active immediately before
 /// Host::accept, skip stale requests, then reply. StopAll uses a separate bounded lane.
 pub struct RemoteCommand {
-    /// Canonical command identity and host policy fields, unchanged by the adapter.
+    /// Host policy fields and command. Registry sessions namespace command IDs by
+    /// authenticated source; legacy sessions preserve the original command ID.
     pub envelope: Envelope,
     /// One reply to the originating connection; closure also cancels pending admission.
     pub reply: oneshot::Sender<CommandOutcome>,
+    /// Host-assigned identity for registry authentication; legacy sessions return None.
+    pub source_id: Option<String>,
+    // Revoking this controller invalidates queued commands independently of the session.
+    source: Arc<AtomicBool>,
     // Dropping the originating socket task invalidates requests already in the host queue.
     connection: Arc<AtomicBool>,
     // Ending host permission invalidates every connection's pending requests together.
@@ -211,10 +216,11 @@ pub struct RemoteCommand {
 }
 
 impl RemoteCommand {
-    /// Whether connection/session permission and the reply receiver remain live.
+    /// Whether source/connection/session permission and the reply receiver remain live.
     /// The host must check this immediately before accepting the command.
     pub fn is_active(&self) -> bool {
-        self.connection.load(Ordering::Acquire)
+        self.source.load(Ordering::Acquire)
+            && self.connection.load(Ordering::Acquire)
             && self.session.load(Ordering::Acquire)
             && !self.reply.is_closed()
     }
@@ -240,7 +246,8 @@ pub struct RemoteSession {
     pub address: SocketAddr,
     /// Host-owned recording session identity used for command validation/deduplication.
     pub session_id: String,
-    /// Fresh pairing credential; its Debug representation is redacted.
+    /// Legacy pairing credential; redacted by Debug. Registry-only sessions reject
+    /// this value and require a credential issued by `SourceAccessRegistry`.
     pub credential: SessionCredential,
     // Synchronous permission check shared with connections and application status views.
     active: Arc<AtomicBool>,
@@ -294,6 +301,28 @@ pub async fn enable(
     )
 }
 
+/// Enable a listener accepting only credentials issued by the supplied registry.
+/// The compatibility `RemoteSession::credential` is deliberately rejected here.
+/// Each authenticated source gets independent command identity and revocation guards.
+pub async fn enable_with_registry(
+    config: SessionConfig,
+    bridge: HostBridge,
+    catalog: RemoteCatalog,
+    registry: SourceAccessRegistry,
+) -> Result<RemoteSession, TransportError> {
+    config.validate()?;
+    verify_tailnet_address(config.address.ip()).await?;
+    let listener = TcpListener::bind(config.address).await?;
+    start_with_access(
+        listener,
+        config.allowed_origins,
+        bridge,
+        catalog,
+        BindingGuard::Tailnet,
+        Some(registry),
+    )
+}
+
 #[cfg(any(test, feature = "test-support"))]
 /// Enable an authenticated loopback fixture only in explicit test-support builds.
 pub async fn enable_test_loopback(
@@ -304,6 +333,24 @@ pub async fn enable_test_loopback(
     start(listener, vec![], bridge, catalog, BindingGuard::Loopback)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+/// Enable a registry-only loopback fixture under the explicit test-support feature.
+pub async fn enable_test_loopback_with_registry(
+    bridge: HostBridge,
+    catalog: RemoteCatalog,
+    registry: SourceAccessRegistry,
+) -> Result<RemoteSession, TransportError> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    start_with_access(
+        listener,
+        vec![],
+        bridge,
+        catalog,
+        BindingGuard::Loopback,
+        Some(registry),
+    )
+}
+
 /// Attach lifecycle ownership to an already verified listener and fresh credential.
 /// The drop guard also revokes permission if the task is aborted before its first poll.
 fn start(
@@ -312,6 +359,18 @@ fn start(
     bridge: HostBridge,
     catalog: RemoteCatalog,
     guard: BindingGuard,
+) -> Result<RemoteSession, TransportError> {
+    start_with_access(listener, origins, bridge, catalog, guard, None)
+}
+
+/// Construct either legacy single-secret or registry-only listener authentication.
+fn start_with_access(
+    listener: TcpListener,
+    origins: Vec<String>,
+    bridge: HostBridge,
+    catalog: RemoteCatalog,
+    guard: BindingGuard,
+    registry: Option<SourceAccessRegistry>,
 ) -> Result<RemoteSession, TransportError> {
     let address = listener.local_addr()?;
     let session_id = bridge.snapshot.borrow().session_id.clone();
@@ -324,6 +383,7 @@ fn start(
     let (revoke, mut revoked) = watch::channel(false);
     let state = Arc::new(ConnectionState {
         expected_authorization,
+        registry,
         origins,
         active: active.clone(),
         bridge,
@@ -381,6 +441,8 @@ fn start(
 struct ConnectionState {
     // Compared in constant time during upgrade; never included in responses or Debug output.
     expected_authorization: String,
+    // When present, legacy authorization is rejected; identity comes only from the secret.
+    registry: Option<SourceAccessRegistry>,
     // Exact browser origins, independent of tailnet membership and bearer permission.
     origins: Vec<String>,
     // Shared session permission; revocation is checked again before command admission.
@@ -486,17 +548,23 @@ fn handshake(
     request: &Request,
     mut response: Response,
     state: &ConnectionState,
+    lease: &mut Option<access::AccessLease>,
 ) -> Result<Response, ErrorResponse> {
     let authorized = request.headers().get_all("authorization").iter().count() == 1
         && request
             .headers()
             .get("authorization")
             .map(|value| {
-                bool::from(
-                    value
-                        .as_bytes()
-                        .ct_eq(state.expected_authorization.as_bytes()),
-                )
+                if let Some(registry) = &state.registry {
+                    *lease = registry.authenticate(value.as_bytes());
+                    lease.is_some()
+                } else {
+                    bool::from(
+                        value
+                            .as_bytes()
+                            .ct_eq(state.expected_authorization.as_bytes()),
+                    )
+                }
             })
             .unwrap_or(false);
     let origin = match request.headers().get_all("origin").iter().count() {
@@ -551,12 +619,13 @@ async fn connection(
         .write_buffer_size(0)
         .max_write_buffer_size(MAX_OUTPUT + 1024);
     // Callback requires an unboxed ErrorResponse (an upstream API constraint).
+    let mut lease = None;
     #[allow(clippy::result_large_err)]
     let upgraded = timeout(
         HANDSHAKE_TIMEOUT,
         accept_hdr_async_with_config(
             tcp,
-            |request: &Request, response| handshake(request, response, &state),
+            |request: &Request, response| handshake(request, response, &state, &mut lease),
             Some(config),
         ),
     )
@@ -564,6 +633,14 @@ async fn connection(
     let Ok(Ok(mut ws)) = upgraded else {
         return;
     };
+    let source = lease
+        .as_ref()
+        .map(|lease| lease.active.clone())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+    let mut source_revoked = lease.as_ref().map(|lease| lease.revoked.subscribe());
+    if !source.load(Ordering::Acquire) {
+        return;
+    }
     let mut events = state.bridge.events.subscribe();
     let snapshot = state.bridge.snapshot.borrow().clone();
     if !send(
@@ -584,6 +661,12 @@ async fn connection(
         tokio::select! {
             biased;
             _ = revoked.changed() => break,
+            _ = async {
+                match source_revoked.as_mut() {
+                    Some(revoked) => { let _ = revoked.changed().await; },
+                    None => std::future::pending::<()>().await,
+                }
+            } => break,
             _ = tokio::time::sleep_until(idle_deadline) => break,
             incoming = ws.next() => {
                 let Some(Ok(message)) = incoming else { break; };
@@ -593,7 +676,7 @@ async fn connection(
                     requests = 0;
                 }
                 requests += 1;
-                if requests > REQUESTS_PER_SECOND || !state.active.load(Ordering::Acquire) { break; }
+                if requests > REQUESTS_PER_SECOND || !state.active.load(Ordering::Acquire) || !source.load(Ordering::Acquire) { break; }
                 let Message::Text(text) = message else {
                     match message {
                         Message::Ping(bytes) => {
@@ -611,10 +694,12 @@ async fn connection(
                     ClientMessage::Snapshot => { let snapshot = state.bridge.snapshot.borrow().clone(); send(&mut ws, &ServerMessage::Snapshot { snapshot: &snapshot }).await },
                     ClientMessage::Catalog => send(&mut ws, &ServerMessage::Catalog { catalog: &state.catalog.metadata }).await,
                     ClientMessage::Icon { clip_id } => match state.catalog.icons.get(&clip_id) { Some(png) => send(&mut ws, &ServerMessage::Icon { clip_id: &clip_id, png }).await, None => send(&mut ws, &ServerMessage::Error { code: "unknown_icon" }).await },
-                    ClientMessage::Command { envelope } => {
+                    ClientMessage::Command { mut envelope } => {
                         // Revision, IDs, deduplication, and playback remain authoritative in Host.
                         if envelope.session_id != state.session_id || envelope.protocol_version != PROTOCOL_VERSION { break; }
                         let command_id = envelope.command_id.clone();
+                        if command_id.is_empty() || command_id.len() > 128 { break; }
+                        if let Some(lease) = &lease { envelope.command_id = lease.command_id(&command_id); }
                         let emergency = matches!(envelope.command, PlaybackCommand::StopAll);
                         if pending.is_some() && !emergency {
                             if !send(&mut ws, &ServerMessage::Error { code: "busy" }).await { break; }
@@ -625,7 +710,7 @@ async fn connection(
                             pending = None;
                         }
                         let (reply, received) = oneshot::channel();
-                        let command = RemoteCommand { envelope, reply, connection: live.clone(), session: state.active.clone() };
+                        let command = RemoteCommand { envelope, reply, source_id: lease.as_ref().map(|lease| lease.source_id.clone()), source: source.clone(), connection: live.clone(), session: state.active.clone() };
                         let queue = if emergency { &state.bridge.emergency } else { &state.bridge.commands };
                         if queue.try_send(command).is_err() {
                             send(&mut ws, &ServerMessage::Error { code: "busy" }).await
@@ -794,6 +879,28 @@ async fn tailscale_output(arguments: &[&str]) -> Result<Vec<u8>, TransportError>
     Ok(output)
 }
 
+/// Discover the current local Tailscale device ID through bounded read-only CLI status.
+/// No device/account data beyond the identifier is returned. A stopped daemon fails closed.
+pub async fn local_device_id() -> Result<String, TransportError> {
+    let status: Value = serde_json::from_slice(&tailscale_output(&["status", "--json"]).await?)
+        .map_err(|_| TransportError::TailnetUnavailable)?;
+    if status.get("BackendState").and_then(Value::as_str) != Some("Running") {
+        return Err(TransportError::TailnetUnavailable);
+    }
+    status
+        .pointer("/Self/ID")
+        .and_then(Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .map(str::to_owned)
+        .ok_or(TransportError::TailnetUnavailable)
+}
+
 /// Read-only, bounded report; never invokes enrollment or policy changes. No raw
 /// status JSON is returned because it can include unrelated account/device details.
 pub async fn diagnostics(peer: Option<IpAddr>) -> Result<Value, TransportError> {
@@ -816,10 +923,17 @@ pub async fn diagnostics(peer: Option<IpAddr>) -> Result<Value, TransportError> 
     )
 }
 
+mod access;
+
+/// Tailscale invitation and host-only administration credential contracts.
+pub mod invitations;
+
 mod client;
 
 #[cfg(test)]
 mod tests;
+
+pub use access::{SourceAccess, SourceAccessRegistry};
 
 pub use client::{ControllerClient, ControllerError, ControllerUpdate};
 
