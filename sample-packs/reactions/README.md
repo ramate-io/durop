@@ -1,20 +1,23 @@
 # Reactions: screen classics and real cues
 
-30 offline clips: **12 animated GIFs, 12 MP3 sounds and 6 H.264 MP4 videos**,
+31 offline clips: **12 animated GIFs, 12 MP3 sounds and 7 H.264 MP4 videos**,
 about 19 MiB including 320-pixel PNG thumbnails. Includes Obama's mic drop,
 Keaton's falling-house stunt, Chaplin, Feline Follies, the Spinning Dancer,
 real applause/laughter/crickets/drums, and six historic NASA callouts. This is a
 curated collection of reusable classics and reaction cues; no popularity ranking
-is implied. The MP4 excerpts are silent because their original sources are silent.
+is implied. Holly the cat’s bird-chatter video includes its original soundtrack;
+the other six MP4 excerpts have silent sources.
 The DOE nuclear-test clips depict an actual nuclear flash/cloud.
 
-All six MP4s have one H.264 video stream and **zero audio streams**, verified by
-stream inspection. For audible cues, select one of the twelve sound entries.
-Durop's production AVFoundation path also plays audio embedded in videos, using
-the same player and clock as the video; this pack's silent excerpts cannot test
-that capability. The separate `fixtures/media/flash-beep.mp4` contains an actual
-AAC soundtrack for A/V acceptance. Native command-line probes are intentionally
-muted and do not establish speaker output.
+**Holly the cat: bird chatter** (`videos/cat-chirps.mp4`) has H.264 video and an
+AAC stereo soundtrack, retained from Ali T's original recording under CC BY 2.0.
+Search for **Holly** or **audio** and click its card to test video with sound.
+The other six MP4s have no audio stream. Durop's production AVFoundation path
+plays embedded sound using the same player and clock as the video. The separate
+`fixtures/media/flash-beep.mp4` is also available for A/V acceptance. The converted soundtrack decodes to nonzero samples (mean −27.8 dB, peak −3.4 dB).
+The native AVFoundation probe delivered 117 frames at 480×360 over its four-second
+window. Native command-line probes are intentionally muted and do not establish
+speaker output.
 
 Each item has a distinct title, tags, real media and an adjacent thumbnail.
 Visual excerpts from the same source occupy separate nonoverlapping intervals.
@@ -35,7 +38,8 @@ linked source for its jurisdiction and basis, particularly early US films.
   license/notice URL, original duration, selected interval and transformation.
 - [SHA256SUMS](SHA256SUMS) pins all output media, metadata and thumbnails.
 - [CC BY-SA 4.0](LICENSES/CC-BY-SA-4.0.txt),
-  [CC BY-SA 3.0](LICENSES/CC-BY-SA-3.0.txt) and
+  [CC BY-SA 3.0](LICENSES/CC-BY-SA-3.0.txt),
+  [CC BY 2.0](LICENSES/CC-BY-2.0.txt) and
   [CC0 1.0](LICENSES/CC0-1.0.txt) full legal texts accompany the assets.
 
 The mic-drop adaptation is distributed under **CC BY-SA 4.0**, credited to
@@ -53,8 +57,12 @@ supplied as pack branding. Recognizable people's privacy/publicity rights and
 commercial advertising restrictions remain applicable; the media policy is not a
 blanket trademark or endorsement license.
 
+Holly’s video and thumbnail are distributed under CC BY 2.0. The five-second
+excerpt is resized and transcoded; its original soundtrack is retained.
+
 | Clip | Author / credit | Source and terms |
 | --- | --- | --- |
+| Holly the cat: bird chatter | Ali T | [Original](https://www.flickr.com/photos/77682540@N00/3392069087/) · [Commons copy and license review](https://commons.wikimedia.org/wiki/File:Cat_making_noises_at_the_birds_outside.webm) · [CC BY 2.0](https://creativecommons.org/licenses/by/2.0/) |
 | Obama: mic drop | The White House; GIF adaptation by Jdlrobson | [Source](https://commons.wikimedia.org/wiki/File:Barack_Obama_drops_the_mic.gif) · [CC BY-SA 4.0 (GIF adaptation); underlying White House footage is a US government work](https://creativecommons.org/licenses/by-sa/4.0/) |
 | Chaplin: hat tip (illustration) | Akumiszcza (source photo); Nevit Dilmen (image/GIF adaptation) | [Source](https://commons.wikimedia.org/wiki/File:Charlie_Chaplin.gif) · [Public domain](https://commons.wikimedia.org/wiki/File:Charlie_Chaplin.gif) |
 | Keaton: house falls around him | Joseph Schenck and Buster Keaton (production), Charles Reisner (direction). | [Source](https://commons.wikimedia.org/wiki/File:GIF_of_Buster_Keaton_in_%22Steamboat_Bill_Jr%22_1928.gif) · [Public domain](https://commons.wikimedia.org/wiki/File:GIF_of_Buster_Keaton_in_"Steamboat_Bill_Jr"_1928.gif) |
@@ -109,8 +117,8 @@ uses finite inputs for GIF palette generation and bounds each conversion to 90s.
 Different FFmpeg versions may produce different output hashes; review new output
 and provenance before accepting regenerated SHA256SUMS.
 
-Validated locally: all 30 clips load through `durop_catalog::Catalog::load`,
-all 30 media files decode fully in FFmpeg, all output hashes match, and both
+Validated locally: all 31 clips load through `durop_catalog::Catalog::load`,
+all 31 media files decode fully in FFmpeg, all output hashes match, and both
 full and metadata-only pack checks pass. Structural catalog validation still
 reports decoder readiness as unchecked; these checks do not establish audible
 hardware output, AVFoundation presentation or visual compositing in the app.

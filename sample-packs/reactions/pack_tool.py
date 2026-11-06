@@ -85,9 +85,9 @@ def build(args, entries):
 
 def verify(args, entries):
     """Check independent clips, provenance, containment, thumbnails and bounded decodes."""
-    assert len(entries) == 30, 'expected 30 curated assets'
-    assert len({entry['id'] for entry in entries}) == 30
-    assert collections.Counter(e['format'] for e in entries) == {'gif': 12, 'mp3': 12, 'mp4': 6}
+    assert len(entries) == 31, 'expected 31 curated assets'
+    assert len({entry['id'] for entry in entries}) == 31
+    assert collections.Counter(e['format'] for e in entries) == {'gif': 12, 'mp3': 12, 'mp4': 7}
     hashes = set()
     expected = set()
     for line in (ROOT / 'SHA256SUMS').read_text().splitlines():
@@ -97,7 +97,7 @@ def verify(args, entries):
         assert not path.is_symlink() and path.is_file(), name
         assert sha256(path) == digest, name
         expected.add(path)
-    assert len(expected) == 91, 'manifest plus three files per clip must be hash-pinned'
+    assert len(expected) == 94, 'manifest plus three files per clip must be hash-pinned'
     assert sum(p.stat().st_size for p in ROOT.rglob('*') if p.is_file()) < MAX_PACK_BYTES
     for entry in entries:
         for key in ('source_url', 'source_sha256', 'author', 'license', 'license_url', 'source_page', 'changes'):
@@ -119,9 +119,12 @@ def verify(args, entries):
         # A complete decode catches truncated/corrupt containers, not just headers.
         if not args.metadata_only:
             run(args.ffmpeg, '-i', media, '-f', 'null', '-')
+            # Sound-bearing videos must retain a decodable audio stream after conversion.
+            if entry['format'] == 'mp4' and entry.get('silent') is False:
+                run(args.ffmpeg, '-i', media, '-map', '0:a:0', '-f', 'null', '-')
     actual_metadata = set(ROOT.glob('*/*.json'))
     assert actual_metadata == {p for p in expected if p.suffix == '.json' and p.name != 'durop.json'}
-    print('Verified 30 unique media clips:', dict(collections.Counter(e['format'] for e in entries)))
+    print('Verified 31 unique media clips:', dict(collections.Counter(e['format'] for e in entries)))
 
 
 def main():

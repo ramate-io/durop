@@ -47,9 +47,11 @@ applies that value with `AVPlayer::setVolume` before starting the same player.
 The command-line `--media-probe` deliberately passes `volume: 0.0`. Extracting
 video frames does not require a separate audio player or Bevy audio component.
 
-The six MP4s in `sample-packs/reactions/videos` contain one H.264 video stream
-and **no audio stream**. Their silent source excerpts cannot demonstrate video
-soundtrack playback. For an actual combined A/V input, `fixtures/media/flash-beep.mp4`
+The bundled `sample-packs/reactions/videos/cat-chirps.mp4` contains H.264 video
+and AAC stereo audio retained from Ali T's CC BY 2.0 recording. Select **Holly the
+cat: bird chatter** in the default catalog to exercise production video with sound.
+The other six bundled MP4s have silent sources and no audio stream.
+For a synthetic combined A/V input, `fixtures/media/flash-beep.mp4`
 contains H.264 video and AAC mono audio at 44.1 kHz. Its soundtrack decoded to
 nonzero samples in the November 5, 2026 check (mean −26.3 dB, peak −11.7 dB).
 The muted native probe prepared, advanced and completed that combined asset;

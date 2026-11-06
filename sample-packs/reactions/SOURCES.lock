@@ -678,5 +678,30 @@
     "changes": "Source 4–8s; resized/transcoded to mp4; source-frame PNG thumbnail.",
     "source_duration_seconds": 8.24,
     "silent": true
+  },
+  {
+    "source_url": "https://upload.wikimedia.org/wikipedia/commons/1/18/Cat_making_noises_at_the_birds_outside.webm",
+    "source_sha256": "804cdc2b06c68cde6e01676a946823d801b05994985d553a8acfb009670446d4",
+    "author": "Ali T",
+    "license": "CC BY 2.0",
+    "license_url": "https://creativecommons.org/licenses/by/2.0/",
+    "source_page": "https://commons.wikimedia.org/wiki/File:Cat_making_noises_at_the_birds_outside.webm",
+    "id": "cat-chirps",
+    "title": "Holly the cat: bird chatter",
+    "category": "videos",
+    "format": "mp4",
+    "start_seconds": 0,
+    "duration_seconds": 5,
+    "tags": [
+      "cat",
+      "birds",
+      "chatter",
+      "audio",
+      "reaction"
+    ],
+    "source_title": "Cat making noises at the birds outside",
+    "changes": "Source 0–5s; resized/transcoded to H.264/AAC MP4 retaining the original stereo soundtrack; source-frame PNG thumbnail.",
+    "source_duration_seconds": 5.042,
+    "silent": false
   }
 ]

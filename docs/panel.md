@@ -2,7 +2,7 @@
 
 Run `cargo run -p durop --bin durop --locked` inside `nix develop`. The controller
 and overlay share one process. The default [reaction catalog](../sample-packs/reactions)
-contains 30 offline GIFs, sounds and videos with attribution and redistribution terms.
+contains 31 offline GIFs, sounds and videos with attribution and redistribution terms.
 
 ## Collection and configuration
 
@@ -94,6 +94,6 @@ native development preview: grid, popup stacking, long titles, masked validation
 cancel, catalog loading, scrollbar reachability and active card controls. A 720×520
 preview verified compact cards and form scrolling with persistent Apply/Cancel.
 The window has a 400×520 minimum; desktop defaults remain 1160×820. Native
-muted probes completed for GIF, MP3 and MP4; all 30 assets passed full FFmpeg decode.
+muted probes completed for GIF, MP3 and MP4; all 31 assets passed full FFmpeg decode.
 These checks do not establish audible output, recorded A/V sync, fullscreen or
 two-Mac acceptance; those remain in the [operator acceptance](acceptance.md).

@@ -822,7 +822,7 @@ mod tests {
     #[test]
     fn bundled_reactions_are_complete_and_cover_all_three_media_kinds() {
         let catalog = crate::catalog::load_local(&Config::bundled_pack()).unwrap();
-        assert_eq!(catalog.clips.len(), 30);
+        assert_eq!(catalog.clips.len(), 31);
         let kinds: std::collections::BTreeSet<_> = catalog
             .clips
             .iter()
