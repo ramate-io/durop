@@ -1,7 +1,7 @@
 //! Application modes and the real host/media bridge. No decoder work runs in UI code.
 use crate::{
-    catalog::{Anchor, Catalog, CatalogCache, Clip, Fit, PackSource},
-    commands::{Envelope, PROTOCOL_VERSION, PlaybackCommand},
+    catalog::{Catalog, CatalogCache, Clip, Fit, PackSource},
+    commands::{Envelope, PROTOCOL_VERSION, PlaybackCommand, VisualPlacement},
     host::{BackendEffect, BackendEvent, BackendEventKind, BackendToken, Host},
     media::{MediaEventKind, MediaSpec, MediaWorker},
     overlay::{OVERLAY_LAYER, OverlayWindow, PlaybackOverlay},
@@ -151,6 +151,20 @@ pub enum Destination {
 pub enum Action {
     /// Request playback of a stable clip identifier.
     Play(String),
+    /// Request visual playback with a bounded per-occurrence placement override.
+    PlayVisual {
+        /// Stable catalog identity admitted by the selected host.
+        clip_id: String,
+        /// Position and fit-box width in normalized host-display coordinates.
+        placement: VisualPlacement,
+    },
+    /// Change or reset one live visual occurrence without restarting its decoder.
+    SetVisual {
+        /// Host occurrence identity, including occurrences still preparing.
+        instance_id: String,
+        /// Explicit override, or None to restore the catalog default.
+        placement: Option<VisualPlacement>,
+    },
     /// Stop one host occurrence.
     Stop(String),
     /// Stop all local playback and the selected remote host.
@@ -187,6 +201,8 @@ struct Playback {
     worker: MediaWorker,
     /// Immutable metadata and file paths pinned for this playback.
     clip: Clip,
+    /// Explicit occurrence override; None resolves the immutable catalog default.
+    placement: Option<VisualPlacement>,
     /// Texture handle reused as decoded frames arrive.
     image: Option<Handle<Image>>,
     /// Overlay entity presenting the current texture.
@@ -322,6 +338,28 @@ impl Runtime {
         }
     }
 
+    /// Route every occurrence command through the selected controller admission path.
+    fn submit_selected(
+        &mut self,
+        command: PlaybackCommand,
+        network: &mut crate::network_app::NetworkState,
+    ) {
+        if self.destination == Destination::Remote {
+            network
+                .actions
+                .push_back(crate::network_app::NetworkAction::RemoteCommand(command));
+        } else if !self.enabled
+            && matches!(
+                command,
+                PlaybackCommand::Play { .. } | PlaybackCommand::PlayVisual { .. }
+            )
+        {
+            self.status = "Start the local host before playing".into();
+        } else {
+            self.submit(command, network);
+        }
+    }
+
     /// Request local cleanup and, when selected, a remote stop without claiming completion.
     pub(crate) fn request_stop_all(&mut self, network: &mut crate::network_app::NetworkState) {
         self.status = "Stop all requested; waiting for playback resources to stop".into();
@@ -377,28 +415,28 @@ pub(crate) fn actions(
     for action in actions.0.drain(..) {
         match action {
             Action::Play(clip_id) => {
-                if runtime.destination != Destination::Local {
-                    network
-                        .actions
-                        .push_back(crate::network_app::NetworkAction::RemoteCommand(
-                            PlaybackCommand::Play { clip_id },
-                        ));
-                } else if !runtime.enabled {
-                    runtime.status = "Start the local host before playing".into();
-                } else {
-                    runtime.submit(PlaybackCommand::Play { clip_id }, &mut network);
-                }
+                runtime.submit_selected(PlaybackCommand::Play { clip_id }, &mut network);
+            }
+            Action::PlayVisual { clip_id, placement } => {
+                runtime.submit_selected(
+                    PlaybackCommand::PlayVisual { clip_id, placement },
+                    &mut network,
+                );
+            }
+            Action::SetVisual {
+                instance_id,
+                placement,
+            } => {
+                runtime.submit_selected(
+                    PlaybackCommand::SetVisual {
+                        instance_id,
+                        placement,
+                    },
+                    &mut network,
+                );
             }
             Action::Stop(instance_id) => {
-                if runtime.destination == Destination::Remote {
-                    network
-                        .actions
-                        .push_back(crate::network_app::NetworkAction::RemoteCommand(
-                            PlaybackCommand::Stop { instance_id },
-                        ));
-                } else {
-                    runtime.submit(PlaybackCommand::Stop { instance_id }, &mut network);
-                }
+                runtime.submit_selected(PlaybackCommand::Stop { instance_id }, &mut network);
             }
             Action::StopAll => runtime.request_stop_all(&mut network),
             Action::ToggleHost => {
@@ -590,6 +628,7 @@ pub(crate) fn media_bridge(
                 crate::diagnostics::first_frame_submitted(&playback.token.instance_id);
                 let (size, position) = Playback::placement(
                     &playback.clip,
+                    playback.placement,
                     Vec2::new(frame.width as f32, frame.height as f32),
                     Vec2::new(window.width(), window.height()),
                 );
@@ -597,6 +636,7 @@ pub(crate) fn media_bridge(
                 sprite.custom_size = Some(size);
                 sprite.rect = Playback::frame_crop(
                     &playback.clip,
+                    playback.placement,
                     playback.dimensions.as_vec2(),
                     Vec2::new(window.width(), window.height()),
                 );
@@ -617,12 +657,14 @@ pub(crate) fn media_bridge(
         {
             let (size, position) = Playback::placement(
                 &playback.clip,
+                playback.placement,
                 playback.dimensions.as_vec2(),
                 Vec2::new(window.width(), window.height()),
             );
             sprite.custom_size = Some(size);
             sprite.rect = Playback::frame_crop(
                 &playback.clip,
+                playback.placement,
                 playback.dimensions.as_vec2(),
                 Vec2::new(window.width(), window.height()),
             );
@@ -651,7 +693,11 @@ pub(crate) fn media_bridge(
         }
         for effect in effects {
             match effect {
-                BackendEffect::Prepare { token, clip } => {
+                BackendEffect::Prepare {
+                    token,
+                    clip,
+                    placement,
+                } => {
                     let worker = MediaWorker::spawn();
                     let result = worker.prepare(MediaSpec {
                         path: clip.asset_path.clone(),
@@ -668,6 +714,7 @@ pub(crate) fn media_bridge(
                                     token,
                                     worker,
                                     clip: *clip,
+                                    placement,
                                     image: None,
                                     sprite: None,
                                     failure: None,
@@ -679,6 +726,11 @@ pub(crate) fn media_bridge(
                             token,
                             event: BackendEventKind::Failed { message },
                         }),
+                    }
+                }
+                BackendEffect::SetVisual { token, placement } => {
+                    if let Some(playback) = runtime.workers.get_mut(&token.instance_id) {
+                        playback.set_visual(&token, placement);
                     }
                 }
                 BackendEffect::Start { token } => {
@@ -772,14 +824,37 @@ impl Playback {
         )
     }
 
-    /// Fit and anchor a clip within the current logical viewport without stretching it.
-    fn placement(clip: &Clip, frame: Vec2, viewport: Vec2) -> (Vec2, Vec2) {
-        let fraction = clip
-            .metadata
-            .visual
-            .as_ref()
-            .map_or(0.3, |v| v.width_fraction as f32);
-        let target = Vec2::splat((viewport.x * fraction).min(viewport.y));
+    /// Apply a live override only to the worker generation that the host authorized.
+    fn set_visual(&mut self, token: &BackendToken, placement: Option<VisualPlacement>) {
+        if self.token.instance_id == token.instance_id && self.token.generation == token.generation
+        {
+            self.placement = placement;
+        }
+    }
+
+    /// Retain exact catalog sizing when no override is active, sharing the box with crop math.
+    fn fit_target(clip: &Clip, placement: Option<VisualPlacement>, viewport: Vec2) -> Vec2 {
+        let fraction = placement.map_or_else(
+            || {
+                clip.metadata
+                    .visual
+                    .as_ref()
+                    .map_or(0.3, |visual| visual.width_fraction as f32)
+            },
+            |placement| f32::from(placement.width_bps) / 10_000.0,
+        );
+        Vec2::splat((viewport.x * fraction).min(viewport.y))
+    }
+
+    /// Fit a clip within the current overlay monitor and keep normalized positions on screen.
+    fn placement(
+        clip: &Clip,
+        placement: Option<VisualPlacement>,
+        frame: Vec2,
+        viewport: Vec2,
+    ) -> (Vec2, Vec2) {
+        let target = Self::fit_target(clip, placement, viewport);
+        let placement = placement.or_else(|| Host::default_placement(clip));
         let fit = clip.metadata.visual.as_ref().map(|v| &v.fit);
         let ratios = target / frame;
         let scale = if matches!(fit, Some(Fit::Cover)) {
@@ -792,24 +867,26 @@ impl Playback {
         } else {
             frame * scale
         };
-        let offset = (viewport - size) * 0.5;
-        let position = match clip.metadata.visual.as_ref().map(|v| &v.anchor) {
-            Some(Anchor::TopLeft) => Vec2::new(-offset.x, offset.y),
-            Some(Anchor::TopRight) => offset,
-            Some(Anchor::BottomLeft) => -offset,
-            Some(Anchor::BottomRight) => Vec2::new(offset.x, -offset.y),
-            _ => Vec2::ZERO,
-        };
+        let travel = viewport - size;
+        let normalized = placement.map_or(Vec2::splat(0.5), |p| {
+            Vec2::new(f32::from(p.x_bps), f32::from(p.y_bps)) / 10_000.0
+        });
+        let position = travel * (normalized - Vec2::splat(0.5)) * Vec2::new(1.0, -1.0);
         (size, position)
     }
 
-    /// Compute a centered source rectangle for cover-fit clips; contain-fit clips remain uncropped.
-    fn frame_crop(clip: &Clip, frame: Vec2, viewport: Vec2) -> Option<Rect> {
+    /// Compute a centered source rectangle using the same effective width as placement.
+    fn frame_crop(
+        clip: &Clip,
+        placement: Option<VisualPlacement>,
+        frame: Vec2,
+        viewport: Vec2,
+    ) -> Option<Rect> {
         let visual = clip.metadata.visual.as_ref()?;
         if !matches!(visual.fit, Fit::Cover) {
             return None;
         }
-        let target = Vec2::splat((viewport.x * visual.width_fraction as f32).min(viewport.y));
+        let target = Self::fit_target(clip, placement, viewport);
         let scale = (target / frame).max_element();
         Some(Rect::from_center_size(frame * 0.5, target / scale))
     }
@@ -818,6 +895,7 @@ impl Playback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Anchor;
 
     #[test]
     fn bundled_reactions_are_complete_and_cover_all_three_media_kinds() {
@@ -916,20 +994,125 @@ mod tests {
         visual.anchor = Anchor::BottomRight;
         visual.fit = Fit::Contain;
         let (size, position) =
-            Playback::placement(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.));
+            Playback::placement(&clip, None, Vec2::new(200., 100.), Vec2::new(800., 600.));
         assert_eq!(size, Vec2::new(200., 100.));
         assert_eq!(position, Vec2::new(300., -250.));
         assert!(
-            Playback::frame_crop(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.)).is_none()
+            Playback::frame_crop(&clip, None, Vec2::new(200., 100.), Vec2::new(800., 600.))
+                .is_none()
         );
         clip.metadata.visual.as_mut().unwrap().fit = Fit::Cover;
         let (size, position) =
-            Playback::placement(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.));
+            Playback::placement(&clip, None, Vec2::new(200., 100.), Vec2::new(800., 600.));
         assert_eq!(size, Vec2::splat(200.));
         assert_eq!(position, Vec2::new(300., -200.));
-        let crop =
-            Playback::frame_crop(&clip, Vec2::new(200., 100.), Vec2::new(800., 600.)).unwrap();
+        let crop = Playback::frame_crop(&clip, None, Vec2::new(200., 100.), Vec2::new(800., 600.))
+            .unwrap();
         assert_eq!(crop.min, Vec2::new(50., 0.));
         assert_eq!(crop.max, Vec2::new(150., 100.));
+    }
+
+    #[test]
+    fn placement_overrides_preserve_aspect_and_bounds_on_each_monitor_shape() {
+        let catalog =
+            crate::catalog::load_local(&resource_root().join("sample-packs/podcast-pack")).unwrap();
+        let mut clip = catalog
+            .clips
+            .iter()
+            .find(|clip| clip.metadata.visual.is_some())
+            .unwrap()
+            .clone();
+        for fit in [Fit::Contain, Fit::Cover] {
+            clip.metadata.visual.as_mut().unwrap().fit = fit.clone();
+            for viewport in [Vec2::new(800., 600.), Vec2::new(600., 1000.)] {
+                for frame in [
+                    Vec2::new(1920., 1080.),
+                    Vec2::new(100., 300.),
+                    Vec2::splat(256.),
+                ] {
+                    for width_bps in [1, 2500, 10_000] {
+                        for (x_bps, y_bps) in [
+                            (0, 0),
+                            (10_000, 0),
+                            (0, 10_000),
+                            (10_000, 10_000),
+                            (5000, 5000),
+                        ] {
+                            let placement = Some(VisualPlacement {
+                                width_bps,
+                                x_bps,
+                                y_bps,
+                            });
+                            let (size, center) =
+                                Playback::placement(&clip, placement, frame, viewport);
+                            assert!(size.x <= viewport.x + 0.001 && size.y <= viewport.y + 0.001);
+                            assert!(center.x.abs() + size.x * 0.5 <= viewport.x * 0.5 + 0.001);
+                            assert!(center.y.abs() + size.y * 0.5 <= viewport.y * 0.5 + 0.001);
+                            let source = Playback::frame_crop(&clip, placement, frame, viewport)
+                                .map_or(frame, |rect| rect.size());
+                            assert!((size.x / size.y - source.x / source.y).abs() < 0.0001);
+                            if x_bps == 0 {
+                                assert!((center.x - size.x * 0.5 + viewport.x * 0.5).abs() < 0.001);
+                            }
+                            if y_bps == 0 {
+                                assert!((center.y + size.y * 0.5 - viewport.y * 0.5).abs() < 0.001);
+                            }
+                            if x_bps == 10_000 {
+                                assert!((center.x + size.x * 0.5 - viewport.x * 0.5).abs() < 0.001);
+                            }
+                            if y_bps == 10_000 {
+                                assert!((center.y - size.y * 0.5 + viewport.y * 0.5).abs() < 0.001);
+                            }
+                            if x_bps == 5000 && y_bps == 5000 {
+                                assert_eq!(center, Vec2::ZERO);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_placement_preserves_worker_and_rejects_stale_generation() {
+        let catalog =
+            crate::catalog::load_local(&resource_root().join("sample-packs/podcast-pack")).unwrap();
+        let clip = catalog
+            .clips
+            .iter()
+            .find(|clip| clip.metadata.visual.is_some())
+            .unwrap()
+            .clone();
+        let token = BackendToken {
+            instance_id: "visual".into(),
+            generation: 7,
+        };
+        let mut playback = Playback {
+            token: token.clone(),
+            worker: MediaWorker::spawn(),
+            clip,
+            placement: None,
+            image: None,
+            sprite: None,
+            failure: None,
+            dimensions: UVec2::new(200, 100),
+        };
+        let worker = &playback.worker as *const MediaWorker;
+        let placement = VisualPlacement {
+            width_bps: 4000,
+            x_bps: 0,
+            y_bps: 10_000,
+        };
+        let mut stale = token.clone();
+        stale.generation -= 1;
+        playback.set_visual(&stale, Some(placement));
+        assert_eq!(playback.placement, None);
+        playback.set_visual(&token, Some(placement));
+        assert_eq!(playback.placement, Some(placement));
+        assert_eq!(playback.dimensions, UVec2::new(200, 100));
+        assert_eq!(&playback.worker as *const MediaWorker, worker);
+        assert!(playback.worker.drain_events().is_empty());
+        playback.set_visual(&token, None);
+        assert_eq!(playback.placement, None);
     }
 }

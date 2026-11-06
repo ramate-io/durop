@@ -52,6 +52,35 @@ then leaves a focused editor, and otherwise stops playback. Space outside editin
 plays the first visible local tile. Bundled fonts have limited script coverage;
 missing glyphs do not discard the underlying search text.
 
+## Experimental visual placement
+
+GIF and video cards include **Edit**. The placement dialog changes the selected
+clip's scale and horizontal/vertical position for the destination host display.
+Audio cards have no placement controls.
+
+- **Scale** is the fitting area's width as a percentage of the host display
+  width, greater than 0% and at most 100%. The area is capped to the display
+  height; the catalog's contain/cover rule still controls aspect ratio and crop.
+- **Horizontal** runs from 0% at the left edge to 100% at the right edge.
+- **Vertical** runs from 0% at the top edge to 100% at the bottom edge.
+
+Position percentages interpolate over the available space around the rendered
+media, keeping it on-screen: 50% centers it and 100% aligns its far edge. Values
+refer to the host's selected display, not the controller window, and accept two
+decimal places.
+
+**Apply** remembers the adjustment for this controller session and updates active
+occurrences of this clip without restarting their decoder or soundtrack. **Send**
+applies the adjustment and requests playback. **Reset to defaults** restores the
+catalog's scale and anchor in the draft; Apply or Send commits that reset.
+**Cancel** discards the draft. New host sessions, destinations or catalog revisions
+clear remembered overrides; this experiment does not rewrite pack metadata or
+persist placement preferences to disk.
+
+Local and Tailscale controllers use the same host command policy. Invalid values,
+stale catalogs and finished/stopping occurrences cannot be updated. The wire
+protocol is version 2 (`durop.v2`); run the same build on host and controller.
+
 ## Launch and persistence
 
 ```sh

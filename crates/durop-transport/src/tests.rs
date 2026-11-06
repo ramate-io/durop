@@ -90,7 +90,7 @@ async fn send_json(client: &mut Client, value: Value) {
         .unwrap();
 }
 fn command(id: &str, kind: Value) -> Value {
-    serde_json::json!({"type":"command","envelope":{"protocolVersion":1,"sessionId":"test-session","commandId":id,"catalogRevision":"abc","command":kind}})
+    serde_json::json!({"type":"command","envelope":{"protocolVersion":PROTOCOL_VERSION,"sessionId":"test-session","commandId":id,"catalogRevision":"abc","command":kind}})
 }
 async fn disconnected(client: &mut Client) {
     let next = timeout(Duration::from_secs(2), client.next())
@@ -130,7 +130,7 @@ async fn authentication_path_origin_and_version_are_required() {
             4 => {
                 request
                     .headers_mut()
-                    .insert("sec-websocket-protocol", "durop.v2".parse().unwrap());
+                    .insert("sec-websocket-protocol", "durop.v1".parse().unwrap());
             }
             5 => {
                 request
@@ -284,7 +284,7 @@ async fn disconnect_cancels_pending_command_and_revoke_closes_all_access() {
 async fn malformed_oversized_and_wrong_identity_never_reach_host() {
     let mut fixture = fixture().await;
     let mut wrong_version = command("version", serde_json::json!({"type":"stop_all"}));
-    wrong_version["envelope"]["protocolVersion"] = 2.into();
+    wrong_version["envelope"]["protocolVersion"] = (PROTOCOL_VERSION + 1).into();
     let mut wrong_session = command("session", serde_json::json!({"type":"stop_all"}));
     wrong_session["envelope"]["sessionId"] = "stale".into();
     for text in [

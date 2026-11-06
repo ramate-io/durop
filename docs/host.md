@@ -1,8 +1,18 @@
 # Playback authority
 
-`commands.rs` owns the version 1 local/remote wire contract. `host.rs` owns policy decisions and a catalog snapshot pinned with `Arc<Catalog>` for the session. Create a fresh session ID for every new host; ending a recording must stop all workers before retiring that host. A new catalog revision takes effect in a new session, never underneath active playback.
+`durop-protocol` owns the version 2 local/remote wire contract. `durop-host` owns policy decisions and a catalog snapshot pinned with `Arc<Catalog>` for the session. Create a fresh session ID for every new host; ending a recording must stop all workers before retiring that host. A new catalog revision takes effect in a new session, never underneath active playback.
 
-An envelope contains `protocolVersion`, `sessionId`, `commandId`, `catalogRevision`, and `command`. Commands use a `type` tag: `play` with `clip_id`, `stop` with `instance_id`, or `stop_all`. Clip IDs are stable catalog identities such as `pack/clip`. Callers cannot override asset paths, playback limits, looping, or placement. Unknown envelope/command fields fail deserialization.
+An envelope contains `protocolVersion`, `sessionId`, `commandId`, `catalogRevision`, and `command`. Commands use a `type` tag: `play` with `clip_id`, `stop` with `instance_id`, or `stop_all`. Clip IDs are stable catalog identities such as `pack/clip`. Callers cannot override asset paths, playback limits, looping, or fitting policy. Unknown envelope/command fields fail deserialization.
+
+The experimental `play_visual` command includes `clip_id` and `placement`;
+`set_visual` includes `instance_id` and optional `placement` (null restores catalog
+defaults). Placement uses integer basis points: `widthBps` is 1–10000 and
+`xBps`/`yBps` are 0–10000, where 10000 means 100%. Width controls the existing
+fitting box relative to the host display; position interpolates between the
+corresponding display edges while keeping the rendered media within them. These
+commands apply only to GIF/video clips. Active snapshots retain the explicit
+override, and `visual_changed` events carry live updates for remote recovery.
+Defaults remain in the immutable catalog; a null override uses them.
 
 `Host::accept` validates and deduplicates commands before creating occurrences. `Accepted` means policy acceptance, not audible/visible playback. Each occurrence has a host-generated ID and generation and moves through preparing, playing, stopping, and one terminal state. Asset readiness is independent: the snapshot reports the latest preparation result for each clip. Only a matching backend `Started` callback after preparation/start permission changes the occurrence to playing. Stop requests report stopping until native teardown is acknowledged. Repeated terminal callbacks produce no new transition.
 
@@ -20,10 +30,16 @@ Drain at most eight emergency and 32 ordinary requests per Bevy update. New acce
 
 ## Backend adapter contract
 
-Drain `BackendEffect`s after command processing and callbacks. A `Prepare` carries the immutable catalog `Clip` plus `BackendToken { instance_id, generation }`. The backend uses the pinned asset path, looping/max duration and visual metadata. Native resources remain behind the adapter; one backend occurrence per host instance supports stack without requiring native objects to implement `Send`. Adapters communicate generation-tagged `Prepared`, `Started`, `Finished`, `Stopped`, or `Failed` events through `Host::backend_event`.
+Drain `BackendEffect`s after command processing and callbacks. A `Prepare` carries the immutable catalog `Clip` plus `BackendToken { instance_id, generation }` and the optional placement override. The backend uses the pinned asset path, looping/max duration and visual metadata. Native resources remain behind the adapter; one backend occurrence per host instance supports stack without requiring native objects to implement `Send`. Adapters communicate generation-tagged `Prepared`, `Started`, `Finished`, `Stopped`, or `Failed` events through `Host::backend_event`.
+
+`SetVisual` carries an occurrence token and optional placement override. The
+application changes its rendering geometry without seeking, restarting or
+replacing the decoder. The host accepts it only for preparing/playing visual
+occurrences and coalesces pending placement effects. Stop and terminal cleanup
+remove those pending effects.
 
 `Prepared` proves only asset/backend readiness. It requests a separate `Start` effect when policy allows. A `Start` performs actual backend start; its later `Started` acknowledgement marks playing. `Stop` must cancel preparation, audio, decoder, texture/frame publishing and all occurrence effects together, then report `Stopped`. It must also acknowledge an unknown/not-yet-prepared token, because cancellation can supersede an unsent Prepare. `Finished` and `Failed` callbacks must mean the worker has released occurrence resources. Stop racing completion/failure produces one Stopped terminal result. Late callbacks with a stale generation or stopped/terminal ID are ignored.
 
-Pending effects coalesce per token: stop removes unsent prepare/start, and terminal release removes all pending token effects. With eight active occurrences there are at most sixteen pending effects; they must be drained promptly. No effect is silently dropped for a live token. Failed preparation keeps clip readiness separate from occurrence termination. Error messages are bounded to 512 characters; adapters must omit credentials and private device information.
+Pending effects coalesce per token: stop removes unsent prepare/start, and terminal release removes all pending token effects. With eight active occurrences there are at most twenty-four pending effects; they must be drained promptly. No effect is silently dropped for a live token. Failed preparation keeps clip readiness separate from occurrence termination. Error messages are bounded to 512 characters; adapters must omit credentials and private device information.
 
 This change tests the real deterministic host policy with a scripted backend boundary. It does not claim local audible/visible runtime acceptance. The native media worker from issue #3 and the Bevy application bridge/panel from issue #6 must execute these effects and feed real callbacks before that acceptance is complete.
