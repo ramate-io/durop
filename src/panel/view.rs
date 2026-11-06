@@ -117,16 +117,7 @@ impl View<'_> {
                                 ..default()
                             })
                             .with_children(|row| {
-                                row.spawn((
-                                    Text::new(value),
-                                    self.fonts.mono(13.),
-                                    TextColor(INK),
-                                    Node {
-                                        min_width: px(0),
-                                        flex_shrink: 1.,
-                                        ..default()
-                                    },
-                                ));
+                                self.label(row, value, 13., INK);
                                 self.label(row, if open { "−" } else { "+" }, 17., PURPLE);
                             });
                     });
