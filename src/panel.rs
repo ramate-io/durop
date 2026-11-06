@@ -171,29 +171,55 @@ enum UiAction {
     Cycle(usize),
     /// Revoke the selected remote connection immediately.
     Disconnect,
-    /// Revoke remote access to the local host without hiding the controller.
-    RevokeHost,
+    /// Enqueue one source operation without performing I/O on the UI thread.
+    Network(crate::network_app::NetworkAction),
+    /// Validate and bind this Mac's listener address from the source draft.
+    EnableListener,
+    /// Issue a separately revocable pairing token for the named controller.
+    AddController,
+    /// Transfer the masked draft to the secure credential store asynchronously.
+    SaveAdminSecret,
 }
 
 /// Header menu whose choices configure a host or catalog provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dropdown {
-    /// Native or authenticated Tailscale control.
-    Host,
+    /// Independently enabled local and authenticated remote controllers.
+    From,
+    /// This Mac's display or an authenticated remote output host.
+    To,
     /// Bundled, directory or Git catalog sources.
     Catalog,
 }
 
 /// Isolated form edits; dropping this state discards ephemeral credentials.
 struct Modal {
-    /// Provider-owned validation schema and uncommitted values.
-    draft: ConfigurationDraft,
-    /// Unicode edit state corresponding one-to-one with draft fields.
+    /// Transactional provider schema or independently applied source controls.
+    draft: ModalDraft,
+    /// Provider fields, or source name/API key/listener address in that order.
     editors: Vec<Editor>,
     /// Validation feedback shown without reflecting credential values.
     error: Option<String>,
     /// Logical offset of the bounded form body, preserved across field edits.
     scroll: f32,
+}
+
+/// Distinguish a transactional provider form from live, independently applied source controls.
+enum ModalDraft {
+    /// Provider edits become effective only after a validated Apply.
+    Configuration(ConfigurationDraft),
+    /// Source controls enqueue individual operations; editors hold name, API key and listener address.
+    Sources,
+}
+
+impl Modal {
+    /// Expose provider identity only for transactional configuration forms.
+    fn provider(&self) -> Option<Provider> {
+        match &self.draft {
+            ModalDraft::Configuration(draft) => Some(draft.provider),
+            ModalDraft::Sources => None,
+        }
+    }
 }
 
 /// Responsive geometry keeps rendered entities bounded independently of catalog size.
@@ -222,7 +248,7 @@ impl GridLayout {
     fn for_window(width: f32, height: f32) -> Self {
         let available = (width - 78.).max(180.);
         let columns = ((available + 20.) / 250.).floor().clamp(1., 6.) as usize;
-        let toolbar_extra = if width < 760. { 80. } else { 0. };
+        let toolbar_extra = if width < 820. { 80. } else { 0. };
         let viewport = (height - 296. - toolbar_extra).max(134.);
         let card_height = viewport.min(282.);
         let rows = ((viewport + 20.) / (card_height + 20.))
@@ -273,8 +299,10 @@ impl Model {
                     | UiAction::Cancel
                     | UiAction::Cycle(_)
                     | UiAction::Focus(Field::Configuration(_))
-                    | UiAction::RevokeHost
-                    | UiAction::Configure(Provider::Host(HostProvider::TailscaleListener))
+                    | UiAction::Network(_)
+                    | UiAction::EnableListener
+                    | UiAction::AddController
+                    | UiAction::SaveAdminSecret
                     | UiAction::Runtime(Action::StopAll | Action::Stop(_))
             )
     }
@@ -339,7 +367,7 @@ impl Model {
             })
             .collect();
         self.modal = Some(Modal {
-            draft,
+            draft: ModalDraft::Configuration(draft),
             editors,
             error: None,
             scroll: 0.,
@@ -351,26 +379,73 @@ impl Model {
 
     /// Discard modal state and transient menus; no provider intent is emitted.
     fn close(&mut self) {
-        if let Some(modal) = self.modal.take() {
-            modal.draft.cancel();
+        if let Some(Modal {
+            draft: ModalDraft::Configuration(draft),
+            ..
+        }) = self.modal.take()
+        {
+            draft.cancel();
         }
         self.dropdown = None;
         self.focus = None;
     }
 
+    /// Open live source controls with fresh, ephemeral name and API-key editors.
+    fn open_sources(&mut self, listen_address: &str) {
+        self.modal = Some(Modal {
+            draft: ModalDraft::Sources,
+            editors: vec![
+                Editor::default(),
+                Editor::default(),
+                Editor {
+                    text: listen_address.to_owned(),
+                    cursor: listen_address.len(),
+                    ..default()
+                },
+            ],
+            error: None,
+            scroll: 0.,
+        });
+        self.dropdown = None;
+        self.focus = None;
+        self.dragging = false;
+    }
+
+    /// Summarize enabled sources without implying they are mutually exclusive or connected.
+    fn source_summary(local_enabled: bool, remote_count: usize) -> String {
+        let controllers = format!(
+            "{remote_count} controller{}",
+            if remote_count == 1 { "" } else { "s" }
+        );
+        if local_enabled {
+            format!("Local + {controllers}")
+        } else {
+            controllers
+        }
+    }
+
     /// Validate editable values before consuming the draft into a typed application intent.
     fn apply(&mut self, context: &ConfigurationContext) -> Option<ConfigurationIntent> {
         let modal = self.modal.as_mut()?;
-        for (field, editor) in modal.draft.fields.iter_mut().zip(&modal.editors) {
+        let ModalDraft::Configuration(draft) = &mut modal.draft else {
+            return None;
+        };
+        for (field, editor) in draft.fields.iter_mut().zip(&modal.editors) {
             field.value.clone_from(&editor.text);
         }
-        if let Err(error) = modal.draft.validate(context) {
+        if let Err(error) = draft.validate(context) {
             modal.error = Some(error.message.into());
             return None;
         }
-        let modal = self.modal.take()?;
+        let Modal {
+            draft: ModalDraft::Configuration(draft),
+            ..
+        } = self.modal.take()?
+        else {
+            return None;
+        };
         self.focus = None;
-        modal.draft.apply(context).ok()
+        draft.apply(context).ok()
     }
 
     /// Retrieve only an editable field; choices and immutable catalog paths do not accept text.
@@ -379,9 +454,11 @@ impl Model {
             Field::Search => Some(&mut self.query),
             Field::Configuration(index) => {
                 let modal = self.modal.as_mut()?;
-                let field = modal.draft.fields.get(index)?;
-                if field.read_only || !field.choices.is_empty() {
-                    return None;
+                if let ModalDraft::Configuration(draft) = &modal.draft {
+                    let field = draft.fields.get(index)?;
+                    if field.read_only || !field.choices.is_empty() {
+                        return None;
+                    }
                 }
                 modal.editors.get_mut(index)
             }
@@ -393,11 +470,14 @@ impl Model {
     fn is_secret(&self, field: Field) -> bool {
         match field {
             Field::Search => false,
-            Field::Configuration(index) => self
-                .modal
-                .as_ref()
-                .and_then(|modal| modal.draft.fields.get(index))
-                .is_some_and(|field| field.secret),
+            Field::Configuration(index) => {
+                self.modal.as_ref().is_some_and(|modal| match &modal.draft {
+                    ModalDraft::Configuration(draft) => {
+                        draft.fields.get(index).is_some_and(|field| field.secret)
+                    }
+                    ModalDraft::Sources => index == 1,
+                })
+            }
         }
     }
 
@@ -406,14 +486,16 @@ impl Model {
         let Some(modal) = &self.modal else {
             return;
         };
-        let fields: Vec<_> = modal
-            .draft
-            .fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| !field.read_only && field.choices.is_empty())
-            .map(|(index, _)| index)
-            .collect();
+        let fields: Vec<_> = match &modal.draft {
+            ModalDraft::Configuration(draft) => draft
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| !field.read_only && field.choices.is_empty())
+                .map(|(index, _)| index)
+                .collect(),
+            ModalDraft::Sources => vec![0, 2, 1],
+        };
         if fields.is_empty() {
             return;
         }
@@ -773,6 +855,9 @@ fn buttons(
                 model.focus = Some(*field);
                 model.dropdown = None;
             }
+            UiAction::Dropdown(Dropdown::From) => {
+                model.open_sources(&network.listen_address);
+            }
             UiAction::Dropdown(menu) => {
                 model.dropdown = if model.dropdown == Some(*menu) {
                     None
@@ -782,13 +867,18 @@ fn buttons(
                 model.focus = None;
             }
             UiAction::Configure(provider) => {
-                let context = Model::configuration_context(&runtime, &network, &monitors);
+                let mut context = Model::configuration_context(&runtime, &network, &monitors);
+                if *provider == Provider::Host(HostProvider::TailscaleListener) {
+                    context.current_endpoint.clone_from(&network.listen_address);
+                }
                 model.open(*provider, &context);
             }
             UiAction::Cancel => model.close(),
             UiAction::Cycle(index) => {
-                if let Some(modal) = &mut model.modal {
-                    let field = &modal.draft.fields[*index];
+                if let Some(modal) = &mut model.modal
+                    && let ModalDraft::Configuration(draft) = &modal.draft
+                {
+                    let field = &draft.fields[*index];
                     let editor = &mut modal.editors[*index];
                     if !field.choices.is_empty() {
                         let selected = field
@@ -804,19 +894,26 @@ fn buttons(
                 }
             }
             UiAction::Apply => {
+                if runtime.destination == Destination::Remote
+                    && let Some(modal) = &mut model.modal
+                    && matches!(modal.provider(), Some(Provider::Catalog(_)))
+                {
+                    modal.error = Some("Catalog is supplied by the remote host. Choose To → This Mac before changing local catalog sources.".into());
+                    continue;
+                }
                 if runtime.mode == Mode::Controller
                     && let Some(modal) = &mut model.modal
                 {
-                    let restriction = match modal.draft.provider {
-                        Provider::Host(HostProvider::Native | HostProvider::TailscaleListener) => {
-                            Some(
-                                "This launch is controller-only. Restart Durop in local mode to play or share this Mac.",
-                            )
-                        }
-                        Provider::Catalog(_) => Some(
+                    let restriction = match modal.provider() {
+                        Some(Provider::Host(
+                            HostProvider::Native | HostProvider::TailscaleListener,
+                        )) => Some(
+                            "This launch is controller-only. Restart Durop in local mode to play or share this Mac.",
+                        ),
+                        Some(Provider::Catalog(_)) => Some(
                             "Catalog is supplied by the remote host. Restart Durop in local mode to use local catalog sources.",
                         ),
-                        Provider::Host(HostProvider::Tailscale) => None,
+                        Some(Provider::Host(HostProvider::Tailscale)) | None => None,
                     };
                     if let Some(message) = restriction {
                         modal.error = Some(message.into());
@@ -848,21 +945,19 @@ fn buttons(
                                 .push_back(Action::Destination(Destination::Remote));
                         }
                         ConfigurationIntent::TailscaleListener { endpoint } => {
-                            network.address = endpoint.to_string();
+                            network.listen_address = endpoint.to_string();
                             network
                                 .actions
                                 .push_back(crate::network_app::NetworkAction::EnableHost);
-                            model.open(Provider::Host(HostProvider::Native), &context);
+                            model.open_sources(&network.listen_address);
                         }
                         ConfigurationIntent::Bundled { path }
                         | ConfigurationIntent::LocalDirectory { path } => {
-                            actions.0.push_back(Action::Destination(Destination::Local));
                             actions
                                 .0
                                 .push_back(Action::LoadPack(path.to_string_lossy().into_owned()));
                         }
                         ConfigurationIntent::GitHttps { .. } => {
-                            actions.0.push_back(Action::Destination(Destination::Local));
                             actions.0.push_back(Action::LoadPack(
                                 source.expect("catalog intent has a source"),
                             ));
@@ -870,10 +965,78 @@ fn buttons(
                     }
                 }
             }
-            UiAction::RevokeHost => {
+            UiAction::Network(action) => network.actions.push_back(action.clone()),
+            UiAction::EnableListener => {
+                let Some(modal) = &mut model.modal else {
+                    continue;
+                };
+                if !matches!(modal.draft, ModalDraft::Sources) {
+                    continue;
+                }
+                let mut context = Model::configuration_context(&runtime, &network, &monitors);
+                context.current_endpoint.clone_from(&modal.editors[2].text);
+                let draft = ConfigurationDraft::new(
+                    Provider::Host(HostProvider::TailscaleListener),
+                    &context,
+                );
+                match draft.apply(&context) {
+                    Ok(ConfigurationIntent::TailscaleListener { endpoint }) => {
+                        network.listen_address = endpoint.to_string();
+                        network
+                            .actions
+                            .push_back(crate::network_app::NetworkAction::EnableHost);
+                        modal.error = None;
+                    }
+                    Err(error) => modal.error = Some(error.message.into()),
+                    _ => unreachable!("listener schema returns a listener intent"),
+                }
+            }
+            UiAction::AddController => {
+                let Some(modal) = &mut model.modal else {
+                    continue;
+                };
+                if !matches!(modal.draft, ModalDraft::Sources) {
+                    continue;
+                }
+                let name = modal.editors[0].text.trim();
+                if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
+                    modal.error = Some(
+                        "Give this controller a name of 1–80 bytes without control characters."
+                            .into(),
+                    );
+                    continue;
+                }
                 network
                     .actions
-                    .push_back(crate::network_app::NetworkAction::DisableHost);
+                    .push_back(crate::network_app::NetworkAction::AddController {
+                        name: name.to_owned(),
+                    });
+                modal.editors[0] = Editor::default();
+                modal.error = None;
+                model.focus = None;
+            }
+            UiAction::SaveAdminSecret => {
+                let Some(modal) = &mut model.modal else {
+                    continue;
+                };
+                if !matches!(modal.draft, ModalDraft::Sources) {
+                    continue;
+                }
+                let secret = modal.editors[1].text.trim();
+                if secret.is_empty() || secret.len() > 4096 || secret.chars().any(char::is_control)
+                {
+                    modal.error =
+                        Some("Enter a Tailscale API key without control characters.".into());
+                    continue;
+                }
+                network
+                    .actions
+                    .push_back(crate::network_app::NetworkAction::SaveAdminSecret {
+                        secret: secret.to_owned(),
+                    });
+                modal.editors[1] = Editor::default();
+                modal.error = None;
+                model.focus = None;
             }
             UiAction::Disconnect => {
                 network

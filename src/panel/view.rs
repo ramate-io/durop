@@ -117,7 +117,16 @@ impl View<'_> {
                                 ..default()
                             })
                             .with_children(|row| {
-                                self.label(row, value, 13., INK);
+                                row.spawn((
+                                    Text::new(value),
+                                    self.fonts.mono(13.),
+                                    TextColor(INK),
+                                    Node {
+                                        min_width: px(0),
+                                        flex_shrink: 1.,
+                                        ..default()
+                                    },
+                                ));
                                 self.label(row, if open { "−" } else { "+" }, 17., PURPLE);
                             });
                     });
@@ -127,11 +136,7 @@ impl View<'_> {
                             Node {
                                 position_type: PositionType::Absolute,
                                 top: px(76),
-                                left: if menu == Dropdown::Host {
-                                    px(0)
-                                } else {
-                                    auto()
-                                },
+                                left: if menu == Dropdown::To { px(0) } else { auto() },
                                 right: if menu == Dropdown::Catalog {
                                     px(0)
                                 } else {
@@ -152,10 +157,14 @@ impl View<'_> {
                         ))
                         .with_children(|popup| {
                             let entries = match menu {
-                                Dropdown::Host => vec![
-                                    ("Native · this Mac", Provider::Host(HostProvider::Native)),
+                                Dropdown::From => vec![],
+                                Dropdown::To => vec![
                                     (
-                                        "Tailscale · remote host",
+                                        "This Mac · choose display",
+                                        Provider::Host(HostProvider::Native),
+                                    ),
+                                    (
+                                        "Remote host · IP + pairing token",
                                         Provider::Host(HostProvider::Tailscale),
                                     ),
                                 ],
@@ -314,7 +323,11 @@ impl View<'_> {
         network: &crate::network_app::NetworkState,
         runtime: &Runtime,
     ) {
-        for (index, field) in modal.draft.fields.iter().enumerate() {
+        let ModalDraft::Configuration(draft) = &modal.draft else {
+            self.sources_fields(dialog, modal, focus, network);
+            return;
+        };
+        for (index, field) in draft.fields.iter().enumerate() {
             dialog
                 .spawn(Node {
                     flex_direction: FlexDirection::Column,
@@ -379,11 +392,12 @@ impl View<'_> {
                     self.label(row, field.hint, 10., MUTED);
                 });
         }
-        if matches!(modal.draft.provider, Provider::Catalog(_)) && runtime.mode == Mode::Controller
+        if matches!(draft.provider, Provider::Catalog(_))
+            && runtime.destination == Destination::Remote
         {
-            self.label(dialog, "Catalog is supplied by the remote host. Restart in local mode to use local catalog sources.", 12., PURPLE);
+            self.label(dialog, "Catalog is supplied by the remote host. Choose To → This Mac before changing local catalog sources.", 12., PURPLE);
         }
-        if modal.draft.provider == Provider::Host(HostProvider::Native)
+        if draft.provider == Provider::Host(HostProvider::Native)
             && runtime.mode == Mode::Controller
         {
             self.label(
@@ -393,39 +407,288 @@ impl View<'_> {
                 PURPLE,
             );
         }
-        if modal.draft.provider == Provider::Host(HostProvider::Native)
-            && runtime.mode != Mode::Controller
-        {
-            dialog
-                .spawn(Node {
+        if let Some(error) = &modal.error {
+            self.label(dialog, error, 12., PURPLE);
+        }
+    }
+
+    /// Render a source editor using the same keyboard, IME and masked-input behavior as providers.
+    fn source_editor(
+        &self,
+        parent: &mut ChildSpawnerCommands,
+        modal: &Modal,
+        focus: Option<Field>,
+        index: usize,
+        label: &str,
+        secret: bool,
+    ) {
+        self.label(parent, label, 11., MUTED);
+        let editor = &modal.editors[index];
+        let selected = focus == Some(Field::Configuration(index));
+        let value = if secret {
+            if editor.text.is_empty() {
+                "Enter API key…".into()
+            } else {
+                "•".repeat(editor.text.chars().count())
+            }
+        } else if selected {
+            editor.label()
+        } else if editor.text.is_empty() {
+            "Enter a value…".into()
+        } else {
+            editor.text.clone()
+        };
+        parent
+            .spawn((
+                Button,
+                UiAction::Focus(Field::Configuration(index)),
+                Node {
+                    width: percent(100),
+                    min_height: px(48),
+                    padding: UiRect::axes(px(14), px(13)),
+                    border: UiRect::all(px(1)),
+                    border_radius: BorderRadius::all(px(5)),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BackgroundColor(BACKGROUND),
+                BorderColor::all(if selected { PURPLE } else { RULE }),
+                HoverColors {
+                    resting: BACKGROUND,
+                    hovered: PAPER,
+                },
+            ))
+            .with_children(|input| self.label(input, value, 12., INK));
+    }
+
+    /// Render one source's independent permission and separate network invitation lifecycle.
+    fn controller_source(
+        &self,
+        dialog: &mut ChildSpawnerCommands,
+        source: &crate::network_app::ControllerSource,
+        hosting: bool,
+    ) {
+        use crate::network_app::NetworkAction;
+        dialog
+            .spawn((
+                Node {
+                    width: percent(100),
+                    padding: UiRect::all(px(16)),
+                    border: UiRect::all(px(1)),
+                    border_radius: BorderRadius::all(px(6)),
                     flex_direction: FlexDirection::Column,
                     row_gap: px(10),
                     ..default()
-                })
-                .with_children(|sharing| {
-                    self.label(sharing, "REMOTE ACCESS", 10., MUTED);
-                    self.label(sharing, &network.status, 10., MUTED);
-                    if network.hosting {
-                        self.label(
-                            sharing,
-                            "Sharing is enabled. Give this secret only to your controller.",
-                            10.,
-                            GREEN,
-                        );
-                        if let Some(secret) = &network.pairing_secret {
-                            self.label(sharing, secret, 11., INK);
-                        }
-                        self.button(sharing, "Revoke remote access", UiAction::RevokeHost, false);
-                    } else {
+                },
+                BackgroundColor(BACKGROUND),
+                BorderColor::all(RULE),
+            ))
+            .with_children(|controller| {
+                self.label(controller, &source.name, 13., INK);
+                self.label(
+                    controller,
+                    if source.enabled { "Source enabled" } else { "Source disabled" },
+                    10.,
+                    if source.enabled { GREEN } else { MUTED },
+                );
+                self.label(controller, &source.invitation_status, 10., MUTED);
+                controller
+                    .spawn(Node {
+                        column_gap: px(8),
+                        row_gap: px(8),
+                        flex_wrap: FlexWrap::Wrap,
+                        ..default()
+                    })
+                    .with_children(|row| {
                         self.button(
-                            sharing,
-                            "Share this Mac…",
-                            UiAction::Configure(Provider::Host(HostProvider::TailscaleListener)),
+                            row,
+                            if source.enabled { "Disable" } else { "Enable" },
+                            UiAction::Network(NetworkAction::SetControllerEnabled {
+                                id: source.id.clone(),
+                                enabled: !source.enabled,
+                            }),
                             false,
                         );
-                    }
-                });
+                        self.button(
+                            row,
+                            "Revoke controller",
+                            UiAction::Network(NetworkAction::RevokeController { id: source.id.clone() }),
+                            false,
+                        );
+                    });
+                if hosting && source.pairing_secret.is_some() {
+                    self.label(
+                        controller,
+                        "Individual Durop pairing token ready. Share privately with this controller.",
+                        10.,
+                        MUTED,
+                    );
+                    self.button(
+                        controller,
+                        if source.invitation_url.is_some() {
+                            "Copy invitation link + pairing details"
+                        } else {
+                            "Copy Durop pairing details"
+                        },
+                        UiAction::Network(NetworkAction::CopyControllerHandoff { id: source.id.clone() }),
+                        false,
+                    );
+                }
+                controller
+                    .spawn(Node {
+                        column_gap: px(8),
+                        row_gap: px(8),
+                        flex_wrap: FlexWrap::Wrap,
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        if hosting {
+                            self.button(
+                                row,
+                                if source.invitation_url.is_some() {
+                                    "Replace network invitation"
+                                } else {
+                                    "Create network invitation"
+                                },
+                                UiAction::Network(NetworkAction::CreateInvitation { id: source.id.clone() }),
+                                false,
+                            );
+                        }
+                        if source.invitation_url.is_some() {
+                            self.button(
+                                row,
+                                "Revoke invitation",
+                                UiAction::Network(NetworkAction::RevokeInvitation { id: source.id.clone() }),
+                                false,
+                            );
+                        }
+                    });
+                if !hosting {
+                    self.label(
+                        controller,
+                        "Enable the remote listener below to copy pairing details or create a network invitation.",
+                        10.,
+                        MUTED,
+                    );
+                }
+            });
+    }
+
+    /// Keep source permissions, per-controller credentials and host administration independently actionable.
+    fn sources_fields(
+        &self,
+        dialog: &mut ChildSpawnerCommands,
+        modal: &Modal,
+        focus: Option<Field>,
+        network: &crate::network_app::NetworkState,
+    ) {
+        use crate::network_app::NetworkAction;
+        self.label(dialog, "CONTROL SOURCES", 10., PURPLE);
+        self.button(
+            dialog,
+            "Refresh invitation status",
+            UiAction::Network(NetworkAction::RefreshInvitations),
+            false,
+        );
+        self.button(
+            dialog,
+            if network.local_enabled {
+                "Local controls: on · Disable"
+            } else {
+                "Local controls: off · Enable"
+            },
+            UiAction::Network(NetworkAction::SetLocalEnabled(!network.local_enabled)),
+            false,
+        );
+        self.label(
+            dialog,
+            "Each enabled source can send commands to the selected To destination.",
+            10.,
+            MUTED,
+        );
+        self.label(dialog, "Revoking a controller immediately removes Durop permission. Accepted Tailscale device access may need removal in Tailscale administration.", 10., MUTED);
+        for source in &network.controllers {
+            self.controller_source(dialog, source, network.hosting);
         }
+        if network.controllers.is_empty() {
+            self.label(
+                dialog,
+                "No remote controllers added. Local control can stay enabled while you add them.",
+                11.,
+                MUTED,
+            );
+        }
+        self.source_editor(dialog, modal, focus, 0, "New controller name", false);
+        self.button(
+            dialog,
+            "Add controller + create pairing token",
+            UiAction::AddController,
+            false,
+        );
+        self.label(dialog, "REMOTE LISTENER", 10., PURPLE);
+        self.source_editor(
+            dialog,
+            modal,
+            focus,
+            2,
+            "This Mac's Tailscale IP:port",
+            false,
+        );
+        self.label(dialog, "Use this Mac's assigned Tailscale address. Remote sources use this listener; To remains independent.", 10., MUTED);
+        self.button(
+            dialog,
+            if network.hosting {
+                "Apply listener address"
+            } else {
+                "Enable remote listener"
+            },
+            UiAction::EnableListener,
+            false,
+        );
+        if network.hosting {
+            self.label(
+                dialog,
+                format!("Listening at {}", network.listen_address),
+                11.,
+                GREEN,
+            );
+            self.button(
+                dialog,
+                "Disable remote listener",
+                UiAction::Network(NetworkAction::DisableHost),
+                false,
+            );
+        }
+        self.label(dialog, "HOST ADMINISTRATION", 10., PURPLE);
+        self.label(
+            dialog,
+            &network.admin_status,
+            11.,
+            if network.admin_secret_available {
+                GREEN
+            } else {
+                MUTED
+            },
+        );
+        self.label(dialog, "A network invitation grants Tailscale device access. The separate Durop token grants controller permission. Copy pairing details hands off both.", 10., MUTED);
+        self.source_editor(dialog, modal, focus, 1, "Tailscale API key", true);
+        self.label(dialog, "Use TAILSCALE_API_KEY or explicitly save a key in this Mac's secure store. Keys stay out of preferences and pairing details.", 10., MUTED);
+        dialog
+            .spawn(Node {
+                column_gap: px(8),
+                row_gap: px(8),
+                flex_wrap: FlexWrap::Wrap,
+                ..default()
+            })
+            .with_children(|row| {
+                self.button(row, "Save key securely", UiAction::SaveAdminSecret, false);
+                self.button(
+                    row,
+                    "Remove saved key",
+                    UiAction::Network(NetworkAction::RemoveAdminSecret),
+                    false,
+                );
+            });
         if let Some(error) = &modal.error {
             self.label(dialog, error, 12., PURPLE);
         }
@@ -440,27 +703,31 @@ impl View<'_> {
         network: &crate::network_app::NetworkState,
         runtime: &Runtime,
     ) {
-        let (title, subtitle) = match modal.draft.provider {
-            Provider::Host(HostProvider::Native) => (
-                "Native host",
+        let (title, subtitle) = match modal.provider() {
+            None => (
+                "From",
+                "Enable local controls and any number of remote controllers independently.",
+            ),
+            Some(Provider::Host(HostProvider::Native)) => (
+                "To this Mac",
                 "Play on this Mac. Choose where your reactions appear.",
             ),
-            Provider::Host(HostProvider::Tailscale) => (
-                modal.draft.provider.label(),
+            Some(Provider::Host(HostProvider::Tailscale)) => (
+                Provider::Host(HostProvider::Tailscale).label(),
                 "Connect to an authenticated host on your private network.",
             ),
-            Provider::Host(HostProvider::TailscaleListener) => (
+            Some(Provider::Host(HostProvider::TailscaleListener)) => (
                 "Share this Mac",
                 "Allow another Durop controller to pair with this host over Tailscale.",
             ),
-            Provider::Catalog(CatalogProvider::Bundled) => (
+            Some(Provider::Catalog(CatalogProvider::Bundled)) => (
                 "Durop reactions",
                 "A collection that travels with your app. Ready to play offline.",
             ),
-            Provider::Catalog(CatalogProvider::LocalDirectory) => {
+            Some(Provider::Catalog(CatalogProvider::LocalDirectory)) => {
                 ("Local catalog", "Load a pack from a directory on this Mac.")
             }
-            Provider::Catalog(CatalogProvider::GitHttps) => (
+            Some(Provider::Catalog(CatalogProvider::GitHttps)) => (
                 "Git repository",
                 "Pin a catalog from a repository, branch or commit.",
             ),
@@ -563,8 +830,12 @@ impl View<'_> {
                                     ..default()
                                 })
                                 .with_children(|actions| {
-                                    self.button(actions, "Cancel", UiAction::Cancel, false);
-                                    self.button(actions, "Apply →", UiAction::Apply, true);
+                                    if modal.provider().is_some() {
+                                        self.button(actions, "Cancel", UiAction::Cancel, false);
+                                        self.button(actions, "Apply →", UiAction::Apply, true);
+                                    } else {
+                                        self.button(actions, "Done", UiAction::Cancel, true);
+                                    }
                                 });
                         });
                 });
@@ -589,8 +860,8 @@ pub(super) fn render(
     primary: Single<&Window, With<PrimaryWindow>>,
 ) {
     let remote = runtime.destination == Destination::Remote;
-    let compact = primary.width() < 760.;
-    let provider_width = ((primary.width() - 70.) * 0.5).max(150.);
+    let compact = primary.width() < 820.;
+    let provider_width = ((primary.width() - 84.) / 3.).max(150.);
     let preferences = crate::preferences::Preferences {
         pack: crate::preferences::Preferences::stored_pack(
             &runtime.pack_input,
@@ -674,6 +945,25 @@ pub(super) fn render(
         model.layout.rows,
         model.viewport_height()
     );
+    let signature = format!(
+        "{signature}|{}|{}|{}|{}|{:?}",
+        network.local_enabled,
+        network.listen_address,
+        network.admin_status,
+        network.admin_secret_available,
+        network
+            .controllers
+            .iter()
+            .map(|source| (
+                &source.id,
+                &source.name,
+                source.enabled,
+                source.pairing_secret.is_some(),
+                source.invitation_url.is_some(),
+                &source.invitation_status
+            ))
+            .collect::<Vec<_>>()
+    );
     if signature == model.signature {
         return;
     }
@@ -726,11 +1016,19 @@ pub(super) fn render(
             .with_children(|header| {
                 view.selector(
                     header,
-                    "HOST",
-                    if remote { "Tailscale" } else { "Native" },
-                    Dropdown::Host,
-                    model.dropdown == Some(Dropdown::Host),
-                    if compact { provider_width } else { 220. },
+                    "FROM",
+                    &Model::source_summary(network.local_enabled, network.controllers.iter().filter(|source| source.enabled).count()),
+                    Dropdown::From,
+                    false,
+                    if compact { provider_width.max(230.) } else { 230. },
+                );
+                view.selector(
+                    header,
+                    "TO",
+                    if remote { "Remote host" } else { "This Mac" },
+                    Dropdown::To,
+                    model.dropdown == Some(Dropdown::To),
+                    if compact { provider_width } else { 170. },
                 );
                 let catalog_label = if remote {
                     "Remote catalog"
@@ -748,7 +1046,7 @@ pub(super) fn render(
                     catalog_label,
                     Dropdown::Catalog,
                     model.dropdown == Some(Dropdown::Catalog),
-                    if compact { provider_width } else { 300. },
+                    if compact { provider_width } else { 210. },
                 );
                 header
                     .spawn((
@@ -883,7 +1181,7 @@ pub(super) fn render(
                                         view.label(
                                             empty,
                                             if remote && !network.connected {
-                                                "Choose Tailscale above to pair with a remote host."
+                                                "Choose To → Remote host to enter its IP and Durop pairing token."
                                             } else {
                                                 "Try another search or choose a catalog above."
                                             },

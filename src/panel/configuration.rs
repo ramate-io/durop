@@ -49,8 +49,8 @@ impl Provider {
     /// Human-readable dropdown/modal label, without user-entered values or secrets.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Host(HostProvider::Native) => "Native",
-            Self::Host(HostProvider::Tailscale) => "Tailscale",
+            Self::Host(HostProvider::Native) => "This Mac",
+            Self::Host(HostProvider::Tailscale) => "Remote host",
             Self::Host(HostProvider::TailscaleListener) => "Share this Mac",
             Self::Catalog(CatalogProvider::Bundled) => "Durop reactions",
             Self::Catalog(CatalogProvider::LocalDirectory) => "Local directory",

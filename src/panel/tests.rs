@@ -548,7 +548,7 @@ fn controller_catalog_apply_preserves_remote_destination_and_draft() {
             .modal
             .as_ref()
             .expect("blocked apply retains the draft");
-        assert_eq!(modal.draft.provider, Provider::Catalog(provider));
+        assert_eq!(modal.provider(), Some(Provider::Catalog(provider)));
         assert!(modal.error.as_ref().unwrap().contains("remote host"));
     }
 }
@@ -898,4 +898,135 @@ fn scrollbar_grab_preserves_offset_and_tracks_fractional_motion() {
     let moved = app.world().get::<ScrollPosition>(body).unwrap().y;
     assert!(moved > grabbed);
     assert!(moved.fract() > 0.);
+}
+
+/// Sources summarize simultaneous permission instead of presenting an exclusive selector.
+#[test]
+fn from_summary_includes_local_and_multiple_controllers() {
+    assert_eq!(Model::source_summary(true, 2), "Local + 2 controllers");
+    assert_eq!(Model::source_summary(true, 0), "Local + 0 controllers");
+    assert_eq!(Model::source_summary(false, 1), "1 controller");
+}
+
+/// Source forms use ephemeral editor state and never produce a provider destination intent.
+#[test]
+fn from_drafts_cancel_secrets_and_keep_to_selection_independent() {
+    let mut model = Model::default();
+    model.open_sources("100.101.102.103:7010");
+    model
+        .editor(Field::Configuration(1))
+        .unwrap()
+        .insert("private-admin-key");
+    assert!(model.apply(&provider_context()).is_none());
+    assert!(model.modal.is_some());
+    assert!(!model.allows(&UiAction::Runtime(Action::Play("pack/clip".into()))));
+    assert!(model.allows(&UiAction::Runtime(Action::StopAll)));
+    model.close();
+    model.open_sources("100.101.102.103:7010");
+    assert!(model.modal.as_ref().unwrap().editors[1].text.is_empty());
+    assert_eq!(
+        model.modal.as_ref().unwrap().editors[2].text,
+        "100.101.102.103:7010"
+    );
+}
+
+/// Exercise source buttons without dispatching the independently owned network executor.
+fn sources_app() -> App {
+    let runtime = Runtime::new(&config()).unwrap();
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut model = Model::default();
+    model.open_sources("100.101.102.103:7010");
+    let mut app = App::new();
+    app.insert_resource(runtime)
+        .insert_resource(network)
+        .insert_resource(model)
+        .init_resource::<Actions>()
+        .add_systems(Update, buttons);
+    app
+}
+
+/// Disabling one controller never emits a destination change or revokes its peers/local source.
+#[test]
+fn source_buttons_enqueue_independent_permissions_without_changing_to() {
+    use crate::network_app::NetworkAction;
+    let mut app = sources_app();
+    app.world_mut().spawn((
+        Interaction::Pressed,
+        UiAction::Network(NetworkAction::SetControllerEnabled {
+            id: "alice".into(),
+            enabled: false,
+        }),
+    ));
+    app.world_mut().spawn((
+        Interaction::Pressed,
+        UiAction::Network(NetworkAction::SetControllerEnabled {
+            id: "bob".into(),
+            enabled: true,
+        }),
+    ));
+    app.update();
+    let actions = &app
+        .world()
+        .resource::<crate::network_app::NetworkState>()
+        .actions;
+    assert_eq!(actions.len(), 2);
+    assert!(actions.iter().any(|action| matches!(action, NetworkAction::SetControllerEnabled {id, enabled: false} if id == "alice")));
+    assert!(actions.iter().any(|action| matches!(action, NetworkAction::SetControllerEnabled {id, enabled: true} if id == "bob")));
+    assert!(app.world().resource::<Actions>().0.is_empty());
+    assert_eq!(
+        app.world().resource::<Runtime>().destination,
+        Destination::Remote
+    );
+}
+
+/// Explicit save transfers a key once and clears the masked draft before asynchronous storage.
+#[test]
+fn secure_save_consumes_only_the_admin_secret_draft() {
+    use crate::network_app::NetworkAction;
+    let mut app = sources_app();
+    app.world_mut()
+        .resource_mut::<Model>()
+        .modal
+        .as_mut()
+        .unwrap()
+        .editors[1]
+        .insert("  secret-key  ");
+    app.world_mut()
+        .spawn((Interaction::Pressed, UiAction::SaveAdminSecret));
+    app.update();
+    assert!(
+        matches!(app.world().resource::<crate::network_app::NetworkState>().actions.front(), Some(NetworkAction::SaveAdminSecret {secret}) if secret == "secret-key")
+    );
+    assert!(
+        app.world()
+            .resource::<Model>()
+            .modal
+            .as_ref()
+            .unwrap()
+            .editors[1]
+            .text
+            .is_empty()
+    );
+    assert!(app.world().resource::<Actions>().0.is_empty());
+}
+
+/// Inbound listener editing must never replace the independent outbound host endpoint.
+#[test]
+fn listener_apply_keeps_outbound_to_address() {
+    use crate::network_app::NetworkAction;
+    let mut app = sources_app();
+    app.world_mut()
+        .resource_mut::<crate::network_app::NetworkState>()
+        .address = "ws://100.111.112.113:7010/control".into();
+    app.world_mut()
+        .spawn((Interaction::Pressed, UiAction::EnableListener));
+    app.update();
+    let network = app.world().resource::<crate::network_app::NetworkState>();
+    assert_eq!(network.address, "ws://100.111.112.113:7010/control");
+    assert_eq!(network.listen_address, "100.101.102.103:7010");
+    assert!(matches!(
+        network.actions.front(),
+        Some(NetworkAction::EnableHost)
+    ));
+    assert!(app.world().resource::<Actions>().0.is_empty());
 }
