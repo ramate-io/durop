@@ -27,6 +27,8 @@ nix develop --command cargo run -p durop --bin durop --locked
 
 For a standalone `.app`, follow [packaging](docs/packaging.md). For arguments,
 pack sources, host/controller modes and pairing, see the [session guide](docs/session-runbook.md).
+For Tailscale admin setup, CDK Terrain policy and pairing in the controller,
+follow the [Tailnet quickstart](docs/tailnet-quickstart.md).
 
 ## Work
 

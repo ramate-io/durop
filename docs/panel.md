@@ -10,6 +10,8 @@ The top row contains **Host**, **Catalog** and search. At compact widths, search
 moves below the two selectors. Cards show real PNG previews, titles, media kinds
 and playback controls; the responsive grid renders only visible rows plus a partial
 row. Wheel/trackpad scrolling and the draggable scrollbar reach the whole collection.
+Wheel input accumulates distance before advancing a row, so tiny trackpad events
+do not each jump a full row; bursts are bounded and navigation discards residual motion.
 Search matches every word across title, tags and category. Thumbnails are bounded
 before decode (one MiB, 512×512), with a bounded 128-entry cache including failures.
 Remote icons additionally satisfy the transport's 32 KiB limit.

@@ -41,6 +41,9 @@ remote Git LFS materialization are supported. See [pack format](packs.md).
 
 ## Host and remote controller
 
+Start with the [Tailnet quickstart](tailnet-quickstart.md) for the Tailscale admin
+console, CDK Terrain policy setup and the complete Durop pairing flow.
+
 Install and authorize Tailscale separately on both Macs. Durop uses its CLI for bounded read-only verification and discovers the
 standard installed macOS app executable even from Finder. Follow [the Tailscale runbook](https://github.com/ramate-io/durop/blob/main/infra/cdktn/tailscale/README.md),
 including its standalone macOS setup. Verify the configured identity/tags
@@ -70,8 +73,8 @@ Optional launch configuration, with the app closed first:
 /Applications/Durop.app/Contents/MacOS/durop --mode controller --connect ws://100.x.y.z:48732/control
 ```
 
-The controller launch only prefills the destination; enter its secret in the UI
-and Connect explicitly. Controller mode starts without a local pack. Host mode
+The controller launch only prefills the destination; open **Host → Tailscale**,
+enter its secret and choose **Apply** explicitly. Controller mode starts without a local pack. Host mode
 uses the same app/window with playback authority; hiding its panel does not
 terminate the process. Pairing material is never placed in command arguments.
 

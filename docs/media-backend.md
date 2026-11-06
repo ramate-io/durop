@@ -75,9 +75,9 @@ only the host's bounded `looping` option repeats the timeline.
 The host must keep the Bevy update loop running while any instance is preparing
 or playing, combining `media::needs_updates()` with its own instance/animation
 policy. This services native control requests; it is not permissible to stop
-updating while a native worker waits for readiness. The worker exposes
+updating while a native worker waits for readiness. The application consumes
 `latest_frame()` for reusable Bevy Image uploads, `position()` and
-`drain_events()`; the host/panel integration is a separate stacked change.
+`drain_events()` through its existing host/media integration.
 
 ## Bounds and tests
 
