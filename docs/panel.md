@@ -6,8 +6,8 @@ contains 31 offline GIFs, sounds and videos with attribution and redistribution 
 
 ## Collection and configuration
 
-The top row contains **Host**, **Catalog** and search. At compact widths, search
-moves below the two selectors. Cards show real PNG previews, titles, media kinds
+The top row contains **From**, **To**, **Catalog** and search. At compact widths, search
+moves below the selectors. Cards show real PNG previews, titles, media kinds
 and playback controls; the responsive grid renders only visible rows plus a partial
 row. Wheel/trackpad scrolling and the draggable scrollbar reach the whole collection.
 The collection uses Bevy UI’s `ScrollPosition` and vertical scroll overflow.
@@ -18,11 +18,13 @@ Search matches every word across title, tags and category. Thumbnails are bounde
 before decode (one MiB, 512×512), with a bounded 128-entry cache including failures.
 Remote icons additionally satisfy the transport's 160 KiB limit.
 
-**Host → Native** selects the primary or an enumerated display. **Host → Tailscale**
+**From** independently enables local controls and authenticated remote controllers.
+Selecting a source opens its controls without changing its permission. **To → This Mac**
+selects the primary or an enumerated display. **To → Remote host**
 accepts the remote host's explicit Tailscale IP:port and Durop pairing token. This
 is a Durop session credential, not a Tailscale API or enrollment key. Input is masked
 and cleared after submission; credentials never enter preferences, URLs or command
-arguments. **Share this Mac…** in Native settings configures a local listener;
+arguments. The selected remote source’s **Listener** settings configure a local listener;
 the runtime verifies the address and generates its own credential. **Revoke remote**
 closes that access. Keep the displayed host credential out of recordings/screenshots.
 Durop does not enroll machines or alter tailnet policy.
@@ -46,11 +48,34 @@ distinct. A card's Stop button targets its latest active occurrence; **STOP ALL*
 stops every occurrence. Remote mode displays the remote catalog and authoritative
 snapshot; disconnected commands have no local fallback or offline replay.
 
-Text entry supports Unicode/IME composition, arrows, Home/End, Backspace and
-Ctrl/Cmd+A replacement. Cmd/Ctrl+V pastes on macOS. Escape closes a modal/menu first,
-then leaves a focused editor, and otherwise stops playback. Space outside editing
-plays the first visible local tile. Bundled fonts have limited script coverage;
-missing glyphs do not discard the underlying search text.
+Headings, hints, status messages and displayed values can be selected and copied
+with the mouse and Command/Control+C. Action button labels keep their click behavior.
+Selecting a read-only label does not edit its value or run playback shortcuts.
+Horizontal rules separate the modal heading, form sections and action footer.
+
+Search and ordinary form fields use Bevy 0.20’s `TextInput` and `EditableText` with
+an engine-rendered blinking caret and selection highlight. Click to place the caret;
+drag or Shift+arrow to select text, and double-click to select a word. Command+A/C/X/V
+on macOS (Control on other desktops) select, copy, cut and paste through the system
+clipboard. Unicode/IME composition, word navigation, Home/End and Delete/Backspace
+use the engine editor. Inputs are bounded to 4096 characters and remain on one line;
+long values scroll horizontally. Their entities, selection and uncommitted IME
+composition survive search filtering, playback snapshots and network status refreshes.
+A small event-order adapter supplies native modifier flags to Bevy before each key,
+including Command press/key/release bursts within one frame.
+
+Bevy 0.20 does not provide password masking. Pairing tokens and host API keys therefore
+use a separate masked field: type or paste a value, Command/Control+A to replace it,
+and Backspace/Delete to remove it. Secret fields never expose plaintext through a
+rendered text input and do not copy or cut credentials to the clipboard. They do not
+provide caret placement, partial selection or IME composition. Secrets are cleared
+on submission or when their draft is discarded.
+
+Opening an editable form focuses its first visible field. Tab and Shift+Tab cycle
+within that form; hidden fields and background search cannot receive editing. Escape
+closes a modal/menu first, then leaves a focused editor, and otherwise stops playback.
+Space outside editing plays the first visible local tile. Bundled fonts have limited
+script coverage; missing glyphs do not discard the underlying search text.
 
 ## Launch and persistence
 
@@ -89,7 +114,10 @@ The warm paper/ink palette and display typography are inspired by
 are bundled with their [OFL notices](../assets/fonts/README.md); no proprietary
 Berkeley Mono font or Symbolic artwork is copied.
 
-Tests cover real keyboard/IME and wheel messages, draft validation/cancellation,
+Tests cover the actual Bevy keyboard/IME edit lifecycle, selection and focus across
+view refreshes, final-edit-plus-Apply ordering, modal Tab isolation, actual pointer
+caret placement/selection, native modifier/focus-loss ordering, low-power redraws, hidden editor
+retirement/reopening, real wheel messages, draft validation/cancellation,
 modal input isolation, controller-only routing, a 10,000-item virtualized catalog,
 thumbnail bounds and preference migration. The redesign was also inspected in a
 native development preview: grid, popup stacking, long titles, masked validation,
@@ -104,3 +132,11 @@ The window has a 400×520 minimum; desktop defaults remain 1160×820. Native
 muted probes completed for GIF, MP3 and MP4; all 31 assets passed full FFmpeg decode.
 These checks do not establish audible output, recorded A/V sync, fullscreen or
 two-Mac acceptance; those remain in the [operator acceptance](acceptance.md).
+
+The Bevy 0.20 migration was checked separately in the native macOS preview:
+From/source draft opening and cancellation, visible bounded dialogs, continuous
+8-pixel scroll movement and scrollbar track navigation, visible caret/selection,
+Command+A/C/X/V, and copying both a card title and a wrapped form paragraph into
+search. Long titles wrap and section rules remain visible. Desktop and compact
+viewport bounds also run through Bevy layout tests; native IME candidate-window
+and standalone distribution acceptance remain separate from these checks.

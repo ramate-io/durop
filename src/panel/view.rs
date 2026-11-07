@@ -2,17 +2,190 @@
 
 use super::theme::*;
 use super::*;
-use bevy::ui::{FocusPolicy, RelativeCursorPosition};
+use bevy::picking::Pickable;
+use bevy::text::TextReadWriteMode;
+use bevy::ui::RelativeCursorPosition;
+use std::{cell::RefCell, collections::HashMap};
+
+/// Style and content identify reusable labels without retaining obsolete display values.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SelectableKey {
+    /// Exact displayed value; secrets are never passed to display labels.
+    text: String,
+    /// Distinguishes the bundled display and interface faces.
+    display: bool,
+    /// Bitwise logical font size avoids rounding collisions.
+    size: u32,
+    /// Bitwise sRGBA channels distinguish labels with different contrast.
+    color: [u32; 4],
+}
+
+/// Keep selection state when an unchanged label moves into the refreshed hierarchy.
+#[derive(Clone, Copy)]
+struct SelectableText {
+    /// A neutral wrapper retains both measured text and its selection overlay.
+    root: Entity,
+    /// A coincident read-only engine editor owns selection and clipboard behavior.
+    selection: Entity,
+}
+
+/// Reuse unchanged labels once per render and retire every unused display value.
+#[derive(Default)]
+pub(super) struct SelectableTexts {
+    /// Labels detached from the previous hierarchy and available for reuse.
+    available: HashMap<SelectableKey, Vec<SelectableText>>,
+    /// Labels attached to the current hierarchy, including duplicate values.
+    used: HashMap<SelectableKey, Vec<SelectableText>>,
+}
+
+impl SelectableTexts {
+    /// Detach before recursive root teardown so selection survives unrelated updates.
+    fn prepare(&mut self, commands: &mut Commands) {
+        self.available = std::mem::take(&mut self.used);
+        // Reuse identical labels in render order so focus stays on the same occurrence.
+        for labels in self.available.values_mut() {
+            labels.reverse();
+        }
+        for label in self.available.values().flatten() {
+            commands.entity(label.root).remove::<ChildOf>();
+        }
+    }
+
+    /// Drop stale labels and release focus if the selected display value disappeared.
+    fn finish(&mut self, commands: &mut Commands, focus: &mut InputFocus) {
+        for label in self.available.drain().flat_map(|(_, labels)| labels) {
+            if focus.get() == Some(label.selection) {
+                focus.clear();
+            }
+            commands.entity(label.root).despawn();
+        }
+    }
+}
 
 /// Construct small reusable paper controls without coupling styling to provider policy.
 struct View<'a> {
     /// Shared bundled fonts; widgets only clone lightweight asset handles.
     fonts: &'a Fonts,
+
+    /// Interior mutability lets nested child builders share the current label cache.
+    texts: RefCell<&'a mut SelectableTexts>,
 }
 
 impl View<'_> {
-    /// Add a monospaced label with explicit contrast against paper surfaces.
+    /// Add selectable interface text with the same intrinsic layout as ordinary text.
     fn label(
+        &self,
+        parent: &mut ChildSpawnerCommands,
+        text: impl Into<String>,
+        size: f32,
+        color: Color,
+    ) {
+        self.selectable(parent, text.into(), size, color, false);
+    }
+
+    /// Add selectable display typography for headings and card titles.
+    fn title(
+        &self,
+        parent: &mut ChildSpawnerCommands,
+        text: impl Into<String>,
+        size: f32,
+        color: Color,
+    ) {
+        self.selectable(parent, text.into(), size, color, true);
+    }
+
+    /// Overlay selection on measured text; engine editors otherwise have no intrinsic width.
+    fn selectable(
+        &self,
+        parent: &mut ChildSpawnerCommands,
+        text: String,
+        size: f32,
+        color: Color,
+        display: bool,
+    ) {
+        let key = SelectableKey {
+            text,
+            display,
+            size: size.to_bits(),
+            color: color.to_srgba().to_f32_array().map(f32::to_bits),
+        };
+        let mut texts = self.texts.borrow_mut();
+        let retained = texts.available.get_mut(&key).and_then(Vec::pop);
+        let label = if let Some(label) = retained {
+            let parent_entity = parent.target_entity();
+            parent
+                .commands()
+                .entity(parent_entity)
+                .add_child(label.root);
+            label
+        } else {
+            let font = if display {
+                self.fonts.display(size)
+            } else {
+                self.fonts.mono(size)
+            };
+            let root = parent
+                .spawn(Node {
+                    // Preserve intrinsic minimums; zero minimums with percentage maxima
+                    // collapse measured label wrappers to zero width in Taffy.
+                    flex_shrink: if display { 1. } else { 0. },
+                    ..default()
+                })
+                .id();
+            // Separate text roots prevent the transparent editor from joining the measured
+            // label's span/style hierarchy. Ordinary Text remains the sole layout content.
+            let measured = parent
+                .commands()
+                .spawn((
+                    Text::new(&key.text),
+                    font.clone(),
+                    TextColor(color),
+                    Node::default(),
+                    Pickable::IGNORE,
+                ))
+                .id();
+            parent.commands().entity(root).add_child(measured);
+            let selection = parent
+                .commands()
+                .spawn((
+                    TextInput,
+                    EditableText {
+                        visible_lines: None,
+                        allow_newlines: true,
+                        cursor_margin: Vec2::ZERO,
+                        cursor_width: 0.,
+                        ..EditableText::new(&key.text)
+                    },
+                    TextReadWriteMode::ReadOnly,
+                    font,
+                    // The measured label supplies ordinary glyphs. Only selection is painted here.
+                    TextColor(Color::NONE),
+                    TextCursorStyle {
+                        selection_color: PURPLE.with_alpha(0.28),
+                        // Bevy uses this color for read-only selections even while focused.
+                        unfocused_selection_color: PURPLE.with_alpha(0.28),
+                        selected_text_color: None,
+                        ..default()
+                    },
+                    TabIndex(-1),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0),
+                        top: px(0),
+                        width: percent(100),
+                        height: percent(100),
+                        ..default()
+                    },
+                ))
+                .id();
+            parent.commands().entity(root).add_child(selection);
+            SelectableText { root, selection }
+        };
+        texts.used.entry(key).or_default().push(label);
+    }
+
+    /// Keep action labels in their parent's hit target instead of intercepting selection drags.
+    fn action_label(
         &self,
         parent: &mut ChildSpawnerCommands,
         text: impl Into<String>,
@@ -28,6 +201,29 @@ impl View<'_> {
                 ..default()
             },
         ));
+    }
+
+    /// Separate logical form sections without adding a border to every individual field.
+    fn rule(&self, parent: &mut ChildSpawnerCommands) {
+        parent.spawn((
+            Node {
+                width: percent(100),
+                height: px(1),
+                min_height: px(1),
+                flex_shrink: 0.,
+                ..default()
+            },
+            BackgroundColor(RULE),
+            Pickable::IGNORE,
+        ));
+    }
+
+    /// Attach the persistent engine editor to its freshly rendered field slot.
+    fn input(&self, parent: &mut ChildSpawnerCommands, editor: &Editor) {
+        if let Some(entity) = editor.entity {
+            let parent_entity = parent.target_entity();
+            parent.commands().entity(parent_entity).add_child(entity);
+        }
     }
 
     /// Add a button with a comfortable hit target and bounded hover feedback.
@@ -46,6 +242,8 @@ impl View<'_> {
         parent
             .spawn((
                 Button,
+                ActivateOnPress,
+                Hovered::default(),
                 action,
                 Node {
                     min_height: px(38),
@@ -63,7 +261,7 @@ impl View<'_> {
                     hovered,
                 },
             ))
-            .with_children(|button| self.label(button, label, 12., foreground));
+            .with_children(|button| self.action_label(button, label, 12., foreground));
     }
 
     /// Render a provider selector with its popup anchored directly below the control.
@@ -87,6 +285,8 @@ impl View<'_> {
                 container
                     .spawn((
                         Button,
+                        ActivateOnPress,
+                        Hovered::default(),
                         UiAction::Dropdown(menu),
                         Node {
                             width: percent(100),
@@ -107,7 +307,7 @@ impl View<'_> {
                         },
                     ))
                     .with_children(|button| {
-                        self.label(button, label, 10., MUTED);
+                        self.action_label(button, label, 10., MUTED);
                         button
                             .spawn(Node {
                                 width: percent(100),
@@ -117,8 +317,8 @@ impl View<'_> {
                                 ..default()
                             })
                             .with_children(|row| {
-                                self.label(row, value, 13., INK);
-                                self.label(row, if open { "−" } else { "+" }, 17., PURPLE);
+                                self.action_label(row, value, 13., INK);
+                                self.action_label(row, if open { "−" } else { "+" }, 17., PURPLE);
                             });
                     });
                 if open {
@@ -144,7 +344,7 @@ impl View<'_> {
                             BackgroundColor(PAPER),
                             BorderColor::all(RULE),
                             GlobalZIndex(30),
-                            FocusPolicy::Block,
+                            Pickable::default(),
                         ))
                         .with_children(|popup| {
                             let entries = match menu {
@@ -200,6 +400,8 @@ impl View<'_> {
         parent
             .spawn((
                 Button,
+                ActivateOnPress,
+                Hovered::default(),
                 UiAction::Runtime(Action::Play(clip.identity.clone())),
                 Node {
                     width: px(layout.card_width),
@@ -249,7 +451,7 @@ impl View<'_> {
                             },
                         ));
                     } else {
-                        self.label(preview, "PREVIEW UNAVAILABLE", 10., MUTED);
+                        self.action_label(preview, "PREVIEW UNAVAILABLE", 10., MUTED);
                     }
                 });
                 card.spawn(Node {
@@ -261,11 +463,7 @@ impl View<'_> {
                     ..default()
                 })
                 .with_children(|title| {
-                    title.spawn((
-                        Text::new(&clip.metadata.title),
-                        self.fonts.display(17.),
-                        TextColor(INK),
-                    ));
+                    self.title(title, &clip.metadata.title, 17., INK);
                 });
                 let kind = match std::path::Path::new(&clip.metadata.asset)
                     .extension()
@@ -281,10 +479,12 @@ impl View<'_> {
                     ..default()
                 })
                 .with_children(|row| {
-                    self.label(row, kind, 9., MUTED);
+                    self.action_label(row, kind, 9., MUTED);
                     if let Some(instance) = stop {
                         row.spawn((
                             Button,
+                            ActivateOnPress,
+                            Hovered::default(),
                             UiAction::Runtime(Action::Stop(instance.to_owned())),
                             Node {
                                 padding: UiRect::axes(px(6), px(1)),
@@ -297,9 +497,9 @@ impl View<'_> {
                                 hovered: INK,
                             },
                         ))
-                        .with_children(|stop| self.label(stop, "STOP", 9., PAPER));
+                        .with_children(|stop| self.action_label(stop, "STOP", 9., PAPER));
                     } else {
-                        self.label(row, status, 9., PURPLE);
+                        self.action_label(row, status, 9., PURPLE);
                     }
                 });
             });
@@ -329,23 +529,13 @@ impl View<'_> {
                     self.label(row, field.label, 11., MUTED);
                     let editor = &modal.editors[index];
                     let selected = focus == Some(Field::Configuration(index));
-                    let value = if field.secret {
-                        if editor.text.is_empty() {
-                            "Enter pairing secret".into()
-                        } else {
-                            "•".repeat(editor.text.chars().count())
-                        }
-                    } else if !field.choices.is_empty() {
+                    let value = if !field.choices.is_empty() {
                         field
                             .choices
                             .iter()
                             .find(|choice| choice.value == editor.text)
                             .map(|choice| format!("{}  +", choice.label))
                             .unwrap_or_else(|| editor.text.clone())
-                    } else if selected {
-                        editor.label()
-                    } else if editor.text.is_empty() {
-                        "Enter a value…".into()
                     } else {
                         editor.text.clone()
                     };
@@ -361,14 +551,14 @@ impl View<'_> {
                     if field.read_only {
                         row.spawn((node, BackgroundColor(BACKGROUND), BorderColor::all(RULE)))
                             .with_children(|input| self.label(input, value, 12., MUTED));
+                    } else if field.choices.is_empty() {
+                        self.input(row, editor);
                     } else {
-                        let action = if field.choices.is_empty() {
-                            UiAction::Focus(Field::Configuration(index))
-                        } else {
-                            UiAction::Cycle(index)
-                        };
+                        let action = UiAction::Cycle(index);
                         row.spawn((
                             Button,
+                            ActivateOnPress,
+                            Hovered::default(),
                             action,
                             node,
                             BackgroundColor(BACKGROUND),
@@ -378,7 +568,7 @@ impl View<'_> {
                                 hovered: PAPER,
                             },
                         ))
-                        .with_children(|input| self.label(input, value, 12., INK));
+                        .with_children(|input| self.action_label(input, value, 12., INK));
                     }
                     self.label(row, field.hint, 10., MUTED);
                 });
@@ -414,42 +604,8 @@ impl View<'_> {
         secret: bool,
     ) {
         self.label(parent, label, 11., MUTED);
-        let editor = &modal.editors[index];
-        let selected = focus == Some(Field::Configuration(index));
-        let value = if secret {
-            if editor.text.is_empty() {
-                "Enter API key…".into()
-            } else {
-                "•".repeat(editor.text.chars().count())
-            }
-        } else if selected {
-            editor.label()
-        } else if editor.text.is_empty() {
-            "Enter a value…".into()
-        } else {
-            editor.text.clone()
-        };
-        parent
-            .spawn((
-                Button,
-                UiAction::Focus(Field::Configuration(index)),
-                Node {
-                    width: percent(100),
-                    min_height: px(48),
-                    padding: UiRect::axes(px(14), px(13)),
-                    border: UiRect::all(px(1)),
-                    border_radius: BorderRadius::all(px(5)),
-                    overflow: Overflow::clip(),
-                    ..default()
-                },
-                BackgroundColor(BACKGROUND),
-                BorderColor::all(if selected { PURPLE } else { RULE }),
-                HoverColors {
-                    resting: BACKGROUND,
-                    hovered: PAPER,
-                },
-            ))
-            .with_children(|input| self.label(input, value, 12., INK));
+        let _ = (focus, secret);
+        self.input(parent, &modal.editors[index]);
     }
 
     /// Render one configured source's controls; selecting it never changes permission.
@@ -632,6 +788,7 @@ impl View<'_> {
         match sources.details {
             SourceDetails::None => (),
             SourceDetails::Listener => {
+                self.rule(dialog);
                 self.label(
                     dialog,
                     "LISTENER · SHARED BY TAILSCALE SOURCES",
@@ -685,6 +842,7 @@ impl View<'_> {
                 );
             }
             SourceDetails::Credentials => {
+                self.rule(dialog);
                 self.label(
                     dialog,
                     "INVITATION CREDENTIALS · SHARED BY TAILSCALE SOURCES",
@@ -742,6 +900,7 @@ impl View<'_> {
             return;
         };
         self.source_selector(dialog, sources, network);
+        self.rule(dialog);
         match &sources.selection {
             SourceSelection::Local => {
                 self.label(dialog, "LOCAL CONTROLS", 10., PURPLE);
@@ -761,6 +920,7 @@ impl View<'_> {
             SourceSelection::Remote(id) => {
                 if let Some(source) = network.controllers.iter().find(|source| &source.id == id) {
                     self.controller_source(dialog, source, network);
+                    self.rule(dialog);
                     self.source_details(dialog, modal, focus, sources, network);
                 }
             }
@@ -851,8 +1011,6 @@ impl View<'_> {
             ),
         };
         root.spawn((
-            Button,
-            UiAction::Cancel,
             Node {
                 position_type: PositionType::Absolute,
                 left: px(0),
@@ -866,11 +1024,19 @@ impl View<'_> {
             },
             BackgroundColor(Color::srgba(0.102, 0.102, 0.102, 0.48)),
             GlobalZIndex(100),
-            FocusPolicy::Block,
+            Pickable::default(),
         ))
         .with_children(|backdrop| {
+            backdrop.spawn((
+                Button,
+                ActivateOnPress,
+                UiAction::Cancel,
+                Node { position_type: PositionType::Absolute, width: percent(100), height: percent(100), ..default() },
+            ));
             backdrop
                 .spawn((
+                    GlobalZIndex(101),
+                    TabGroup::modal(),
                     Node {
                         width: px(650),
                         max_width: percent(100),
@@ -884,7 +1050,7 @@ impl View<'_> {
                     },
                     BackgroundColor(PAPER),
                     BorderColor::all(RULE),
-                    FocusPolicy::Block,
+                    Pickable::default(),
                 ))
                 .with_children(|dialog| {
                     dialog
@@ -894,21 +1060,20 @@ impl View<'_> {
                             ..default()
                         })
                         .with_children(|heading| {
-                            heading.spawn((
-                                Text::new(title),
-                                self.fonts.display(31.),
-                                TextColor(INK),
-                            ));
+                            self.title(heading, title, 31., INK);
                             self.button(heading, "Close ×", UiAction::Cancel, false);
                         });
                     self.label(dialog, subtitle, 12., MUTED);
                     dialog
                         .spawn((
                             ModalBody,
+                            BorderColor::all(RULE),
                             ScrollPosition(Vec2::new(0., modal.scroll)),
                             Node {
                                 width: percent(100),
                                 min_height: px(0),
+                                border: UiRect::top(px(1)),
+                                padding: UiRect::top(px(22)),
                                 overflow: Overflow::scroll_y(),
                                 ..default()
                             },
@@ -930,11 +1095,14 @@ impl View<'_> {
                             width: percent(100),
                             flex_shrink: 0.,
                             min_height: px(38),
+                            border: UiRect::top(px(1)),
+                            padding: UiRect::top(px(16)),
                             justify_content: JustifyContent::SpaceBetween,
                             align_items: AlignItems::Center,
                             margin: UiRect::top(px(6)),
                             ..default()
                         })
+                        .insert(BorderColor::all(RULE))
                         .with_children(|footer| {
                             self.button(
                                 footer,
@@ -979,6 +1147,10 @@ pub(super) fn render(
     network: Res<crate::network_app::NetworkState>,
     fonts: Res<Fonts>,
     primary: Single<&Window, With<PrimaryWindow>>,
+    inputs: Query<Entity, With<input::InputField>>,
+    mut focus: ResMut<InputFocus>,
+    mut redraw: MessageWriter<bevy::window::RequestRedraw>,
+    mut texts: Local<SelectableTexts>,
 ) {
     model.reconcile_sources(&network);
     let remote = runtime.destination == Destination::Remote;
@@ -993,7 +1165,9 @@ pub(super) fn render(
         display: runtime.display,
     };
     if model.saved_preferences.as_ref() != Some(&preferences) {
-        let _ = preferences.save();
+        if !cfg!(test) {
+            let _ = preferences.save();
+        }
         model.saved_preferences = Some(preferences);
     }
     let snapshot = if remote {
@@ -1062,7 +1236,7 @@ pub(super) fn render(
         network.remote_icons.len(),
         primary.width(),
         primary.height(),
-        model.query.label(),
+        model.query.text,
         network.hosting,
         model.layout.rows,
         model.viewport_height()
@@ -1089,7 +1263,11 @@ pub(super) fn render(
     if signature == model.signature {
         return;
     }
+    // Reactive windows need a settling frame after replacing the UI hierarchy.
+    redraw.write(bevy::window::RequestRedraw);
     model.signature = signature;
+    input::prepare(&mut commands, &mut model, &inputs, &fonts, &mut focus);
+    texts.prepare(&mut commands);
     if let Some(root) = model.root.take() {
         commands.entity(root).despawn();
     }
@@ -1098,6 +1276,8 @@ pub(super) fn render(
             Node {
                 width: percent(100),
                 height: percent(100),
+                min_height: px(0),
+                max_height: percent(100),
                 padding: UiRect::all(px(28)),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(18),
@@ -1106,10 +1286,14 @@ pub(super) fn render(
             },
             BackgroundColor(BACKGROUND),
             UiTargetCamera(camera.0),
+            TabGroup::default(),
         ))
         .id();
     model.root = Some(root);
-    let view = View { fonts: &fonts };
+    let view = View {
+        fonts: &fonts,
+        texts: RefCell::new(&mut texts),
+    };
     commands.entity(root).with_children(|parent| {
         parent
             .spawn(Node {
@@ -1120,7 +1304,7 @@ pub(super) fn render(
                 ..default()
             })
             .with_children(|brand| {
-                brand.spawn((Text::new("durop"), fonts.display(29.), TextColor(INK)));
+                view.title(brand, "durop", 29., INK);
                 if primary.width() >= 620. {
                     view.label(brand, "A LITTLE EXPRESSION, ON CUE.", 10., MUTED);
                 }
@@ -1172,8 +1356,7 @@ pub(super) fn render(
                 );
                 header
                     .spawn((
-                        Button,
-                        UiAction::Focus(Field::Search),
+
                         Node {
                             flex_grow: 1.,
                             width: if compact { percent(100) } else { auto() },
@@ -1201,22 +1384,7 @@ pub(super) fn render(
                     ))
                     .with_children(|search| {
                         view.label(search, "SEARCH", 10., MUTED);
-                        view.label(
-                            search,
-                            if model.focus == Some(Field::Search) {
-                                model.query.label()
-                            } else if model.query.text.is_empty() {
-                                "Find a reaction…".into()
-                            } else {
-                                model.query.text.clone()
-                            },
-                            13.,
-                            if model.query.text.is_empty() {
-                                MUTED
-                            } else {
-                                INK
-                            },
-                        );
+                        view.input(search, &model.query);
                     });
             });
         parent
@@ -1246,6 +1414,7 @@ pub(super) fn render(
             .spawn(Node {
                 width: percent(100),
                 flex_grow: 1.,
+                flex_basis: px(0),
                 min_height: px(0),
                 column_gap: px(14),
                 overflow: Overflow::clip(),
@@ -1289,17 +1458,18 @@ pub(super) fn render(
                                         ..default()
                                     })
                                     .with_children(|empty| {
-                                        empty.spawn((
-                                            Text::new(if runtime.loading {
+                                        view.title(
+                                            empty,
+                                            if runtime.loading {
                                                 "Gathering your collection…"
                                             } else if remote && !network.connected {
                                                 "Connect your host"
                                             } else {
                                                 "Nothing here, yet."
-                                            }),
-                                            fonts.display(28.),
-                                            TextColor(INK),
-                                        ));
+                                            },
+                                            28.,
+                                            INK,
+                                        );
                                         view.label(
                                             empty,
                                             if remote && !network.connected {
@@ -1401,6 +1571,7 @@ pub(super) fn render(
                 collection
                     .spawn((
                         Button,
+                        Hovered::default(),
                         Scrollbar,
                         RelativeCursorPosition::default(),
                         Node {
@@ -1411,7 +1582,7 @@ pub(super) fn render(
                             ..default()
                         },
                         BackgroundColor(YELLOW.with_alpha(0.22)),
-                        FocusPolicy::Block,
+                        Pickable::default(),
                     ))
                     .with_children(|track| {
                         let (top, height) = model.thumb_geometry(model.viewport_height());
@@ -1430,7 +1601,7 @@ pub(super) fn render(
                             } else {
                                 PURPLE
                             }),
-                            FocusPolicy::Pass,
+                            Pickable::IGNORE,
                         ));
                     });
             });
@@ -1490,4 +1661,5 @@ pub(super) fn render(
             view.modal(parent, modal, model.focus, &network, &runtime);
         }
     });
+    texts.finish(&mut commands, &mut focus);
 }

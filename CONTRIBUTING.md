@@ -12,6 +12,10 @@ cargo build --workspace --locked
 python3 -m unittest discover -s scripts/tests -v
 ```
 
+Bevy 0.20.1 requires Rust 1.97.1; `rust-toolchain.toml` and the pinned Nix
+Rust overlay provide that minimum toolchain. CI and native packaging read the
+same channel from the toolchain file.
+
 CI runs the Rust checks on macOS and Linux. Keep Cargo.lock and flake.lock committed when dependencies change. Shell entry does not install hooks or change Git configuration; there is no required hook setup.
 
 The first runtime target is Apple Silicon macOS. One executable assembles separate protocol, catalog, host, media and transport crates. Follow the [dependency boundaries](docs/architecture.md); application/UI dependencies stay out of those libraries. Linux CI checks portable code and does not validate native AppKit/AVFoundation behavior. Audio/video controls and system codecs are qualified on macOS; GIF and state/transport logic have portable tests.

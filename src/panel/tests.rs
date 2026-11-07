@@ -1,6 +1,16 @@
 //! Regression coverage for input routing, modal isolation and bounded collection geometry.
 
 use super::*;
+use bevy::input::ButtonState;
+use bevy::window::Ime;
+
+/// Feed legacy routing fixtures through a one-shot intent queue; engine activation has separate integration coverage.
+fn queue_test_activations(
+    widgets: Query<&UiAction, Added<Pressed>>,
+    mut pending: ResMut<input::PendingActions>,
+) {
+    pending.0.extend(widgets.iter().cloned());
+}
 
 /// Start a controller-only runtime without loading a pack from user preferences.
 fn config() -> crate::app::Config {
@@ -25,17 +35,89 @@ fn thumbnails_reject_large_payloads_and_oversized_ihdr_before_decode() {
     assert!(Icons::icon_image(&icon).is_ok());
 }
 
-/// Construct real input message routing with a focused synthetic primary window.
+/// The headless edit harness has no renderer visibility propagation; expose its UI nodes for tab traversal.
+fn mark_test_nodes_visible(mut nodes: Query<&mut InheritedVisibility>) {
+    for mut visible in &mut nodes {
+        *visible = InheritedVisibility::VISIBLE;
+    }
+}
+
+/// Construct the production text widgets and engine dispatch/edit lifecycle without a native window.
 fn input_app() -> (App, Entity) {
     let mut app = App::new();
-    app.insert_resource(Runtime::new(&config()).unwrap())
-        .init_resource::<Model>()
-        .init_resource::<Actions>()
-        .init_resource::<ButtonInput<KeyCode>>()
-        .add_message::<KeyboardInput>()
-        .add_message::<Ime>()
-        .add_message::<bevy::winit::RawWinitWindowEvent>()
-        .add_systems(Update, text_input);
+    let runtime = Runtime::new(&config()).unwrap();
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let preferences = crate::preferences::Preferences {
+        pack: crate::preferences::Preferences::stored_pack(
+            &runtime.pack_input,
+            &crate::app::Config::bundled_pack(),
+        ),
+        query: String::new(),
+        display: runtime.display,
+    };
+    app.add_plugins((
+        bevy::input::InputPlugin,
+        bevy::input_focus::InputFocusPlugin,
+        bevy::input_focus::InputDispatchPlugin,
+        bevy::ui_widgets::TextInputPlugin,
+        TabNavigationPlugin,
+    ))
+    .insert_resource(runtime)
+    .insert_resource(network)
+    .insert_resource(Model {
+        saved_preferences: Some(preferences),
+        ..default()
+    })
+    .init_resource::<Actions>()
+    .init_resource::<input::PendingActions>()
+    .init_resource::<input::OrderedKeyboard>()
+    .init_resource::<bevy::clipboard::Clipboard>()
+    .init_resource::<bevy::text::FontCx>()
+    .init_resource::<bevy::text::LayoutCx>()
+    .init_resource::<Time<bevy::time::Real>>()
+    .init_resource::<bevy::picking::events::PointerState>()
+    .init_resource::<UiScale>()
+    .init_resource::<Icons>()
+    .init_resource::<Fonts>()
+    .init_resource::<Assets<Image>>()
+    .add_message::<Ime>()
+    .add_message::<bevy::window::RequestRedraw>()
+    .add_message::<bevy::picking::events::PointerRelease>()
+    .add_message::<bevy::input::gamepad::GamepadButtonChangedEvent>()
+    .add_observer(input::activate)
+    .add_observer(input::keyboard)
+    .add_systems(
+        PreUpdate,
+        input::dispatch_keyboard
+            .after(bevy::input::InputSystems)
+            .before(bevy::input_focus::InputFocusSystems::Dispatch),
+    )
+    .add_systems(Update, (view::render, mark_test_nodes_visible).chain())
+    .add_systems(
+        PostUpdate,
+        bevy::text::apply_text_edits.in_set(EditableTextSystems),
+    )
+    .add_systems(
+        PostUpdate,
+        (
+            input::synchronize,
+            buttons,
+            input::focus_style,
+            input::request_redraw,
+        )
+            .chain()
+            .after(EditableTextSystems),
+    );
+    let font = Font::from_bytes(
+        std::fs::read(crate::app::resource_root().join("assets/fonts/IBMPlexMono-Regular.ttf"))
+            .unwrap(),
+    );
+    {
+        let mut context = app.world_mut().resource_mut::<bevy::text::FontCx>();
+        context.collection.register_fonts(font.data, None);
+        context.set_sans_serif_family("IBM Plex Mono").unwrap();
+        context.set_monospace_family("IBM Plex Mono").unwrap();
+    }
     let window = app
         .world_mut()
         .spawn((
@@ -46,7 +128,13 @@ fn input_app() -> (App, Entity) {
             PrimaryWindow,
         ))
         .id();
-    app.world_mut().resource_mut::<Model>().focus = Some(Field::Search);
+    let camera = app.world_mut().spawn(Camera2d).id();
+    app.insert_resource(PanelCamera(camera));
+    app.update();
+    let search = app.world().resource::<Model>().query.entity.unwrap();
+    app.world_mut()
+        .resource_mut::<InputFocus>()
+        .set(search, FocusCause::Pressed);
     (app, window)
 }
 
@@ -88,82 +176,38 @@ fn actual_keyboard_messages_edit_search_and_suppress_drop_shortcuts() {
     ));
 }
 
-/// Within-frame modifier ordering must preserve select-all semantics.
+/// Engine character selection and replacement preserve Unicode text rather than inserting command letters.
 #[test]
-fn modifier_down_a_modifier_up_in_one_update_selects_instead_of_typing_a() {
+fn engine_selection_replaces_unicode_search_and_suppresses_shortcuts() {
+    use bevy::text::TextEdit;
     let (mut app, window) = input_app();
-    {
-        let mut model = app.world_mut().resource_mut::<Model>();
-        model.query.insert("gif");
-    }
-    key(&mut app, window, Key::Super, KeyCode::SuperLeft, None);
-    key(
-        &mut app,
-        window,
-        Key::Character("a".into()),
-        KeyCode::KeyA,
-        Some("a"),
-    );
+    let input = app.world().resource::<Model>().query.entity.unwrap();
+    app.world_mut()
+        .get_mut::<EditableText>(input)
+        .unwrap()
+        .queue_edit(TextEdit::Insert("Aé🌈".into()));
+    app.update();
+    key(&mut app, window, Key::Shift, KeyCode::ShiftLeft, None);
+    key(&mut app, window, Key::ArrowLeft, KeyCode::ArrowLeft, None);
+    app.update();
     app.world_mut().write_message(KeyboardInput {
-        key_code: KeyCode::SuperLeft,
-        logical_key: Key::Super,
+        key_code: KeyCode::ShiftLeft,
+        logical_key: Key::Shift,
         state: ButtonState::Released,
         text: None,
         repeat: false,
         window,
     });
-    app.update();
-    assert_eq!(app.world().resource::<Model>().query.text, "gif");
-    assert!(app.world().resource::<Model>().query.select_all);
-    assert_eq!(app.world().resource::<Model>().modifiers, 0);
     key(
         &mut app,
         window,
-        Key::Character("video".into()),
-        KeyCode::KeyV,
-        Some("video"),
+        Key::Character("日本".into()),
+        KeyCode::KeyN,
+        Some("日本"),
     );
     app.update();
-    assert_eq!(app.world().resource::<Model>().query.text, "video");
+    assert_eq!(app.world().resource::<Model>().query.text, "Aé日本");
     assert!(app.world().resource::<Actions>().0.is_empty());
-}
-
-/// Native modifier flags must work even without a physical modifier key event.
-#[test]
-fn flag_only_modifiers_apply_to_the_ordered_key_without_physical_modifier_events() {
-    let entity = Entity::PLACEHOLDER;
-    let key = |text: &str, code| KeyboardInput {
-        window: entity,
-        key_code: code,
-        logical_key: Key::Character(text.into()),
-        text: Some(text.into()),
-        state: ButtonState::Pressed,
-        repeat: false,
-    };
-    let mut flags = 0;
-    let keys = ordered_keyboard(
-        [
-            OrderedInput::Modifiers(1),
-            OrderedInput::Keyboard(key("a", KeyCode::KeyA)),
-            OrderedInput::Modifiers(0),
-            OrderedInput::Keyboard(key("g", KeyCode::KeyG)),
-        ],
-        &mut flags,
-    );
-    assert_eq!(keys.len(), 2);
-    assert!(keys[0].1);
-    assert!(!keys[1].1);
-    assert_eq!(flags, 0);
-    let mut query = Editor::default();
-    query.insert("video");
-    for (key, modified) in keys {
-        if modified && key.key_code == KeyCode::KeyA {
-            query.select_all = true;
-        } else if !modified {
-            query.insert(key.text.as_deref().unwrap());
-        }
-    }
-    assert_eq!(query.text, "g");
 }
 
 /// Button admission requests cancellation without claiming native teardown finished.
@@ -216,9 +260,12 @@ fn pressed_stop_all_button_routes_to_shared_host_and_truthful_request_status() {
         .insert_resource(network)
         .init_resource::<Model>()
         .init_resource::<Actions>()
-        .add_systems(Update, buttons);
+        .init_resource::<input::PendingActions>()
+        .init_resource::<input::OrderedKeyboard>()
+        .init_resource::<InputFocus>()
+        .add_systems(Update, (queue_test_activations, buttons).chain());
     app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::Runtime(Action::StopAll)));
+        .spawn((Pressed, UiAction::Runtime(Action::StopAll)));
     app.update();
     assert!(matches!(
         app.world_mut().resource_mut::<Actions>().0.pop_front(),
@@ -253,49 +300,25 @@ fn actual_ime_messages_keep_preedit_uncommitted_and_commit_only_once() {
         value: "に".into(),
         cursor: Some((3, 3)),
     });
-    key(
-        &mut app,
-        window,
-        Key::Character("n".into()),
-        KeyCode::KeyN,
-        Some("n"),
-    );
     app.update();
     assert_eq!(app.world().resource::<Model>().query.text, "");
-    assert_eq!(app.world().resource::<Model>().query.preedit, "に");
+    let input = app.world().resource::<Model>().query.entity.unwrap();
+    assert!(
+        app.world()
+            .get::<EditableText>(input)
+            .unwrap()
+            .is_composing()
+    );
     app.world_mut().write_message(Ime::Commit {
         window,
         value: "日本".into(),
     });
-    key(
-        &mut app,
-        window,
-        Key::Character("日本".into()),
-        KeyCode::KeyN,
-        Some("日本"),
-    );
     app.update();
     assert_eq!(app.world().resource::<Model>().query.text, "日本");
     key(&mut app, window, Key::Backspace, KeyCode::Backspace, None);
     app.update();
     assert_eq!(app.world().resource::<Model>().query.text, "日");
     assert!(app.world().resource::<Actions>().0.is_empty());
-}
-
-/// Editing and selection must not split UTF-8 scalar boundaries.
-#[test]
-fn unicode_cursor_selection_and_backspace_stay_on_character_boundaries() {
-    let mut editor = Editor::default();
-    editor.insert("Aé🌈");
-    editor.left();
-    editor.backspace();
-    assert_eq!(editor.text, "A🌈");
-    editor.right();
-    editor.backspace();
-    assert_eq!(editor.text, "A");
-    editor.select_all = true;
-    editor.insert("日本");
-    assert_eq!(editor.text, "日本");
 }
 
 /// Virtualized rendering stays bounded while filtering the complete source catalog.
@@ -376,19 +399,23 @@ fn provider_modal_blocks_background_play_but_preserves_emergency_stop() {
     let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
     let mut model = Model::default();
     model.open(Provider::Host(HostProvider::Tailscale), &provider_context());
-    model.modal.as_mut().unwrap().editors[1].insert(&"a".repeat(64));
+    model.modal.as_mut().unwrap().editors[1]
+        .text
+        .push_str(&"a".repeat(64));
     let mut app = App::new();
     app.insert_resource(runtime)
         .insert_resource(network)
         .insert_resource(model)
         .init_resource::<Actions>()
-        .add_systems(Update, buttons);
+        .init_resource::<input::PendingActions>()
+        .init_resource::<InputFocus>()
+        .add_systems(Update, (queue_test_activations, buttons).chain());
     app.world_mut().spawn((
-        Interaction::Pressed,
+        Pressed,
         UiAction::Runtime(Action::Play("background/clip".into())),
     ));
     app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::Runtime(Action::StopAll)));
+        .spawn((Pressed, UiAction::Runtime(Action::StopAll)));
     app.update();
     let actions = &app.world().resource::<Actions>().0;
     assert_eq!(actions.len(), 1);
@@ -407,7 +434,9 @@ fn apply_retains_invalid_edits_and_consumes_only_a_valid_provider_draft() {
     model.open(Provider::Host(HostProvider::Tailscale), &context);
     assert!(model.apply(&context).is_none());
     assert!(model.modal.as_ref().unwrap().error.is_some());
-    model.modal.as_mut().unwrap().editors[1].insert(&"b".repeat(64));
+    model.modal.as_mut().unwrap().editors[1]
+        .text
+        .push_str(&"b".repeat(64));
     let intent = model.apply(&context).expect("validated pairing intent");
     assert!(matches!(intent, ConfigurationIntent::Tailscale { .. }));
     assert!(model.modal.is_none());
@@ -446,9 +475,10 @@ fn native_provider_apply_in_controller_mode_retains_actionable_modal_error() {
         .insert_resource(network)
         .insert_resource(model)
         .init_resource::<Actions>()
-        .add_systems(Update, buttons);
-    app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::Apply));
+        .init_resource::<input::PendingActions>()
+        .init_resource::<InputFocus>()
+        .add_systems(Update, (queue_test_activations, buttons).chain());
+    app.world_mut().spawn((Pressed, UiAction::Apply));
     app.update();
     assert!(app.world().resource::<Actions>().0.is_empty());
     assert!(
@@ -485,7 +515,7 @@ fn scrollbar_drag_tracks_pointer_and_modal_cancels_capture() {
                 inverse_scale_factor: 1.,
                 ..default()
             },
-            Interaction::Pressed,
+            Pressed,
             bevy::ui::RelativeCursorPosition {
                 normalized: Some(Vec2::new(0., 0.5)),
                 ..default()
@@ -497,7 +527,7 @@ fn scrollbar_drag_tracks_pointer_and_modal_cancels_capture() {
     assert!(model.dragging);
     assert_eq!(model.scroll, model.max_scroll());
     app.world_mut().entity_mut(track).insert((
-        Interaction::None,
+        (),
         bevy::ui::RelativeCursorPosition {
             normalized: Some(Vec2::new(0., -0.5)),
             ..default()
@@ -509,7 +539,7 @@ fn scrollbar_drag_tracks_pointer_and_modal_cancels_capture() {
         .resource_mut::<Model>()
         .open(Provider::Host(HostProvider::Native), &provider_context());
     app.world_mut().entity_mut(track).insert((
-        Interaction::Pressed,
+        Pressed,
         bevy::ui::RelativeCursorPosition {
             normalized: Some(Vec2::new(0., 0.5)),
             ..default()
@@ -538,9 +568,10 @@ fn controller_catalog_apply_preserves_remote_destination_and_draft() {
             .insert_resource(network)
             .insert_resource(model)
             .init_resource::<Actions>()
-            .add_systems(Update, buttons);
-        app.world_mut()
-            .spawn((Interaction::Pressed, UiAction::Apply));
+            .init_resource::<input::PendingActions>()
+            .init_resource::<InputFocus>()
+            .add_systems(Update, (queue_test_activations, buttons).chain());
+        app.world_mut().spawn((Pressed, UiAction::Apply));
         app.update();
         assert!(app.world().resource::<Actions>().0.is_empty());
         let model = app.world().resource::<Model>();
@@ -894,7 +925,7 @@ fn scrollbar_grab_preserves_offset_and_tracks_fractional_motion() {
         .world_mut()
         .spawn((
             Scrollbar,
-            Interaction::Pressed,
+            Pressed,
             ComputedNode {
                 size: Vec2::new(8., 1000.),
                 inverse_scale_factor: 0.5,
@@ -940,7 +971,8 @@ fn from_drafts_cancel_secrets_and_keep_to_selection_independent() {
     model
         .editor(Field::Configuration(1))
         .unwrap()
-        .insert("private-admin-key");
+        .text
+        .push_str("private-admin-key");
     assert!(model.apply(&provider_context()).is_none());
     assert!(model.modal.is_some());
     assert!(!model.allows(&UiAction::Runtime(Action::Play("pack/clip".into()))));
@@ -976,7 +1008,9 @@ fn sources_app() -> App {
         .insert_resource(network)
         .insert_resource(model)
         .init_resource::<Actions>()
-        .add_systems(Update, buttons);
+        .init_resource::<input::PendingActions>()
+        .init_resource::<InputFocus>()
+        .add_systems(Update, (queue_test_activations, buttons).chain());
     app
 }
 
@@ -986,14 +1020,14 @@ fn source_buttons_enqueue_independent_permissions_without_changing_to() {
     use crate::network_app::NetworkAction;
     let mut app = sources_app();
     app.world_mut().spawn((
-        Interaction::Pressed,
+        Pressed,
         UiAction::Network(NetworkAction::SetControllerEnabled {
             id: "alice".into(),
             enabled: false,
         }),
     ));
     app.world_mut().spawn((
-        Interaction::Pressed,
+        Pressed,
         UiAction::Network(NetworkAction::SetControllerEnabled {
             id: "bob".into(),
             enabled: true,
@@ -1031,9 +1065,9 @@ fn secure_save_consumes_only_the_admin_secret_draft() {
         .as_mut()
         .unwrap()
         .editors[1]
-        .insert("  secret-key  ");
-    app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::SaveAdminSecret));
+        .text
+        .push_str("  secret-key  ");
+    app.world_mut().spawn((Pressed, UiAction::SaveAdminSecret));
     app.update();
     assert!(
         matches!(app.world().resource::<crate::network_app::NetworkState>().actions.front(), Some(NetworkAction::SaveAdminSecret {secret}) if secret == "secret-key")
@@ -1065,8 +1099,7 @@ fn listener_apply_keeps_outbound_to_address() {
     app.world_mut()
         .resource_mut::<crate::network_app::NetworkState>()
         .address = "ws://100.111.112.113:7010/control".into();
-    app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::EnableListener));
+    app.world_mut().spawn((Pressed, UiAction::EnableListener));
     app.update();
     let network = app.world().resource::<crate::network_app::NetworkState>();
     assert_eq!(network.address, "ws://100.111.112.113:7010/control");
@@ -1087,10 +1120,8 @@ fn listener_accepts_tailnet_ip_without_an_explicit_port() {
         modal.select_source(SourceSelection::Remote("alice".into()));
         modal.show_source_details(SourceDetails::Listener);
         modal.editors[2].text = "100.101.102.103".into();
-        modal.editors[2].cursor = modal.editors[2].text.len();
     }
-    app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::EnableListener));
+    app.world_mut().spawn((Pressed, UiAction::EnableListener));
     app.update();
     let network = app.world().resource::<crate::network_app::NetworkState>();
     assert_eq!(network.listen_address, "100.101.102.103:48732");
@@ -1102,7 +1133,7 @@ fn listener_accepts_tailnet_ip_without_an_explicit_port() {
 
 /// Press one transient source-navigation button without leaving stale synthetic interactions.
 fn source_press(app: &mut App, action: UiAction) {
-    let button = app.world_mut().spawn((Interaction::Pressed, action)).id();
+    let button = app.world_mut().spawn((Pressed, action)).id();
     app.update();
     app.world_mut().despawn(button);
 }
@@ -1151,7 +1182,8 @@ fn plus_type_switch_and_cancel_create_no_controller() {
         .resource_mut::<Model>()
         .editor(Field::Configuration(0))
         .unwrap()
-        .insert("Uncommitted controller");
+        .text
+        .push_str("Uncommitted controller");
     source_press(
         &mut app,
         UiAction::SelectSource(SourceSelection::ChooseType),
@@ -1194,7 +1226,8 @@ fn leaving_invitation_credentials_discards_secret_and_hidden_input_focus() {
         .resource_mut::<Model>()
         .editor(Field::Configuration(1))
         .unwrap()
-        .insert("private-admin-key");
+        .text
+        .push_str("private-admin-key");
     source_press(
         &mut app,
         UiAction::SourceDetails(SourceDetails::Credentials),
@@ -1223,7 +1256,8 @@ fn leaving_invitation_credentials_discards_secret_and_hidden_input_focus() {
         .resource_mut::<Model>()
         .editor(Field::Configuration(1))
         .unwrap()
-        .insert("second-key");
+        .text
+        .push_str("second-key");
     source_press(&mut app, UiAction::SelectSource(SourceSelection::Local));
     let model = app.world().resource::<Model>();
     assert!(model.focus.is_none());
@@ -1250,7 +1284,8 @@ fn add_selects_only_new_controller_after_runtime_result() {
         .resource_mut::<Model>()
         .editor(Field::Configuration(0))
         .unwrap()
-        .insert("alice");
+        .text
+        .push_str("alice");
     source_press(&mut app, UiAction::AddController);
     {
         let network = app.world().resource::<NetworkState>();
@@ -1307,4 +1342,895 @@ fn controller_launch_listener_provider_apply_preserves_remote_destination() {
         app.world().resource::<Runtime>().destination,
         Destination::Remote
     );
+}
+
+/// Status, catalog filtering and snapshot updates must preserve the live selection and caret entity.
+#[test]
+fn actual_view_refresh_retains_engine_selection_focus_and_composition() {
+    use bevy::text::TextEdit;
+    let (mut app, window) = input_app();
+    let input = app.world().resource::<Model>().query.entity.unwrap();
+    app.world_mut()
+        .get_mut::<EditableText>(input)
+        .unwrap()
+        .queue_edit(TextEdit::Insert("reaction".into()));
+    app.update();
+    app.world_mut()
+        .get_mut::<EditableText>(input)
+        .unwrap()
+        .queue_edit(TextEdit::SelectAll);
+    app.update();
+    let selection = app
+        .world()
+        .get::<EditableText>(input)
+        .unwrap()
+        .editor
+        .raw_selection()
+        .text_range();
+    assert_eq!(selection, 0..8);
+    let root = app.world().resource::<Model>().root.unwrap();
+    {
+        let mut runtime = app.world_mut().resource_mut::<Runtime>();
+        runtime.status = "Playback changed during editing".into();
+        runtime.snapshot.sequence += 1;
+    }
+    app.world_mut()
+        .resource_mut::<crate::network_app::NetworkState>()
+        .status = "Remote status changed".into();
+    app.update();
+    assert_ne!(app.world().resource::<Model>().root, Some(root));
+    assert_eq!(app.world().resource::<Model>().query.entity, Some(input));
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(input));
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(input)
+            .unwrap()
+            .editor
+            .raw_selection()
+            .text_range(),
+        selection
+    );
+    assert!(app.world().get::<TextCursorStyle>(input).is_some());
+    assert_eq!(
+        app.world().get::<TextLayout>(input).unwrap().linebreak,
+        LineBreak::NoWrap
+    );
+    key(
+        &mut app,
+        window,
+        Key::Character("日本".into()),
+        KeyCode::KeyN,
+        Some("日本"),
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().query.text, "日本");
+    app.world_mut().write_message(Ime::Preedit {
+        window,
+        value: "に".into(),
+        cursor: Some((3, 3)),
+    });
+    app.update();
+    app.world_mut().resource_mut::<Runtime>().status = "Still editing".into();
+    app.update();
+    assert!(
+        app.world()
+            .get::<EditableText>(input)
+            .unwrap()
+            .is_composing()
+    );
+    assert_eq!(app.world().resource::<Model>().query.text, "日本");
+}
+
+/// Opening a modal enters its engine tab group, which traps focus and masks protected values.
+#[test]
+fn rendered_modal_initial_focus_and_tab_stay_inside_visible_fields() {
+    let (mut app, window) = input_app();
+    app.world_mut()
+        .resource_mut::<Model>()
+        .open(Provider::Host(HostProvider::Tailscale), &provider_context());
+    app.update();
+    let model = app.world().resource::<Model>();
+    let search = model.query.entity.unwrap();
+    let modal = model.modal.as_ref().unwrap();
+    let endpoint = modal.editors[0].entity.unwrap();
+    let secret = modal.editors[1].entity.unwrap();
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(endpoint));
+    assert!(app.world().get::<InteractionDisabled>(search).is_some());
+    assert!(app.world().get::<EditableText>(secret).is_none());
+    assert!(app.world().get::<Text>(secret).unwrap().0.is_empty());
+    key(&mut app, window, Key::Tab, KeyCode::Tab, None);
+    app.update();
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(secret));
+    key(
+        &mut app,
+        window,
+        Key::Character("private-token".into()),
+        KeyCode::KeyP,
+        Some("private-token"),
+    );
+    app.update();
+    assert_eq!(app.world().get::<Text>(secret).unwrap().0, "•".repeat(13));
+    key(&mut app, window, Key::Tab, KeyCode::Tab, None);
+    app.update();
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(endpoint));
+    key(&mut app, window, Key::Shift, KeyCode::ShiftRight, None);
+    key(&mut app, window, Key::Tab, KeyCode::Tab, None);
+    app.world_mut().write_message(KeyboardInput {
+        window,
+        key_code: KeyCode::ShiftRight,
+        logical_key: Key::Shift,
+        state: ButtonState::Released,
+        text: None,
+        repeat: false,
+    });
+    app.update();
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(secret));
+    assert!(app.world().resource::<Actions>().0.is_empty());
+}
+
+/// Retiring a hidden source field clears its entity handle so revisiting constructs a usable editor.
+#[test]
+fn rendered_source_listener_can_close_and_reopen_without_dead_input_handles() {
+    let (mut app, window) = input_app();
+    let mut fixture = sources_app();
+    let network = fixture
+        .world_mut()
+        .remove_resource::<crate::network_app::NetworkState>()
+        .unwrap();
+    app.insert_resource(network);
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        model.open_sources("100.101.102.103:48732");
+        let modal = model.modal.as_mut().unwrap();
+        modal.select_source(SourceSelection::Remote("alice".into()));
+        modal.show_source_details(SourceDetails::Listener);
+    }
+    app.update();
+    let original = app
+        .world()
+        .resource::<Model>()
+        .modal
+        .as_ref()
+        .unwrap()
+        .editors[2]
+        .entity
+        .unwrap();
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        model
+            .modal
+            .as_mut()
+            .unwrap()
+            .show_source_details(SourceDetails::Listener);
+        model.revision += 1;
+    }
+    app.update();
+    assert!(app.world().get_entity(original).is_err());
+    assert!(
+        app.world()
+            .resource::<Model>()
+            .modal
+            .as_ref()
+            .unwrap()
+            .editors[2]
+            .entity
+            .is_none()
+    );
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        model
+            .modal
+            .as_mut()
+            .unwrap()
+            .show_source_details(SourceDetails::Listener);
+        model.revision += 1;
+    }
+    app.update();
+    let reopened = app
+        .world()
+        .resource::<Model>()
+        .modal
+        .as_ref()
+        .unwrap()
+        .editors[2]
+        .entity
+        .unwrap();
+    assert_ne!(original, reopened);
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(reopened));
+    key(&mut app, window, Key::Backspace, KeyCode::Backspace, None);
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<Model>()
+            .modal
+            .as_ref()
+            .unwrap()
+            .editors[2]
+            .text,
+        "100.101.102.103:4873"
+    );
+    {
+        let mut text = app.world_mut().get_mut::<EditableText>(reopened).unwrap();
+        text.queue_edit(bevy::text::TextEdit::SelectAll);
+        text.queue_edit(bevy::text::TextEdit::Backspace);
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<crate::network_app::NetworkState>()
+        .status = "Discovery changed while editing".into();
+    app.update();
+    let model = app.world().resource::<Model>();
+    let editor = &model.modal.as_ref().unwrap().editors[2];
+    assert!(editor.text.is_empty());
+    assert_eq!(editor.entity, Some(reopened));
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(reopened));
+}
+
+/// A same-frame final edit and Apply must commit the engine value even if a status refresh destroys its button.
+#[test]
+fn queued_final_engine_edit_and_apply_survive_transient_view_refresh() {
+    use bevy::text::TextEdit;
+    let (mut app, _) = input_app();
+    app.world_mut().resource_mut::<Runtime>().destination = Destination::Local;
+    app.world_mut().resource_mut::<Runtime>().mode = Mode::Local;
+    app.world_mut().resource_mut::<Model>().open(
+        Provider::Catalog(CatalogProvider::GitHttps),
+        &provider_context(),
+    );
+    app.update();
+    let input = app
+        .world()
+        .resource::<Model>()
+        .modal
+        .as_ref()
+        .unwrap()
+        .editors[0]
+        .entity
+        .unwrap();
+    let button = app
+        .world_mut()
+        .query::<(Entity, &UiAction)>()
+        .iter(app.world())
+        .find_map(|(entity, action)| matches!(action, UiAction::Apply).then_some(entity))
+        .unwrap();
+    {
+        let mut text = app.world_mut().get_mut::<EditableText>(input).unwrap();
+        text.queue_edit(TextEdit::SelectAll);
+        text.queue_edit(TextEdit::Insert("https://example.com/final.git".into()));
+    }
+    app.world_mut().trigger(Activate { entity: button });
+    app.world_mut().resource_mut::<Runtime>().status = "Refresh before text commit".into();
+    app.update();
+    assert!(app.world().get_entity(button).is_err());
+    assert!(app.world().resource::<Model>().modal.is_none());
+    assert!(app.world().resource::<Actions>().0.iter().any(|action| matches!(action, Action::LoadPack(source) if source.starts_with("https://example.com/final.git#"))));
+    app.update();
+    assert!(app.world().get_entity(input).is_err());
+}
+
+/// Fast modifier chords must reach Bevy editing with their event-time flags, even in one update.
+#[test]
+fn ordered_command_down_a_command_up_selects_instead_of_typing_a() {
+    use bevy::text::TextEdit;
+    let (mut app, window) = input_app();
+    let input = app.world().resource::<Model>().query.entity.unwrap();
+    app.world_mut()
+        .get_mut::<EditableText>(input)
+        .unwrap()
+        .queue_edit(TextEdit::Insert("gif".into()));
+    app.update();
+    let (modifier, code) = if cfg!(target_os = "macos") {
+        (Key::Super, KeyCode::SuperLeft)
+    } else {
+        (Key::Control, KeyCode::ControlLeft)
+    };
+    key(&mut app, window, modifier.clone(), code, None);
+    key(
+        &mut app,
+        window,
+        Key::Character("a".into()),
+        KeyCode::KeyA,
+        Some("a"),
+    );
+    app.world_mut().write_message(KeyboardInput {
+        window,
+        key_code: code,
+        logical_key: modifier,
+        state: ButtonState::Released,
+        text: None,
+        repeat: false,
+    });
+    app.update();
+    assert_eq!(app.world().resource::<Model>().query.text, "gif");
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(input)
+            .unwrap()
+            .editor
+            .raw_selection()
+            .text_range(),
+        0..3
+    );
+    key(
+        &mut app,
+        window,
+        Key::Character("日本".into()),
+        KeyCode::KeyN,
+        Some("日本"),
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().query.text, "日本");
+    assert!(app.world().resource::<Actions>().0.is_empty());
+}
+
+/// Install Bevy's actual camera propagation and Taffy layout over the production rendered tree.
+fn enable_headless_layout(app: &mut App, width: u32, height: u32) {
+    use bevy::app::{HierarchyPropagatePlugin, PropagateSet};
+    use bevy::ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera};
+    app.add_plugins((
+        HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(PostUpdate),
+        HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(PostUpdate),
+    ))
+    .init_resource::<bevy::ui::ui_surface::UiSurface>()
+    .init_resource::<bevy::text::RemSize>()
+    .add_systems(
+        PostUpdate,
+        bevy::ui::update::propagate_ui_target_cameras
+            .before(PropagateSet::<ComputedUiTargetCamera>::default())
+            .before(PropagateSet::<ComputedUiRenderTargetInfo>::default()),
+    )
+    .add_systems(
+        PostUpdate,
+        (
+            bevy::ui::sync_font_size_to_em_size,
+            bevy::ui::ui_layout_system,
+            bevy::ui::widget::sync_editable_text_viewports,
+        )
+            .chain()
+            .after(PropagateSet::<ComputedUiTargetCamera>::default())
+            .after(PropagateSet::<ComputedUiRenderTargetInfo>::default())
+            .before(EditableTextSystems),
+    )
+    .add_systems(Update, scroll.before(view::render));
+    let camera = app.world().resource::<PanelCamera>().0;
+    app.world_mut().entity_mut(camera).insert(Camera {
+        computed: bevy::camera::ComputedCameraValues {
+            target_info: Some(bevy::camera::RenderTargetInfo {
+                physical_size: UVec2::new(width, height),
+                scale_factor: 1.,
+            }),
+            ..default()
+        },
+        viewport: Some(bevy::camera::Viewport {
+            physical_size: UVec2::new(width, height),
+            ..default()
+        }),
+        ..default()
+    });
+    let mut windows = app
+        .world_mut()
+        .query_filtered::<&mut Window, With<PrimaryWindow>>();
+    for mut window in windows.iter_mut(app.world_mut()) {
+        window.resolution = bevy::window::WindowResolution::new(width, height);
+    }
+}
+
+/// Full layout must bound the catalog and keep modal geometry inside desktop and compact windows.
+#[test]
+fn actual_bevy_layout_bounds_collection_and_modal_across_filter_refreshes() {
+    for (width, height) in [(1160, 820), (720, 520)] {
+        let (mut app, window) = input_app();
+        enable_headless_layout(&mut app, width, height);
+        {
+            let mut runtime = app.world_mut().resource_mut::<Runtime>();
+            runtime.destination = Destination::Local;
+            runtime.mode = Mode::Local;
+            runtime.catalog = std::sync::Arc::new(
+                crate::catalog::load_local(
+                    &crate::app::resource_root().join("sample-packs/reactions"),
+                )
+                .unwrap(),
+            );
+            runtime.status = "Layout fixture".into();
+        }
+        app.update();
+        app.update();
+        let root = app.world().resource::<Model>().root.unwrap();
+        let size = app.world().get::<ComputedNode>(root).unwrap().size();
+        assert!(
+            size.y <= height as f32 + 1.,
+            "root {size:?} exceeds viewport {width}x{height}"
+        );
+        let mut bodies = app
+            .world_mut()
+            .query_filtered::<&ComputedNode, With<CatalogBody>>();
+        let body = bodies.single(app.world()).unwrap();
+        assert!(body.size().y > 0. && body.size().y < height as f32);
+        assert!(body.content_size().y > body.size().y);
+        key(
+            &mut app,
+            window,
+            Key::Character("Holly".into()),
+            KeyCode::KeyH,
+            Some("Holly"),
+        );
+        app.update();
+        app.update();
+        let root = app.world().resource::<Model>().root.unwrap();
+        assert!(app.world().get::<ComputedNode>(root).unwrap().size().y <= height as f32 + 1.);
+        app.world_mut().resource_mut::<Model>().open(
+            Provider::Catalog(CatalogProvider::GitHttps),
+            &provider_context(),
+        );
+        app.update();
+        let mut groups = app
+            .world_mut()
+            .query::<(&TabGroup, &ComputedNode, &UiGlobalTransform)>();
+        let (_, node, transform) = groups
+            .iter(app.world())
+            .find(|(group, _, _)| group.modal)
+            .unwrap();
+        let center = transform.translation;
+        let half = node.size() * 0.5;
+        assert!(node.size().y > 100. && node.size().x > 100.);
+        assert!(
+            center.y - half.y >= -1. && center.y + half.y <= height as f32 + 1.,
+            "modal center {center:?} size {:?} outside {width}x{height}",
+            node.size()
+        );
+        let mut modal_bodies = app
+            .world_mut()
+            .query_filtered::<&ComputedNode, With<ModalBody>>();
+        assert!(modal_bodies.single(app.world()).unwrap().size().y > 0.);
+    }
+}
+
+/// Bevy 0.20 stores native windows in thread-local storage; flag-only Command must still reach editing.
+#[test]
+fn native_flag_only_modifiers_use_thread_local_windows_and_reset_on_focus_loss() {
+    let (mut app, window) = input_app();
+    let native = winit::window::WindowId::from(918_273);
+    bevy::winit::WINIT_WINDOWS.with(|windows| {
+        windows.borrow_mut().entity_to_winit.insert(window, native);
+    });
+    app.add_message::<bevy::winit::RawWinitWindowEvent>();
+    app.world_mut()
+        .write_message(bevy::winit::RawWinitWindowEvent {
+            window_id: native,
+            event: winit::event::WindowEvent::ModifiersChanged(
+                winit::keyboard::ModifiersState::SUPER.into(),
+            ),
+        });
+    app.update();
+    assert!(
+        app.world()
+            .resource::<ButtonInput<Key>>()
+            .pressed(Key::Super)
+    );
+    app.world_mut().get_mut::<Window>(window).unwrap().focused = false;
+    app.world_mut()
+        .write_message(bevy::winit::RawWinitWindowEvent {
+            window_id: native,
+            event: winit::event::WindowEvent::Focused(false),
+        });
+    key(
+        &mut app,
+        window,
+        Key::Character("a".into()),
+        KeyCode::KeyA,
+        Some("a"),
+    );
+    app.update();
+    app.world_mut().get_mut::<Window>(window).unwrap().focused = true;
+    app.update();
+    assert!(app.world().resource::<Model>().query.text.is_empty());
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<Key>>()
+            .pressed(Key::Super)
+    );
+    bevy::winit::WINIT_WINDOWS.with(|windows| {
+        windows.borrow_mut().entity_to_winit.remove(&window);
+    });
+}
+
+/// Text committed after Update must request another frame in the native low-power event loop.
+#[test]
+fn committed_engine_edit_requests_a_followup_render_without_pointer_motion() {
+    let (mut app, window) = input_app();
+    app.update();
+    app.world_mut()
+        .resource_mut::<Messages<bevy::window::RequestRedraw>>()
+        .clear();
+    key(
+        &mut app,
+        window,
+        Key::Character("filter".into()),
+        KeyCode::KeyF,
+        Some("filter"),
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().query.text, "filter");
+    assert!(
+        !app.world()
+            .resource::<Messages<bevy::window::RequestRedraw>>()
+            .is_empty()
+    );
+}
+
+/// Pointer presses must focus the padded input and drive Bevy selection/caret placement.
+#[test]
+fn engine_pointer_press_selects_text_and_places_caret_inside_padded_field() {
+    use bevy::picking::{
+        backend::HitData,
+        events::{Pointer, PointerPress},
+        pointer::{Location, PointerButton, PointerId},
+    };
+    use bevy::text::TextEdit;
+    let (mut app, window) = input_app();
+    app.add_plugins(bevy::input_focus::pointer_focus::PointerFocusPlugin);
+    enable_headless_layout(&mut app, 1160, 820);
+    let input = app.world().resource::<Model>().query.entity.unwrap();
+    app.world_mut()
+        .get_mut::<EditableText>(input)
+        .unwrap()
+        .queue_edit(TextEdit::Insert("hello".into()));
+    app.update();
+    app.update();
+    let node = app.world().get::<ComputedNode>(input).unwrap();
+    let transform = app.world().get::<UiGlobalTransform>(input).unwrap();
+    let position = transform
+        .affine()
+        .transform_point2(node.content_box().min + Vec2::splat(1.));
+    let camera = app.world().resource::<PanelCamera>().0;
+    let event = |count| PointerPress {
+        entity: input,
+        pointer: Pointer::new(
+            PointerId::Mouse,
+            Location {
+                target: bevy::camera::NormalizedRenderTarget::Window(
+                    WindowRef::Entity(window).normalize(Some(window)).unwrap(),
+                ),
+                position,
+            },
+        ),
+        button: PointerButton::Primary,
+        hit: HitData::new(camera, 0., None, None),
+        count,
+    };
+    app.world_mut().resource_mut::<InputFocus>().clear();
+    app.update();
+    app.world_mut().trigger(event(3));
+    app.update();
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(input));
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(input)
+            .unwrap()
+            .editor
+            .raw_selection()
+            .text_range(),
+        0..5
+    );
+    app.world_mut().trigger(event(1));
+    app.update();
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(input)
+            .unwrap()
+            .editor
+            .raw_selection()
+            .text_range(),
+        0..0
+    );
+    key(
+        &mut app,
+        window,
+        Key::Character("X".into()),
+        KeyCode::KeyX,
+        Some("X"),
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().query.text, "Xhello");
+}
+
+/// Read-only selectable labels consume text keys and leave playback shortcuts for unfocused input.
+#[test]
+fn readonly_engine_text_selection_suppresses_playback_and_remains_immutable() {
+    use bevy::text::{TextEdit, TextReadWriteMode};
+    let (mut app, window) = input_app();
+    app.world_mut().resource_mut::<Runtime>().destination = Destination::Local;
+    let label = app
+        .world_mut()
+        .spawn((
+            TextInput,
+            EditableText::new("Status text"),
+            TextCursorStyle::default(),
+            TextReadWriteMode::ReadOnly,
+            TabIndex(-1),
+        ))
+        .id();
+    app.world_mut()
+        .resource_mut::<InputFocus>()
+        .set(label, FocusCause::Pressed);
+    app.world_mut()
+        .get_mut::<EditableText>(label)
+        .unwrap()
+        .queue_edit(TextEdit::SelectAll);
+    app.update();
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(label)
+            .unwrap()
+            .editor
+            .raw_selection()
+            .text_range(),
+        0..11
+    );
+    key(&mut app, window, Key::Space, KeyCode::Space, Some(" "));
+    key(
+        &mut app,
+        window,
+        Key::Character("x".into()),
+        KeyCode::KeyX,
+        Some("x"),
+    );
+    app.update();
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(label)
+            .unwrap()
+            .value()
+            .to_string(),
+        "Status text"
+    );
+    assert!(app.world().resource::<Actions>().0.is_empty());
+    key(&mut app, window, Key::Escape, KeyCode::Escape, None);
+    app.update();
+    assert!(app.world().resource::<Actions>().0.is_empty());
+    assert!(app.world().resource::<InputFocus>().get().is_none());
+}
+
+/// Unchanged selectable modal labels retain their engine selection and retire when their context closes.
+#[test]
+fn production_readonly_modal_selection_survives_refresh_and_retires_on_close() {
+    use bevy::text::{TextEdit, TextReadWriteMode};
+    let (mut app, _) = input_app();
+    app.world_mut().resource_mut::<Model>().open(
+        Provider::Catalog(CatalogProvider::GitHttps),
+        &provider_context(),
+    );
+    app.update();
+    let label = app
+        .world_mut()
+        .query::<(Entity, &EditableText, &TextReadWriteMode)>()
+        .iter(app.world())
+        .find_map(|(entity, text, mode)| {
+            (*mode == TextReadWriteMode::ReadOnly && text.value() == "Git repository")
+                .then_some(entity)
+        })
+        .unwrap();
+    app.world_mut()
+        .resource_mut::<InputFocus>()
+        .set(label, FocusCause::Pressed);
+    app.world_mut()
+        .get_mut::<EditableText>(label)
+        .unwrap()
+        .queue_edit(TextEdit::SelectAll);
+    app.update();
+    app.world_mut()
+        .resource_mut::<crate::network_app::NetworkState>()
+        .status = "Network update while selecting label".into();
+    app.update();
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(label));
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(label)
+            .unwrap()
+            .editor
+            .raw_selection()
+            .text_range(),
+        0..14
+    );
+    app.world_mut().resource_mut::<Model>().close();
+    app.update();
+    assert!(app.world().get_entity(label).is_err());
+    assert_ne!(app.world().resource::<InputFocus>().get(), Some(label));
+}
+
+/// Selecting a real rendered title must stop the pointer before the enclosing Play button activates.
+#[test]
+fn production_card_title_selection_does_not_activate_card_play() {
+    use bevy::picking::{
+        backend::HitData,
+        events::{Pointer, PointerPress},
+        pointer::{Location, PointerButton, PointerId},
+    };
+    use bevy::text::TextReadWriteMode;
+    let (mut app, window) = input_app();
+    app.add_plugins(bevy::ui_widgets::ButtonPlugin);
+    enable_headless_layout(&mut app, 1160, 820);
+    let (identity, title) = {
+        let mut runtime = app.world_mut().resource_mut::<Runtime>();
+        runtime.destination = Destination::Local;
+        runtime.catalog = std::sync::Arc::new(
+            crate::catalog::load_local(&crate::app::resource_root().join("sample-packs/reactions"))
+                .unwrap(),
+        );
+        runtime.status = "Card input fixture".into();
+        (
+            runtime.catalog.clips[0].identity.clone(),
+            runtime.catalog.clips[0].metadata.title.clone(),
+        )
+    };
+    app.update();
+    app.update();
+    app.update();
+    let label = app
+        .world_mut()
+        .query::<(Entity, &EditableText, &TextReadWriteMode)>()
+        .iter(app.world())
+        .find_map(|(entity, text, mode)| {
+            (*mode == TextReadWriteMode::ReadOnly && text.value().to_string() == title)
+                .then_some(entity)
+        })
+        .unwrap();
+    let card = app
+        .world_mut()
+        .query::<(Entity, &UiAction)>()
+        .iter(app.world())
+        .find_map(|(entity, action)| {
+            matches!(action, UiAction::Runtime(Action::Play(id)) if id == &identity)
+                .then_some(entity)
+        })
+        .unwrap();
+    let camera = app.world().resource::<PanelCamera>().0;
+    let event = |entity| PointerPress {
+        entity,
+        pointer: Pointer::new(
+            PointerId::Mouse,
+            Location {
+                target: bevy::camera::NormalizedRenderTarget::Window(
+                    WindowRef::Entity(window).normalize(Some(window)).unwrap(),
+                ),
+                position: Vec2::ZERO,
+            },
+        ),
+        button: PointerButton::Primary,
+        hit: HitData::new(camera, 0., None, None),
+        count: 1,
+    };
+    assert!(app.world().get::<EditableText>(label).is_some());
+    assert!(
+        app.world()
+            .get::<bevy::text::TextReadWriteMode>(label)
+            .is_some()
+    );
+    assert!(app.world().get::<ComputedNode>(label).is_some());
+    assert!(
+        app.world()
+            .get::<bevy::ui::ComputedUiRenderTargetInfo>(label)
+            .is_some()
+    );
+    assert!(app.world().get::<UiGlobalTransform>(label).is_some());
+    assert!(
+        app.world().resource::<Actions>().0.is_empty(),
+        "Fixture already had actions"
+    );
+    assert!(
+        app.world().resource::<input::PendingActions>().0.is_empty(),
+        "Fixture already had queued actions"
+    );
+    app.world_mut().trigger(event(label));
+    app.update();
+    assert!(app.world().resource::<Actions>().0.is_empty());
+    // A card-background press still activates immediately and survives the pending refresh.
+    app.world_mut().trigger(event(card));
+    app.update();
+    assert!(
+        app.world()
+            .resource::<Actions>()
+            .0
+            .iter()
+            .any(|action| matches!(action, Action::Play(id) if id == &identity))
+    );
+}
+
+/// Another window's modifier transitions must not alter this panel's ordered editor state.
+#[test]
+fn secondary_window_modifier_does_not_change_primary_text_insertion() {
+    let (mut app, primary) = input_app();
+    let secondary = app.world_mut().spawn(Window::default()).id();
+    key(
+        &mut app,
+        primary,
+        Key::Character("gif".into()),
+        KeyCode::KeyG,
+        Some("gif"),
+    );
+    app.update();
+    key(
+        &mut app,
+        secondary,
+        Key::Control,
+        KeyCode::ControlLeft,
+        None,
+    );
+    key(
+        &mut app,
+        primary,
+        Key::Character("a".into()),
+        KeyCode::KeyA,
+        Some("a"),
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().query.text, "gifa");
+    key(
+        &mut app,
+        primary,
+        Key::Character("b".into()),
+        KeyCode::KeyB,
+        Some("b"),
+    );
+    app.update();
+    assert_eq!(app.world().resource::<Model>().query.text, "gifab");
+    assert!(app.world().resource::<Actions>().0.is_empty());
+}
+
+/// Both the final appended secret glyph and the final deletion must schedule a settling render.
+#[test]
+fn secret_append_and_backspace_update_revision_and_request_redraw() {
+    let (mut app, window) = input_app();
+    app.world_mut()
+        .resource_mut::<Model>()
+        .open(Provider::Host(HostProvider::Tailscale), &provider_context());
+    app.update();
+    let secret = app
+        .world()
+        .resource::<Model>()
+        .modal
+        .as_ref()
+        .unwrap()
+        .editors[1]
+        .entity
+        .unwrap();
+    app.world_mut()
+        .resource_mut::<InputFocus>()
+        .set(secret, FocusCause::Pressed);
+    app.update();
+    app.update();
+    app.world_mut()
+        .resource_mut::<Messages<bevy::window::RequestRedraw>>()
+        .clear();
+    let initial_revision = app.world().resource::<Model>().revision;
+    key(
+        &mut app,
+        window,
+        Key::Character("x".into()),
+        KeyCode::KeyX,
+        Some("x"),
+    );
+    app.update();
+    assert!(app.world().resource::<Model>().revision > initial_revision);
+    assert_eq!(app.world().get::<Text>(secret).unwrap().0, "•");
+    assert!(
+        !app.world()
+            .resource::<Messages<bevy::window::RequestRedraw>>()
+            .is_empty()
+    );
+    app.update();
+    app.world_mut()
+        .resource_mut::<Messages<bevy::window::RequestRedraw>>()
+        .clear();
+    let inserted_revision = app.world().resource::<Model>().revision;
+    key(&mut app, window, Key::Backspace, KeyCode::Backspace, None);
+    app.update();
+    assert!(app.world().resource::<Model>().revision > inserted_revision);
+    assert!(app.world().get::<Text>(secret).unwrap().0.is_empty());
+    assert!(
+        !app.world()
+            .resource::<Messages<bevy::window::RequestRedraw>>()
+            .is_empty()
+    );
+    assert!(app.world().get::<EditableText>(secret).is_none());
 }

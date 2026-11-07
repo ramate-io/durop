@@ -362,6 +362,8 @@ pub(crate) fn sync_overlay(
     playback: Option<Res<PlaybackOverlay>>,
     assets: Res<AssetServer>,
     mut settings: ResMut<WinitSettings>,
+    focus: Option<Res<bevy::input_focus::InputFocus>>,
+    editors: Query<&bevy::text::TextReadWriteMode, With<bevy::text::EditableText>>,
 ) {
     if state.target.is_none() {
         state.target = monitors
@@ -430,7 +432,20 @@ pub(crate) fn sync_overlay(
     let mode = if active {
         WinitSettings::continuous()
     } else {
-        idle_settings()
+        let mut mode = idle_settings();
+        if focus
+            .as_ref()
+            .and_then(|focus| focus.get())
+            .is_some_and(|entity| {
+                editors
+                    .get(entity)
+                    .is_ok_and(|mode| *mode == bevy::text::TextReadWriteMode::Editable)
+            })
+        {
+            // Keep the engine caret blinking without continuously rendering an idle app.
+            mode.focused_mode = UpdateMode::reactive_low_power(Duration::from_millis(250));
+        }
+        mode
     };
     if settings.focused_mode != mode.focused_mode || settings.unfocused_mode != mode.unfocused_mode
     {
