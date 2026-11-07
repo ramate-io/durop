@@ -1460,6 +1460,36 @@ mod tests {
         network.runtime.block_on(session.close());
     }
 
+    // Keep the fixture's application consumer alive while a socket actor produces
+    // updates. Bound each drain so snapshot traffic cannot hide the wait deadline.
+    fn pump_controller_updates(
+        network: &mut NetworkState,
+        host: &mut crate::host::Host,
+    ) -> (usize, usize) {
+        let mut accepted = 0;
+        let mut superseded = 0;
+        for _ in 0..32 {
+            let Ok(update) = network.updates.try_recv() else {
+                break;
+            };
+            match update {
+                Update::Remote(request) => network.admit_remote(request),
+                Update::Outcome(_, CommandOutcome::Accepted { .. }) => accepted += 1,
+                Update::Outcome(_, CommandOutcome::Rejected { reason }) => {
+                    assert_eq!(reason, Rejection::Superseded);
+                    superseded += 1;
+                }
+                _ => {}
+            }
+        }
+        network.accept_pending(host, "network-test");
+        let events = host.drain_events();
+        if !events.is_empty() {
+            network.publish_local(host.snapshot(), &events);
+        }
+        (accepted, superseded)
+    }
+
     #[test]
     fn controller_stop_supersedes_unsent_online_actions_without_replaying_them() {
         let catalog = Arc::new(
@@ -1516,36 +1546,50 @@ mod tests {
         let mut accepted = 0;
         let mut superseded = 0;
         while accepted != 2 || superseded != 1 {
-            while let Ok(update) = network.updates.try_recv() {
-                match update {
-                    Update::Remote(request) => network.admit_remote(request),
-                    Update::Outcome(_, CommandOutcome::Accepted { .. }) => accepted += 1,
-                    Update::Outcome(
-                        _,
-                        CommandOutcome::Rejected {
-                            reason: Rejection::Superseded,
-                        },
-                    ) => superseded += 1,
-                    _ => {}
-                }
-            }
-            network.accept_pending(&mut host, "network-test");
-            let events = host.drain_events();
-            network.publish_local(host.snapshot(), &events);
+            let (new_accepted, new_superseded) = pump_controller_updates(&mut network, &mut host);
+            accepted += new_accepted;
+            superseded += new_superseded;
+            assert!(
+                accepted <= 2 && superseded <= 1,
+                "unexpected extra command outcomes"
+            );
             assert!(
                 std::time::Instant::now() < deadline,
                 "controller actor did not complete priority requests"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        // Model the scheduling race from CI: a full application mailbox can park
+        // notify() outside the actor's select, so dropping the backend alone cannot
+        // complete teardown. Keep consuming until every producer has stopped.
+        while network.update_tx.try_send(Update::CatalogReady(1)).is_ok() {}
+        assert_eq!(network.update_tx.capacity(), 0);
         drop(backend);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !actor.is_finished() {
+            let (new_accepted, new_superseded) = pump_controller_updates(&mut network, &mut host);
+            accepted += new_accepted;
+            superseded += new_superseded;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "controller actor did not finish after backend closure"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The completion check makes this join nonblocking; no detached actor is
+        // left waiting for the fixture's stopped application consumer.
         network.runtime.block_on(actor).unwrap();
+        assert_eq!((accepted, superseded), (2, 1));
         assert_eq!(host.snapshot().instances.len(), 1);
         assert_eq!(
             host.snapshot().instances[0].state,
             crate::commands::InstanceState::Preparing
         );
-        network.runtime.block_on(session.close());
+        network.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), session.close())
+                .await
+                .expect("controller fixture listener did not close");
+        });
     }
 
     #[test]

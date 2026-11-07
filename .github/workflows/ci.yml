@@ -11,6 +11,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v17
@@ -21,7 +22,11 @@ jobs:
         run: nix develop --command cargo fmt --all -- --check
       - name: Type-check with locked dependencies
         run: nix develop --command cargo check --workspace --locked
+      - name: Compile Rust unit and integration test executables
+        timeout-minutes: 20
+        run: nix develop --command cargo test --workspace --locked --no-run
       - name: Run Rust unit and integration tests
+        timeout-minutes: 5
         run: nix develop --command cargo test --workspace --locked
       - name: Verify bundled reaction media hashes and provenance
         run: python3 sample-packs/reactions/pack_tool.py verify --metadata-only
