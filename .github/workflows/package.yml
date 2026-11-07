@@ -1,6 +1,13 @@
 name: macOS distribution checks
 on:
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing published release tag to build and attach assets to (blank for CI artifacts only)'
+        required: false
+        type: string
   pull_request:
     paths:
       - 'src/**'
@@ -20,7 +27,21 @@ jobs:
     name: Build, sign and validate app bundle (macOS 15 arm64; target 14+)
     runs-on: macos-15
     steps:
+      - name: Verify release exists and is published
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          draft=$(gh release view --repo "$GH_REPO" --json isDraft --jq '.isDraft' -- "$RELEASE_TAG")
+          if [[ "$draft" != false ]]; then
+            echo 'Release must be published before attaching packages.' >&2
+            exit 1
+          fi
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ (github.event.release.tag_name || inputs.release_tag) && format('refs/tags/{0}', github.event.release.tag_name || inputs.release_tag) || github.ref }}
       - name: Install pinned native Rust
         shell: bash
         run: |
@@ -35,15 +56,37 @@ jobs:
       - name: Test recursive Mach-O dependency validator
         run: python3 -m unittest discover -s packaging/macos -p 'test_*.py' -v
       - name: Build app and validate signature, dependencies and bundled resources
-        run: packaging/macos/package.sh --output dist/ci-${{ github.sha }}
+        run: packaging/macos/package.sh --output dist/ci-${{ github.run_id }}
       - name: Upload app archive, checksum and validation reports
         uses: actions/upload-artifact@v4
         with:
-          name: Durop-macos-arm64-${{ github.sha }}
+          name: Durop-macos-arm64-${{ github.run_id }}
           compression-level: 0
           if-no-files-found: error
           path: |
-            dist/ci-${{ github.sha }}/*.zip
-            dist/ci-${{ github.sha }}/*.sha256
-            dist/ci-${{ github.sha }}/BUILD-INFO.json
-            dist/ci-${{ github.sha }}/VALIDATION.json
+            dist/ci-${{ github.run_id }}/*.zip
+            dist/ci-${{ github.run_id }}/*.sha256
+            dist/ci-${{ github.run_id }}/BUILD-INFO.json
+            dist/ci-${{ github.run_id }}/VALIDATION.json
+
+  publish:
+    name: Attach validated package to release
+    needs: package
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Durop-macos-arm64-${{ github.run_id }}
+          path: dist/release
+      - name: Upload app archive, checksum and validation reports
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          gh release upload --repo "$GH_REPO" --clobber -- "$RELEASE_TAG" \
+            dist/release/*.zip dist/release/*.sha256 \
+            dist/release/BUILD-INFO.json dist/release/VALIDATION.json
