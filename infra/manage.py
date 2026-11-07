@@ -15,7 +15,7 @@ import sys
 REPO = Path(__file__).resolve().parent.parent
 PROJECT = REPO / 'infra/cdktn/tailscale'
 STACK = 'durop-network'
-COMMANDS = ('setup', 'synth', 'validate', 'import', 'plan', 'show', 'apply', 'status')
+COMMANDS = ('setup', 'synth', 'validate', 'import', 'plan', 'show', 'apply', 'status', 'ensure')
 
 
 def load_env(path: Path, *, required: bool = False) -> None:
@@ -68,6 +68,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--config', type=Path, default=PROJECT / 'network.config.json')
     parser.add_argument('--state-dir', type=Path, help='private persistent backend outside the checkout')
     parser.add_argument('--output', type=Path, default=PROJECT / 'cdktf.out')
+    parser.add_argument('--host', help='playback Mac Tailscale IP or prefix for hosts.durop-host')
+    parser.add_argument('--controller', action='append', help='repeatable email for group:durop-controllers')
+    parser.add_argument('--unauthorized', help='email that policy tests must deny on TCP 48732')
+    parser.add_argument('--replace-config', action='store_true',
+                        help='overwrite network.config.json when ensure merges the live ACL')
     args = parser.parse_args(argv)
     try:
         if not args.no_env:
@@ -75,11 +80,15 @@ def main(argv: list[str] | None = None) -> int:
                      required=args.env_file is not None)
         # The host's invitation token must never become provisioner authentication.
         os.environ.pop('TAILSCALE_API_KEY', None)
+        if args.command != 'ensure' and (args.host or args.controller or args.unauthorized or args.replace_config):
+            raise ValueError('host/controller flags are only valid with ensure')
         if args.command == 'setup':
             setup()
         elif Path(sys.prefix).resolve() != (PROJECT / '.venv').resolve():
             if os.environ.get('_DUROP_INFRA_RUNTIME'):
                 raise ValueError('locked runtime missing; run setup durop-network first')
+            if not (PROJECT / '.venv' / 'bin' / 'python').is_file():
+                setup()
             arguments = sys.argv[1:] if argv is None else argv
             return subprocess.run(['uv', 'run', '--project', str(PROJECT), '--locked', '--no-sync',
                                    'python', str(Path(__file__).resolve()), *arguments],
@@ -87,8 +96,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sys.path.insert(0, str(PROJECT))
             from main import execute
+            from policy import overlay_from_flags
             state = args.state_dir or Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'durop/tailscale'
-            execute(args.command, args.config, state, args.output)
+            if args.command == 'ensure':
+                execute(args.command, args.config, state, args.output,
+                        overlay=overlay_from_flags(args.host, args.controller, args.unauthorized,
+                                                   args.replace_config))
+            else:
+                execute(args.command, args.config, state, args.output)
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f'{args.command} failed: {error}', file=sys.stderr)
         return 1

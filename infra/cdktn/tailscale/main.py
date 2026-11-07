@@ -9,6 +9,7 @@ import shutil
 import subprocess
 
 from network import synthesize
+from policy import DuropOverlay, config_document, fetch_live_policy, merge_durop
 from settings import Settings
 
 ROOT = Path(__file__).resolve().parent
@@ -27,7 +28,7 @@ def tofu(stack_dir: Path, *args: str) -> None:
 
 def fingerprint(config: Path, state_dir: Path, stack_dir: Path) -> str:
     """Bind a saved plan to all authored, generated, locked and target inputs."""
-    paths = [ROOT / n for n in ('main.py', 'network.py', 'settings.py', 'pyproject.toml',
+    paths = [ROOT / n for n in ('main.py', 'network.py', 'settings.py', 'policy.py', 'pyproject.toml',
              'uv.lock', 'package.json', 'package-lock.json', 'cdktf.json', '.terraform.lock.hcl', '.python-version', '.node-version')]
     paths += sorted((ROOT / 'imports').rglob('*.py')) + sorted((ROOT / 'imports').rglob('*.tgz'))
     paths += sorted((ROOT / 'imports').glob('*.json'))
@@ -51,15 +52,18 @@ def operator_lock(state_dir: Path):
         yield
 
 
-def execute(command: str, config: Path, state_dir: Path, output: Path) -> None:
+def execute(command: str, config: Path, state_dir: Path, output: Path,
+            overlay: DuropOverlay | None = None) -> None:
     """Execute a single stack lifecycle step without replacing reviewed apply inputs."""
     state_dir, output, config = state_dir.expanduser().resolve(), output.resolve(), config.resolve()
     repo = ROOT.parents[2]
     if state_dir == repo or repo in state_dir.parents or state_dir == output or output in state_dir.parents:
         raise ValueError('state/plans must live outside the checkout and generated output')
-    if command not in {'synth', 'validate', 'import', 'plan', 'show', 'apply', 'status'}:
+    if command not in {'synth', 'validate', 'import', 'plan', 'show', 'apply', 'status', 'ensure'}:
         raise ValueError('unknown lifecycle command')
-    if command in {'import', 'plan', 'apply'}:
+    if overlay is not None and command != 'ensure':
+        raise ValueError('Durop overlay flags are only valid with ensure')
+    if command in {'import', 'plan', 'apply', 'ensure'}:
         for name in ('TAILSCALE_TAILNET', 'TAILSCALE_OAUTH_CLIENT_ID', 'TAILSCALE_OAUTH_CLIENT_SECRET'):
             if not os.environ.get(name, '').strip():
                 raise ValueError(f'{command} requires explicit {name}')
@@ -70,13 +74,15 @@ def execute(command: str, config: Path, state_dir: Path, output: Path) -> None:
     with operator_lock(state_dir):
         plan = state_dir / 'reviewed.tfplan'
         metadata = state_dir / 'reviewed.json'
-        if command in {'plan', 'import'}:
+        if command in {'plan', 'import', 'ensure'}:
             # Invalidate before config parsing/synthesis: failures also require fresh review.
             metadata.unlink(missing_ok=True)
             plan.unlink(missing_ok=True)
         # Missing plan is refused before synthesis or any OpenTofu subprocess.
         if command in {'apply', 'show'} and (not plan.is_file() or not metadata.is_file()):
             raise ValueError('no reviewed plan; run plan and review it first')
+        if command == 'ensure':
+            _write_ensured_config(config, state_dir, overlay)
         settings = Settings.load(config, state_dir)
         synthesize(settings, str(output))
         stack_dir = output / 'stacks' / STACK
@@ -88,21 +94,9 @@ def execute(command: str, config: Path, state_dir: Path, output: Path) -> None:
                 raise ValueError('stale or modified plan; create and review a new plan')
         tofu(stack_dir, 'init', '-input=false', '-lockfile=readonly')
         tofu(stack_dir, 'validate')
-        if command == 'import':
-            # Inspect backend ownership before importing; never re-import tracked resources.
-            state = state_dir / 'terraform.tfstate'
-            owned = set()
-            if state.is_file():
-                result = subprocess.run(['tofu', f'-chdir={stack_dir}', 'state', 'list'],
-                                        check=True, capture_output=True, text=True)
-                owned = set(result.stdout.splitlines())
-            resources = [('tailscale_acl.policy', 'acl')]
-            if settings.magic_dns is not None:
-                resources.append(('tailscale_dns_preferences.dns', 'dns_preferences'))
-            for address, resource_id in resources:
-                if address not in owned:
-                    tofu(stack_dir, 'import', '-input=false', address, resource_id)
-        elif command == 'status':
+        if command in {'import', 'ensure'}:
+            _import_unowned(stack_dir, state_dir, settings)
+        if command == 'status':
             print(f'Stack: {STACK}\nState: {state_dir / "terraform.tfstate"}')
             if (state_dir / 'terraform.tfstate').is_file():
                 tofu(stack_dir, 'state', 'list')
@@ -111,11 +105,44 @@ def execute(command: str, config: Path, state_dir: Path, output: Path) -> None:
             print(f'Saved plan: {"present; run show to verify" if metadata.is_file() and plan.is_file() else "none"}')
         elif command == 'show':
             tofu(stack_dir, 'show', str(plan))
-        elif command == 'plan':
+        elif command in {'plan', 'ensure'}:
             tofu(stack_dir, 'plan', '-input=false', f'-out={plan}')
             metadata.write_text(json.dumps({'fingerprint': current, 'plan_sha256': digest(plan)}, sort_keys=True) + '\n')
+            if command == 'ensure':
+                tofu(stack_dir, 'show', str(plan))
         elif command == 'apply':
             # Invalidate before apply: interrupted/failed applies also require a fresh review.
             metadata.unlink()
             tofu(stack_dir, 'apply', '-input=false', str(plan))
             plan.unlink()
+
+
+def _write_ensured_config(config: Path, state_dir: Path, overlay: DuropOverlay | None) -> None:
+    """Materialize complete desired state from the live ACL when merging, else require a file."""
+    if overlay is None:
+        if not config.is_file():
+            raise ValueError('ensure requires --host, --controller and --unauthorized, or an existing configuration')
+        return
+    live = fetch_live_policy()
+    (state_dir / 'fetched-acl.json').write_text(json.dumps(live, sort_keys=True, indent=2) + '\n')
+    desired = config_document(merge_durop(live, overlay))
+    Settings.parse(json.loads(desired), state_dir)
+    if config.is_file() and config.read_text() != desired and not overlay.replace_config:
+        raise ValueError('configuration exists and differs from the merged live ACL; pass --replace-config to overwrite')
+    config.write_text(desired)
+
+
+def _import_unowned(stack_dir: Path, state_dir: Path, settings: Settings) -> None:
+    """Inspect backend ownership before importing; never re-import tracked resources."""
+    state = state_dir / 'terraform.tfstate'
+    owned = set()
+    if state.is_file():
+        result = subprocess.run(['tofu', f'-chdir={stack_dir}', 'state', 'list'],
+                                check=True, capture_output=True, text=True)
+        owned = set(result.stdout.splitlines())
+    resources = [('tailscale_acl.policy', 'acl')]
+    if settings.magic_dns is not None:
+        resources.append(('tailscale_dns_preferences.dns', 'dns_preferences'))
+    for address, resource_id in resources:
+        if address not in owned:
+            tofu(stack_dir, 'import', '-input=false', address, resource_id)

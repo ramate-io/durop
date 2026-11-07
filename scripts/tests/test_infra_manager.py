@@ -72,6 +72,27 @@ class ManagerTests(unittest.TestCase):
                                 cwd=self.base, check=True, capture_output=True, text=True)
         self.assertIn('durop-network', result.stdout)
         self.assertIn('--no-env', result.stdout)
+        self.assertIn('ensure', result.stdout)
+        self.assertIn('--host', result.stdout)
+
+    def test_overlay_flags_only_valid_with_ensure(self):
+        self.assertEqual(manager.main(['synth', manager.STACK, '--no-env', '--host', '100.64.0.1']), 1)
+
+    def test_missing_venv_runs_setup_before_reexec(self):
+        project = self.base / 'tailscale'
+        project.mkdir()
+        runs = []
+
+        def fake_run(argv, **kwargs):
+            runs.append(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with patch.object(manager, 'PROJECT', project), patch.object(manager, 'setup') as setup, \
+                patch('subprocess.run', side_effect=fake_run), \
+                patch.object(sys, 'prefix', str(self.base / 'other-python')):
+            self.assertEqual(manager.main(['status', manager.STACK, '--no-env']), 0)
+        setup.assert_called_once()
+        self.assertEqual(runs[0][:3], ['uv', 'run', '--project'])
 
 
 if __name__ == '__main__':

@@ -37,7 +37,7 @@ The POC uses `ws://TAILSCALE_IP:48732/control`: confidentiality and peer-network
 authentication depend on Tailscale's encrypted network, while the independent
 session credential grants application access. A public listener is unsupported.
 Install and authorize Tailscale separately. Follow the [network runbook](../infra/cdktn/tailscale/README.md)
-for policy backup/import, reviewed deployment, installation/login, and the narrow
+for `ensure`/reviewed apply, installation/login, and the narrow
 controller-to-host port grant. Tailnet membership alone grants no durop access.
 Ending a durop session leaves Tailscale enrollment and policy intact.
 

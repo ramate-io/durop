@@ -7,38 +7,43 @@ covers complete-policy ownership, credentials, durable state and recovery.
 
 ## Administrator: prepare the existing tailnet
 
-1. Select your existing tailnet in the [Tailscale admin console](https://login.tailscale.com/admin).
-   Install and sign into the [Tailscale macOS app](https://tailscale.com/docs/install/mac)
-   on each Mac; approve devices when required. Keep laptops owned by their users;
-   guests can remain signed into their own tailnets.
-2. Ensure policy permits intended controllers to reach the playback Mac on TCP
-   **48732**, with authorized and unauthorized policy tests. For device-share
-   guests, include the sample's `autogroup:shared` → `durop-host` grant for
-   `tcp:48732`; a same-tailnet user group alone does not cover shared guests.
-   Existing broader grants still apply. If policy already allows this, skip provisioning.
-3. For policy changes, export and privately back up the **complete** current
-   policy first. Create `infra/cdktn/tailscale/network.config.json` containing
-   `{"policy": <complete ordinary JSON policy object>}`; preserve unrelated rules.
-   The example config is only for a dedicated test tailnet. Keep `magic_dns`
-   absent unless deliberately taking ownership of that preference.
-4. Copy `.env.example` to ignored `.env` at the checkout root. Set the administrator's
-   `TAILSCALE_OAUTH_CLIENT_ID`, `TAILSCALE_OAUTH_CLIENT_SECRET` and explicit
-   `TAILSCALE_TAILNET`. Keep these OAuth credentials on the administrator's machine.
+1. Create a dedicated OAuth trust credential in the
+   [Tailscale admin console](https://login.tailscale.com/admin) with `policy_file`,
+   `devices:posture_attributes` and `devices:core:read`. Copy `.env.example` to
+   ignored `.env` at the checkout root. Set `TAILSCALE_OAUTH_CLIENT_ID`,
+   `TAILSCALE_OAUTH_CLIENT_SECRET` and explicit `TAILSCALE_TAILNET`. Keep these
+   credentials on the administrator's machine.
+2. Install and sign into the [Tailscale macOS app](https://tailscale.com/docs/install/mac)
+   on each host and controller Mac; approve devices when required. Keep laptops
+   owned by their users; guests can remain signed into their own tailnets.
+3. If intended controllers cannot already reach the playback Mac on TCP **48732**,
+   let `manage.py ensure` pull the live ACL, merge Durop grants and save a reviewed
+   plan. Include `--controller` emails that should be admitted and `--unauthorized`
+   for the deny test. Device-share guests need the sample's `autogroup:shared` →
+   `durop-host` grant for `tcp:48732`; a same-tailnet user group alone does not
+   cover shared guests. Existing broader grants still apply. Skip this stack if
+   you do not want CDKTN to own policy and 48732 already works.
 
-From the checkout root:
+From the checkout root, with the playback Mac's Tailscale IPv4 from the app:
 
 ```sh
 nix develop .#infrastructure
-python infra/manage.py setup durop-network
-python infra/manage.py validate durop-network
-# First adoption only: records the existing policy and configured DNS in state.
-python infra/manage.py import durop-network
-python infra/manage.py plan durop-network
-python infra/manage.py show durop-network
-# After reviewing the complete policy diff, tests, tailnet and backend:
+python infra/manage.py ensure durop-network \
+  --host HOST_TAILSCALE_IP \
+  --controller you@example.com \
+  --unauthorized other@example.com
+# After reviewing the printed complete policy diff, tests, tailnet and backend:
 python infra/manage.py apply durop-network
 python infra/manage.py plan durop-network
 ```
+
+`ensure` installs the locked toolchain when needed, writes ignored
+`infra/cdktn/tailscale/network.config.json`, imports the singleton ACL and prints
+the saved plan. It preserves unrelated rules and refuses to overwrite a local
+config that differs; pass `--replace-config` to rebuild from the live ACL. The
+example config is only for a dedicated test tailnet. Keep `magic_dns` absent
+unless deliberately taking ownership of that preference. Repeat `ensure` without
+merge flags to re-plan from the saved file.
 
 The final plan should report no changes. State and saved plans use a private,
 persistent directory outside the checkout. Use the same `--state-dir` for every

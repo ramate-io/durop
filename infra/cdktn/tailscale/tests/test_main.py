@@ -44,6 +44,10 @@ class WrapperTests(unittest.TestCase):
         with patch('main.subprocess.run', side_effect=self.fake_run):
             main.execute(command, self.config, self.state, self.out)
 
+    def execute_overlay(self, overlay):
+        with patch('main.subprocess.run', side_effect=self.fake_run):
+            main.execute('ensure', self.config, self.state, self.out, overlay=overlay)
+
     def test_argument_vectors_and_durability(self):
         self.execute('plan')
         prefix = ['tofu', f'-chdir={self.out}/stacks/durop-network']
@@ -156,10 +160,56 @@ class WrapperTests(unittest.TestCase):
 
     def test_live_commands_require_oauth_provisioner(self):
         with patch.dict('os.environ', {'TAILSCALE_OAUTH_CLIENT_SECRET': ''}):
-            for command in ('import', 'plan', 'apply'):
+            for command in ('import', 'plan', 'apply', 'ensure'):
                 with self.assertRaisesRegex(ValueError, 'TAILSCALE_OAUTH_CLIENT_SECRET'):
                     self.execute(command)
         self.assertEqual(self.calls, [])
+
+    def test_ensure_merges_live_acl_then_imports_plans_and_shows(self):
+        overlay = main.DuropOverlay(host='100.64.1.1', controllers=('host@example.com',),
+                                    unauthorized='guest@example.com')
+        live = {'ssh': [{'action': 'check', 'src': ['autogroup:member'], 'dst': ['autogroup:self'],
+                         'users': ['autogroup:nonroot']}]}
+        self.config.unlink()
+        with patch('main.fetch_live_policy', return_value=live):
+            self.execute_overlay(overlay)
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data['policy']['hosts']['durop-host'], '100.64.1.1')
+        self.assertEqual(data['policy']['ssh'], live['ssh'])
+        self.assertNotIn('magic_dns', data)
+        self.assertEqual(json.loads((self.state / 'fetched-acl.json').read_text()), live)
+        prefix = ['tofu', f'-chdir={self.out}/stacks/durop-network']
+        self.assertEqual(self.calls[0], prefix + ['init', '-input=false', '-lockfile=readonly'])
+        self.assertEqual(self.calls[1], prefix + ['validate'])
+        imports = [call for call in self.calls if 'import' in call]
+        self.assertEqual([call[-2:] for call in imports], [['tailscale_acl.policy', 'acl']])
+        self.assertEqual(self.calls[-2], prefix + ['plan', '-input=false', f'-out={self.state}/reviewed.tfplan'])
+        self.assertEqual(self.calls[-1], prefix + ['show', str(self.state / 'reviewed.tfplan')])
+        self.assertTrue((self.state / 'reviewed.json').exists())
+
+    def test_ensure_without_overlay_uses_existing_config(self):
+        with patch('main.fetch_live_policy', side_effect=AssertionError('must not fetch')):
+            self.execute('ensure')
+        imports = [call for call in self.calls if 'import' in call]
+        self.assertEqual([call[-2:] for call in imports], [['tailscale_acl.policy', 'acl']])
+        self.assertEqual(self.calls[-1][-2:], ['show', str(self.state / 'reviewed.tfplan')])
+
+    def test_ensure_refuses_to_clobber_existing_config(self):
+        overlay = main.DuropOverlay(host='100.64.1.1', controllers=('host@example.com',),
+                                    unauthorized='guest@example.com')
+        original = self.config.read_text()
+        with patch('main.fetch_live_policy', return_value={}):
+            with self.assertRaisesRegex(ValueError, 'replace-config'):
+                self.execute_overlay(overlay)
+        self.assertEqual(self.config.read_text(), original)
+        self.assertEqual(self.calls, [])
+
+    def test_ensure_replace_config_overwrites_local_file(self):
+        overlay = main.DuropOverlay(host='100.64.1.1', controllers=('host@example.com',),
+                                    unauthorized='guest@example.com', replace_config=True)
+        with patch('main.fetch_live_policy', return_value={}):
+            self.execute_overlay(overlay)
+        self.assertEqual(json.loads(self.config.read_text())['policy']['hosts']['durop-host'], '100.64.1.1')
 
     def test_invalid_config_invalidates_previous_plan(self):
         self.execute('plan')

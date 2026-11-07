@@ -26,7 +26,8 @@ working directory. Commands require the explicit `durop-network` stack. `setup`
 syncs locked Python/npm dependencies and regenerates bindings; it may download
 dependencies, but performs no Tailscale operations. Other commands enter the
 locked uv runtime automatically unless already running in the project's virtual
-environment. Dependency installation is explicit; runtime commands use `--no-sync`.
+environment. If that environment is missing, they run `setup` first. Runtime
+re-entry uses `--no-sync`.
 
 | Command | Effect |
 | --- | --- |
@@ -38,8 +39,9 @@ environment. Dependency installation is explicit; runtime commands use `--no-syn
 | `show` | Verify fingerprints and display the exact saved plan. |
 | `apply` | Consume the saved review and apply only that plan. |
 | `status` | Show backend location, tracked addresses and saved-plan presence. |
+| `ensure` | Fetch the live ACL, merge Durop grants when flags are passed, import, plan and show. |
 
-`import`, `plan` and `apply` are live operator actions and require explicit OAuth
+`import`, `plan`, `apply` and `ensure` are live operator actions and require explicit OAuth
 credentials and tailnet. No test or shell entry runs them against Tailscale.
 `validate`, `show` and `status` initialize OpenTofu and may download the locked
 provider; status inspects local ownership, not live connectivity or policy drift.
@@ -61,17 +63,18 @@ qualification passed on both platforms; no live plan/apply was performed.
 
 ## Complete policy and optional DNS ownership
 
-Before import or deployment, export the complete current policy from the admin
-console's Access controls editor. Save the original HuJSON as a private backup
-outside Git and create an ordinary JSON copy with a reviewed HuJSON parser or
-export facility. Python's JSON parser cannot parse HuJSON comments.
-
-Create ignored `infra/cdktn/tailscale/network.config.json` containing
-`{"policy": <complete exported JSON object>}`. Preserve unrelated grants, ACLs,
-SSH rules, tests, tags and posture rules. Add reviewed Durop identities, host and
-TCP 48732 grants with authorized and unauthorized tests. The example configuration
-is suitable only for a dedicated test tailnet; replacing a real policy with it
-would remove unrelated access. Existing broad grants remain effective.
+`ensure` downloads the live ACL as ordinary JSON (`Accept: application/json`),
+writes a private `fetched-acl.json` next to state, merges Durop host/group/port
+grants and tests, and saves ignored `network.config.json`. Pass `--host`,
+`--controller` (repeatable) and `--unauthorized`. Synthesis still never fetches
+or merges; only this operator command talks to the ACL API before generating
+OpenTofu JSON. Unrelated grants, ACLs, SSH rules, tests, tags and posture rules
+are preserved. A conflicting `durop-host` address is refused. An existing local
+config that differs from the merge is refused unless `--replace-config` is set.
+The example configuration is suitable only for a dedicated test tailnet;
+replacing a real policy with it would remove unrelated access. Existing broad
+grants remain effective. Skip `ensure`/`apply` when you do not want CDKTN to own
+policy and TCP 48732 already works.
 
 The dedicated sample includes both a same-tailnet controller group and a narrow
 `autogroup:shared` → `durop-host` / `tcp:48732` grant. The latter covers users who
@@ -139,8 +142,9 @@ and reads, on one machine. Do not run raw OpenTofu concurrently. Multiple
 operators need a separately implemented shared locking backend and migration;
 do not copy/share this local backend between active operators.
 
-Before a live change, back up the complete exported policy and state, including
-OpenTofu `.backup` files. Then run the quickstart's import/plan/show/apply sequence.
+Before a live change, retain `fetched-acl.json`, the authored configuration and
+state, including OpenTofu `.backup` files. Then run the quickstart's
+ensure/apply sequence (or import/plan/show/apply on an existing file).
 Review the full diff, deletions, policy tests, resource addresses, target tailnet
 and backend path. A final plan after apply should show no changes; verify intended
 TCP 48732 access and rejection on real devices separately.
