@@ -133,13 +133,43 @@ their own asset provenance files. Do not silently add a non-system media/Git
 runtime: its recursive closure, redistribution notices and source obligations
 must be handled before distribution.
 
-The workflow `.github/workflows/package.yml` builds native macOS DMGs for pull
-requests, `main` pushes that touch the same paths, published GitHub releases and
-manual dispatch. CI uploads the DMG, checksum and build/validation records.
-Publishing a GitHub release attaches the DMG and checksum to that release.
-Developer ID signing and notarization still require a separate explicit operator
-action. The high-level development/native-build separation was reviewed from
-Maybraid's packaging README; no Maybraid source or documentation was copied.
+## Release packages
+
+The workflow `.github/workflows/package.yml` builds native macOS DMGs for
+relevant pull requests, `main` pushes that touch the same paths, manual dispatch
+and published GitHub releases, including prereleases. Publishing a release
+builds its tag, runs the existing signing and validation checks, and attaches
+the DMG, SHA-256 checksum, `BUILD-INFO.json` and `VALIDATION.json` to that
+release. The DMG name uses the published tag without a leading `v`, so
+`v0.1.0-playtest-001` becomes `Durop-0.1.0-playtest-001-macos-arm64.dmg`. All
+runs also retain these files as Actions artifacts. Only the separate release
+upload job has repository write permission; pull requests and manual runs with
+no release tag only produce CI artifacts.
+
+To recover an existing published release that has no packages, run **Package**
+from a branch containing this workflow, such as `main` after merging the
+change, and set the optional `release_tag` input to the exact existing tag. For
+example:
+
+```sh
+gh workflow run package.yml --repo ramate-io/durop --ref main \
+  -f release_tag=v0.0.1-alpha-001
+```
+
+The workflow rejects missing or draft releases before building and checks out
+`refs/tags/<release_tag>`, so recovery packages the release's source rather than
+the selected workflow branch. Re-running an upload replaces assets with matching
+names. Older releases are not rebuilt automatically when the workflow changes;
+use this recovery input for them. Tags used for future automatic release builds
+must contain the updated workflow. Info.plist keeps the numeric Cargo version;
+the DMG filename uses the release tag, and the build record identifies the exact
+source revision.
+
+This workflow attaches packages to an existing release; creating/publishing the
+release remains an operator action. Packages remain ad-hoc signed, without
+Developer ID signing or notarization. The high-level development/native-build
+separation and release-triggered asset publication were reviewed from Maybraid;
+no Maybraid source or documentation was copied.
 
 See [the session runbook](session-runbook.md) for local/host/controller operation
 and outstanding second-Mac acceptance.
