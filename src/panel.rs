@@ -1,6 +1,7 @@
 //! Native controller panel with bounded virtualization and Unicode/IME editing.
 
 pub(crate) mod configuration;
+mod input;
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -14,12 +15,19 @@ use crate::{
 use bevy::{
     camera::{RenderTarget, visibility::RenderLayers},
     input::{
-        ButtonState,
         keyboard::{Key, KeyboardInput},
         mouse::MouseWheel,
     },
+    input_focus::{
+        FocusCause, FocusedInput, InputFocus,
+        tab_navigation::{TabGroup, TabIndex, TabNavigationPlugin},
+    },
+    picking::hover::Hovered,
     prelude::*,
-    window::{Ime, PrimaryWindow, WindowRef},
+    text::{EditableText, EditableTextFilter, EditableTextSystems, TextCursorStyle},
+    ui::{InteractionDisabled, Pressed},
+    ui_widgets::{Activate, ActivateOnPress, Button, TextInput},
+    window::{PrimaryWindow, WindowRef},
 };
 use configuration::{
     CatalogProvider, ConfigurationContext, ConfigurationDraft, ConfigurationIntent, DisplayChoice,
@@ -42,77 +50,15 @@ enum Field {
     Configuration(usize),
 }
 
-/// Bounded Unicode editor with a byte-boundary cursor and separate IME preedit.
+/// Draft mirror whose live Bevy input survives surrounding view refreshes.
 #[derive(Default, Clone)]
 struct Editor {
-    /// Committed UTF-8 content.
+    /// Committed content only; IME preedit belongs to the engine editor.
     text: String,
-    /// Byte index guaranteed to lie on a character boundary.
-    cursor: usize,
-    /// IME composition displayed but not yet committed.
-    preedit: String,
-    /// Whether insertion/deletion replaces the full committed value.
-    select_all: bool,
-}
-
-impl Editor {
-    /// Replace a selection or insert printable text while preserving the character limit.
-    fn insert(&mut self, value: &str) {
-        if self.select_all {
-            self.text.clear();
-            self.cursor = 0;
-            self.select_all = false;
-        }
-        let value: String = value
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(4096usize.saturating_sub(self.text.chars().count()))
-            .collect();
-        self.text.insert_str(self.cursor, &value);
-        self.cursor += value.len();
-    }
-
-    /// Delete the selection or the preceding complete Unicode scalar.
-    fn backspace(&mut self) {
-        if self.select_all {
-            self.text.clear();
-            self.cursor = 0;
-            self.select_all = false;
-            return;
-        }
-        if let Some((i, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.text.drain(i..self.cursor);
-            self.cursor = i;
-        }
-    }
-
-    /// Move the cursor to the preceding UTF-8 character boundary.
-    fn left(&mut self) {
-        self.cursor = self.text[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map_or(0, |(i, _)| i);
-        self.select_all = false;
-    }
-
-    /// Move the cursor to the next UTF-8 character boundary.
-    fn right(&mut self) {
-        self.cursor = self.text[self.cursor..]
-            .chars()
-            .next()
-            .map_or(self.cursor, |c| self.cursor + c.len_utf8());
-        self.select_all = false;
-    }
-
-    /// Compose display text with the cursor and uncommitted IME preedit.
-    fn label(&self) -> String {
-        format!(
-            "{}|{}{}",
-            &self.text[..self.cursor],
-            self.preedit,
-            &self.text[self.cursor..]
-        )
-    }
+    /// Persistent input entity, retired when this draft is replaced or closed.
+    entity: Option<Entity>,
+    /// Masked secret fields support replacement without exposing plaintext widgets.
+    selected: bool,
 }
 
 /// Panel-only editing, pagination and render invalidation state.
@@ -146,10 +92,6 @@ struct Model {
     drag_offset: f32,
     /// Last persisted benign state, avoiding unchanged disk writes.
     saved_preferences: Option<crate::preferences::Preferences>,
-    /// Modifier state reconstructed from ordered keyboard events.
-    modifiers: u8,
-    /// Native modifier flags used when physical key messages are absent.
-    raw_modifiers: u8,
 }
 
 /// Attach a semantic action to a rendered button.
@@ -157,8 +99,6 @@ struct Model {
 enum UiAction {
     /// Queue an application lifecycle/playback intent.
     Runtime(Action),
-    /// Move text focus to one editor.
-    Focus(Field),
     /// Open or close a provider menu.
     Dropdown(Dropdown),
     /// Open a new isolated configuration draft.
@@ -373,11 +313,22 @@ impl Default for GridLayout {
 }
 
 impl GridLayout {
+    /// Reserve complete toolbar rows before estimating the first collection viewport.
+    fn toolbar_height(width: f32) -> f32 {
+        if width < 534. {
+            228.
+        } else if width < 840. {
+            148.
+        } else {
+            68.
+        }
+    }
+
     /// Fit large previews while allowing one-column compact windows and six-column wide windows.
     fn for_window(width: f32, height: f32) -> Self {
         let available = (width - 78.).max(180.);
         let columns = ((available + 20.) / 250.).floor().clamp(1., 6.) as usize;
-        let toolbar_extra = if width < 820. { 80. } else { 0. };
+        let toolbar_extra = Self::toolbar_height(width) - 68.;
         let viewport = (height - 296. - toolbar_extra).max(134.);
         let card_height = viewport.min(282.);
         let rows = ((viewport + 20.) / (card_height + 20.))
@@ -427,7 +378,6 @@ impl Model {
                 UiAction::Apply
                     | UiAction::Cancel
                     | UiAction::Cycle(_)
-                    | UiAction::Focus(Field::Configuration(_))
                     | UiAction::Network(_)
                     | UiAction::EnableListener
                     | UiAction::AddController
@@ -488,13 +438,13 @@ impl Model {
 
     /// Begin a new provider draft without changing playback or network ownership.
     fn open(&mut self, provider: Provider, context: &ConfigurationContext) {
+        self.revision = self.revision.wrapping_add(1);
         let draft = ConfigurationDraft::new(provider, context);
         let editors = draft
             .fields
             .iter()
             .map(|field| Editor {
                 text: field.value.clone(),
-                cursor: field.value.len(),
                 ..default()
             })
             .collect();
@@ -511,6 +461,7 @@ impl Model {
 
     /// Discard modal state and transient menus; no provider intent is emitted.
     fn close(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         if let Some(Modal {
             draft: ModalDraft::Configuration(draft),
             ..
@@ -524,6 +475,7 @@ impl Model {
 
     /// Open live source controls with fresh, ephemeral name and API-key editors.
     fn open_sources(&mut self, listen_address: &str) {
+        self.revision = self.revision.wrapping_add(1);
         self.modal = Some(Modal {
             draft: ModalDraft::Sources(SourcesDraft::default()),
             editors: vec![
@@ -531,7 +483,6 @@ impl Model {
                 Editor::default(),
                 Editor {
                     text: listen_address.to_owned(),
-                    cursor: listen_address.len(),
                     ..default()
                 },
             ],
@@ -550,13 +501,12 @@ impl Model {
             && modal
                 .editors
                 .get(2)
-                .is_some_and(|editor| editor.text.is_empty())
+                .is_some_and(|editor| editor.text.is_empty() && editor.entity.is_none())
         {
             let endpoint = network.listener_endpoint();
             if !endpoint.is_empty() {
                 modal.editors[2] = Editor {
                     text: endpoint.to_owned(),
-                    cursor: endpoint.len(),
                     ..default()
                 };
             }
@@ -653,50 +603,6 @@ impl Model {
         }
     }
 
-    /// Trim pasted credentials while leaving ordinary user-entered field values exact.
-    #[cfg(target_os = "macos")]
-    fn is_secret(&self, field: Field) -> bool {
-        match field {
-            Field::Search => false,
-            Field::Configuration(index) => {
-                self.modal.as_ref().is_some_and(|modal| match &modal.draft {
-                    ModalDraft::Configuration(draft) => {
-                        draft.fields.get(index).is_some_and(|field| field.secret)
-                    }
-                    ModalDraft::Sources(_) => index == 1,
-                })
-            }
-        }
-    }
-
-    /// Cycle keyboard focus through editable modal fields without leaking input to the catalog.
-    fn focus_next(&mut self) {
-        let Some(modal) = &self.modal else {
-            return;
-        };
-        let fields: Vec<_> = match &modal.draft {
-            ModalDraft::Configuration(draft) => draft
-                .fields
-                .iter()
-                .enumerate()
-                .filter(|(_, field)| !field.read_only && field.choices.is_empty())
-                .map(|(index, _)| index)
-                .collect(),
-            ModalDraft::Sources(_) => modal.source_fields(),
-        };
-        if fields.is_empty() {
-            return;
-        }
-        let next = match self.focus {
-            Some(Field::Configuration(index)) => fields
-                .iter()
-                .position(|candidate| *candidate == index)
-                .map_or(0, |current| (current + 1) % fields.len()),
-            _ => 0,
-        };
-        self.focus = Some(Field::Configuration(fields[next]));
-    }
-
     /// Exact content extent includes the inter-row gaps, with no trailing gap.
     fn content_height(&self) -> f32 {
         let rows = self.matches.div_ceil(self.layout.columns);
@@ -754,7 +660,7 @@ fn scrollbar(
     mut model: ResMut<Model>,
     tracks: Query<
         (
-            &Interaction,
+            Has<Pressed>,
             &bevy::ui::RelativeCursorPosition,
             &ComputedNode,
         ),
@@ -777,7 +683,7 @@ fn scrollbar(
         }
         let pointer = (position.y + 0.5) * track_height;
         let (top, height) = model.thumb_geometry(track_height);
-        if *interaction == Interaction::Pressed && !model.dragging {
+        if interaction && !model.dragging {
             model.dragging = true;
             model.drag_offset = if (top..=top + height).contains(&pointer) {
                 pointer - top
@@ -813,15 +719,16 @@ fn scroll_thumb(
 }
 
 /// Apply subtle feedback to interactive paper surfaces without triggering layout churn.
-fn hover(
-    mut widgets: Query<(&Interaction, &HoverColors, &mut BackgroundColor), Changed<Interaction>>,
-) {
-    for (interaction, colors, mut background) in &mut widgets {
-        background.0 = if *interaction == Interaction::None {
-            colors.resting
-        } else {
+fn hover(mut widgets: Query<(&Hovered, Has<Pressed>, &HoverColors, &mut BackgroundColor)>) {
+    for (hovered, pressed, colors, mut background) in &mut widgets {
+        let color = if hovered.get() || pressed {
             colors.hovered
+        } else {
+            colors.resting
         };
+        if background.0 != color {
+            background.0 = color;
+        }
     }
 }
 
@@ -879,23 +786,37 @@ struct PanelCamera(Entity);
 pub struct PanelPlugin;
 impl Plugin for PanelPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Model>()
+        app.add_plugins(TabNavigationPlugin)
+            .add_observer(input::activate)
+            .add_observer(input::keyboard)
+            .init_resource::<input::PendingActions>()
+            .init_resource::<input::OrderedKeyboard>()
+            .init_resource::<Model>()
             .init_resource::<Icons>()
             .init_resource::<Fonts>()
             .add_systems(Startup, setup)
             .add_systems(
+                PreUpdate,
+                input::dispatch_keyboard
+                    .after(bevy::input::InputSystems)
+                    .before(bevy::input_focus::InputFocusSystems::Dispatch),
+            )
+            .add_systems(
                 Update,
-                (
-                    buttons,
-                    text_input,
-                    scroll,
-                    scrollbar,
-                    scroll_thumb,
-                    hover,
-                    terminal,
-                )
+                (scroll, scrollbar, scroll_thumb, hover, terminal)
                     .chain()
                     .before(crate::app::actions),
+            )
+            .add_systems(
+                PostUpdate,
+                (
+                    input::synchronize,
+                    buttons,
+                    input::focus_style,
+                    input::request_redraw,
+                )
+                    .chain()
+                    .after(EditableTextSystems),
             )
             .add_systems(
                 Update,
@@ -932,7 +853,6 @@ fn setup(
     commands.insert_resource(PanelCamera(camera));
     let preferences = crate::preferences::Preferences::load();
     model.query.text = preferences.query;
-    model.query.cursor = model.query.text.len();
     if let Some(index) = runtime.display {
         controls.0.push(crate::overlay::Control::Display(index));
     }
@@ -1015,21 +935,15 @@ impl Model {
 /// Dispatch one pointer press; rebuilding widgets must not repeat a held click.
 fn buttons(
     mut model: ResMut<Model>,
-    buttons: Query<(&Interaction, &UiAction), Changed<Interaction>>,
+    mut pending: ResMut<input::PendingActions>,
+    mut focus: ResMut<InputFocus>,
     mut actions: ResMut<Actions>,
     mut network: ResMut<crate::network_app::NetworkState>,
     runtime: Res<Runtime>,
     monitors: Query<(Entity, &bevy::window::Monitor)>,
-    mouse: Option<Res<ButtonInput<MouseButton>>>,
 ) {
-    if mouse
-        .as_ref()
-        .is_some_and(|mouse| !mouse.just_pressed(MouseButton::Left))
-    {
-        return;
-    }
-    for (interaction, action) in &buttons {
-        if *interaction != Interaction::Pressed || !model.allows(action) {
+    for action in &std::mem::take(&mut pending.0) {
+        if !model.allows(action) {
             continue;
         }
         model.revision = model.revision.wrapping_add(1);
@@ -1038,10 +952,6 @@ fn buttons(
                 model.focus = None;
                 model.dropdown = None;
                 actions.0.push_back(action.clone());
-            }
-            UiAction::Focus(field) => {
-                model.focus = Some(*field);
-                model.dropdown = None;
             }
             UiAction::Dropdown(Dropdown::From) => {
                 if network.listen_address.is_empty() && network.discovered_listener.is_none() {
@@ -1080,7 +990,6 @@ fn buttons(
                         editor.text = field.choices[(selected + 1) % field.choices.len()]
                             .value
                             .clone();
-                        editor.cursor = editor.text.len();
                     }
                 }
             }
@@ -1269,205 +1178,12 @@ fn buttons(
                     .push_back(crate::network_app::NetworkAction::Disconnect);
             }
         }
-    }
-}
-
-/// Retain raw-window modifier ordering alongside translated key events.
-enum OrderedInput {
-    /// Native command/control flags at this point in the event sequence.
-    Modifiers(u8),
-    /// Keyboard message paired with the flags active at its position.
-    Keyboard(KeyboardInput),
-}
-
-/// Merge keyboard events with raw modifier changes in their original event order.
-fn ordered_keyboard(
-    events: impl IntoIterator<Item = OrderedInput>,
-    modifiers: &mut u8,
-) -> Vec<(KeyboardInput, bool)> {
-    let mut keys = Vec::new();
-    for event in events {
-        match event {
-            OrderedInput::Modifiers(value) => *modifiers = value,
-            OrderedInput::Keyboard(key) => keys.push((key, *modifiers != 0)),
-        }
-    }
-    keys
-}
-
-/// Route keyboard, clipboard and IME input to the focused editor before shortcuts.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The editor combines ordered raw modifier flags, Bevy IME and window state"
-)]
-fn text_input(
-    mut keys: MessageReader<KeyboardInput>,
-    mut ime: MessageReader<Ime>,
-    primary: Single<(Entity, &mut Window), With<PrimaryWindow>>,
-    mut model: ResMut<Model>,
-    runtime: Res<Runtime>,
-    mut actions: ResMut<Actions>,
-    _main: bevy::ecs::system::NonSendMarker,
-    mut raw: MessageReader<bevy::winit::RawWinitWindowEvent>,
-    native: Option<NonSend<bevy::winit::WinitWindows>>,
-) {
-    let (entity, mut window) = primary.into_inner();
-    window.ime_enabled = model.focus.is_some();
-    if !window.focused {
-        model.modifiers = 0;
-        model.raw_modifiers = 0;
-        keys.clear();
-        ime.clear();
-        raw.clear();
-        return;
-    }
-    let mut committed = false;
-    for event in ime.read() {
-        model.revision = model.revision.wrapping_add(1);
-        let Some(field) = model.focus else {
-            continue;
-        };
-        let Some(edit) = model.editor(field) else {
-            continue;
-        };
-        match event {
-            Ime::Preedit { window, value, .. } if *window == entity => edit.preedit = value.clone(),
-            Ime::Commit { window, value } if *window == entity => {
-                edit.preedit.clear();
-                edit.insert(value);
-                committed = true;
-                if field == Field::Search {
-                    model.scroll = 0.;
-                }
-            }
-            Ime::Disabled { window } if *window == entity => edit.preedit.clear(),
-            _ => (),
-        }
-    }
-    let native_id = native
-        .as_ref()
-        .and_then(|windows| windows.entity_to_winit.get(&entity))
-        .copied();
-    let mut raw_steps = Vec::new();
-    for event in raw.read() {
-        if Some(event.window_id) != native_id {
-            continue;
-        }
-        match &event.event {
-            winit::event::WindowEvent::ModifiersChanged(modifiers) => {
-                let flags = modifiers.state();
-                raw_steps.push(OrderedInput::Modifiers(
-                    u8::from(flags.super_key()) | u8::from(flags.control_key()) << 2,
-                ));
-            }
-            winit::event::WindowEvent::KeyboardInput { event, .. } => {
-                raw_steps.push(OrderedInput::Keyboard(
-                    bevy::winit::converters::convert_keyboard_input(event, entity),
-                ))
-            }
-            winit::event::WindowEvent::Focused(false) => raw_steps.push(OrderedInput::Modifiers(0)),
-            _ => (),
-        }
-    }
-    let ordered = ordered_keyboard(raw_steps, &mut model.raw_modifiers);
-    let input: Vec<_> = if ordered.is_empty() {
-        keys.read().cloned().map(|key| (key, None)).collect()
-    } else {
-        keys.clear();
-        ordered
-            .into_iter()
-            .map(|(key, modified)| (key, Some(modified)))
-            .collect()
-    };
-    for (key, raw_modified) in input {
-        if key.window != entity {
-            continue;
-        }
-        let modifier = match key.key_code {
-            KeyCode::SuperLeft => 1,
-            KeyCode::SuperRight => 2,
-            KeyCode::ControlLeft => 4,
-            KeyCode::ControlRight => 8,
-            _ => 0,
-        };
-        if modifier != 0 {
-            if key.state == ButtonState::Pressed {
-                model.modifiers |= modifier;
-            } else {
-                model.modifiers &= !modifier;
-            }
-        }
-        if key.state != ButtonState::Pressed {
-            continue;
-        }
-        model.revision = model.revision.wrapping_add(1);
-        if key.logical_key == Key::Escape && (model.modal.is_some() || model.dropdown.is_some()) {
-            model.close();
-            continue;
-        }
-        if key.logical_key == Key::Tab && model.modal.is_some() {
-            model.focus_next();
-            continue;
-        }
         if let Some(field) = model.focus {
-            // Preserve modifier ordering even if key-down and key-up arrive in
-            // one update, when ButtonInput already contains the final state.
-            let modified = raw_modified.unwrap_or(model.modifiers != 0);
-            #[cfg(target_os = "macos")]
-            let secret = model.is_secret(field);
-            let Some(edit) = model.editor(field) else {
-                continue;
-            };
-            if key.logical_key == Key::Escape {
-                edit.preedit.clear();
-                model.focus = None;
-                continue;
+            if let Some(entity) = model.editor(field).and_then(|editor| editor.entity) {
+                focus.set(entity, FocusCause::Pressed);
             }
-            if !edit.preedit.is_empty() {
-                continue;
-            }
-            match key.logical_key {
-                Key::Backspace => edit.backspace(),
-                Key::ArrowLeft => edit.left(),
-                Key::ArrowRight => edit.right(),
-                Key::Home => edit.cursor = 0,
-                Key::End => edit.cursor = edit.text.len(),
-                Key::Enter => {
-                    model.focus = None;
-                }
-                _ if modified && key.key_code == KeyCode::KeyA => edit.select_all = true,
-                #[cfg(target_os = "macos")]
-                _ if modified && key.key_code == KeyCode::KeyV => {
-                    if let Some(text) = crate::app_macos::paste_text() {
-                        edit.insert(if secret { text.trim() } else { &text });
-                    }
-                }
-                _ if !modified && !committed => {
-                    if let Some(text) = &key.text {
-                        edit.insert(text);
-                    }
-                }
-                _ => (),
-            }
-            if field == Field::Search {
-                model.scroll = 0.;
-            }
-        } else if !key.repeat && !raw_modified.unwrap_or(model.modifiers != 0) {
-            match key.logical_key {
-                Key::Escape => actions.0.push_back(Action::StopAll),
-                Key::Space
-                    if runtime.destination == Destination::Local
-                        && model.modal.is_none()
-                        && model.dropdown.is_none() =>
-                {
-                    if let Some(index) = model.visible(&runtime.catalog.clips).first() {
-                        actions.0.push_back(Action::Play(
-                            runtime.catalog.clips[*index].identity.clone(),
-                        ));
-                    }
-                }
-                _ => (),
-            }
+        } else {
+            focus.clear();
         }
     }
 }
