@@ -14,6 +14,7 @@ From `nix develop`:
 
 ```sh
 cd infra/cdktn/tailscale
+node check_node_runtime.cjs
 uv sync --locked
 uv run --locked --no-sync python main.py setup --no-env
 python -m unittest discover -s ../../../scripts/tests -v
@@ -45,10 +46,15 @@ credentials and tailnet. No test or shell entry runs them against Tailscale.
 provider; status inspects local ownership, not live connectivity or policy drift.
 The CLI has no destroy command.
 
-The committed `flake.lock` pins Python 3.12.13, Node 24.15.0, uv 0.11.16 and
-OpenTofu 1.11.8. Both Nix shells also include the open-source Tailscale CLI.
+The committed `flake.lock` pins Python 3.12.13, Node 22.23.4, uv 0.11.16 and
+OpenTofu 1.11.8. Node alone uses the separately locked `nixpkgs-node` input;
+the other tools retain their existing snapshot. The shell also includes the
+open-source Tailscale CLI.
 `uv.lock` pins CDK Terrain 0.25.0 and constructs 10.6.0; `package-lock.json`
-pins `cdktn-cli` 0.25.0. The official provider is `tailscale/tailscale` 0.29.2,
+pins `cdktn-cli` 0.25.0. Node 22 is a [supported JSII LTS runtime](https://aws.github.io/jsii/user-guides/lib-user/#common-runtime)
+and avoids the [Nix-built Node 24 / Darwin LLVM 21 descriptor-tracking defect](https://github.com/NixOS/nixpkgs/issues/536039).
+The worker smoke check exercises synchronous file I/O and worker teardown before
+loading JSII. The official provider is `tailscale/tailscale` 0.29.2,
 with signed checksums for Linux x86_64 and Apple Silicon. No archived CDKTF
 package is used; `cdktf.json` is Terrain's required filename. Regeneration uses
 `TERRAFORM_BINARY_NAME=tofu`; review and commit changes to `imports/`, provider
