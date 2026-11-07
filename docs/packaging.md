@@ -36,7 +36,7 @@ still runs the locked build and mandatory bundle/resource checks.
 
 If a native rustup launcher was installed through Homebrew, select its actual
 official toolchain executable with
-`--cargo "$(rustup which --toolchain 1.95.0 cargo)"`. The packaging CI does this
+`--cargo "$(rustup which --toolchain 1.97.1 cargo)"`. The packaging CI does this
 explicitly; the launcher/installer's location must not be mistaken for the
 compiler/Cargo used to build the distributable.
 

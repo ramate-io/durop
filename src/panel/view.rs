@@ -2,7 +2,12 @@
 
 use super::theme::*;
 use super::*;
+use bevy::input_focus::tab_navigation::TabIndex;
+use bevy::picking::Pickable;
+use bevy::picking::hover::Hovered;
+use bevy::text::EditableText;
 use bevy::ui::{FocusPolicy, RelativeCursorPosition};
+use bevy::ui_widgets::{Button, ScrollArea, TextInput};
 
 /// Construct small reusable paper controls without coupling styling to provider policy.
 struct View<'a> {
@@ -30,6 +35,20 @@ impl View<'_> {
         ));
     }
 
+    /// Separate stacked form sections without implying a new modal or exclusive mode.
+    fn rule(&self, parent: &mut ChildSpawnerCommands) {
+        parent.spawn((
+            Node {
+                width: percent(100),
+                height: px(1),
+                margin: UiRect::vertical(px(8)),
+                flex_shrink: 0.,
+                ..default()
+            },
+            BackgroundColor(RULE),
+        ));
+    }
+
     /// Add a button with a comfortable hit target and bounded hover feedback.
     fn button(
         &self,
@@ -46,6 +65,7 @@ impl View<'_> {
         parent
             .spawn((
                 Button,
+                Hovered::default(),
                 action,
                 Node {
                     min_height: px(38),
@@ -64,6 +84,57 @@ impl View<'_> {
                 },
             ))
             .with_children(|button| self.label(button, label, 12., foreground));
+    }
+
+    /// Native selectable field; secrets stay on the custom masked editor.
+    fn text_field(
+        &self,
+        parent: &mut ChildSpawnerCommands,
+        text: &str,
+        marker: impl Bundle,
+        selected: bool,
+        min_height: f32,
+        size: f32,
+    ) {
+        parent
+            .spawn((
+                Node {
+                    width: percent(100),
+                    min_height: px(min_height),
+                    padding: UiRect::axes(px(14), px(13)),
+                    border: UiRect::all(px(1)),
+                    border_radius: BorderRadius::all(px(5)),
+                    overflow: Overflow::clip(),
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(BACKGROUND),
+                BorderColor::all(if selected { PURPLE } else { RULE }),
+                Hovered::default(),
+                HoverColors {
+                    resting: BACKGROUND,
+                    hovered: PAPER,
+                },
+            ))
+            .with_children(|row| {
+                row.spawn((
+                    Node {
+                        width: percent(100),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    TextInput,
+                    EditableText {
+                        allow_newlines: false,
+                        max_characters: Some(4096),
+                        ..EditableText::new(text)
+                    },
+                    self.fonts.mono(size),
+                    TextColor(INK),
+                    TabIndex(0),
+                    marker,
+                ));
+            });
     }
 
     /// Render a provider selector with its popup anchored directly below the control.
@@ -87,6 +158,7 @@ impl View<'_> {
                 container
                     .spawn((
                         Button,
+                        Hovered::default(),
                         UiAction::Dropdown(menu),
                         Node {
                             width: percent(100),
@@ -155,7 +227,7 @@ impl View<'_> {
                                         Provider::Host(HostProvider::Native),
                                     ),
                                     (
-                                        "Remote host · IP + pairing token",
+                                        "Remote host · IP and pairing token",
                                         Provider::Host(HostProvider::Tailscale),
                                     ),
                                 ],
@@ -200,6 +272,7 @@ impl View<'_> {
         parent
             .spawn((
                 Button,
+                Hovered::default(),
                 UiAction::Runtime(Action::Play(clip.identity.clone())),
                 Node {
                     width: px(layout.card_width),
@@ -285,6 +358,7 @@ impl View<'_> {
                     if let Some(instance) = stop {
                         row.spawn((
                             Button,
+                            Hovered::default(),
                             UiAction::Runtime(Action::Stop(instance.to_owned())),
                             Node {
                                 padding: UiRect::axes(px(6), px(1)),
@@ -361,6 +435,8 @@ impl View<'_> {
                     if field.read_only {
                         row.spawn((node, BackgroundColor(BACKGROUND), BorderColor::all(RULE)))
                             .with_children(|input| self.label(input, value, 12., MUTED));
+                    } else if field.choices.is_empty() && !field.secret {
+                        self.text_field(row, &editor.text, FormField(index), selected, 48., 12.);
                     } else {
                         let action = if field.choices.is_empty() {
                             UiAction::Focus(Field::Configuration(index))
@@ -369,6 +445,7 @@ impl View<'_> {
                         };
                         row.spawn((
                             Button,
+                            Hovered::default(),
                             action,
                             node,
                             BackgroundColor(BACKGROUND),
@@ -404,6 +481,10 @@ impl View<'_> {
     }
 
     /// Render a source editor using the same keyboard, IME and masked-input behavior as providers.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Source editors share layout while secrets stay on the masked custom field"
+    )]
     fn source_editor(
         &self,
         parent: &mut ChildSpawnerCommands,
@@ -412,26 +493,28 @@ impl View<'_> {
         index: usize,
         label: &str,
         secret: bool,
+        occupied: bool,
     ) {
         self.label(parent, label, 11., MUTED);
         let editor = &modal.editors[index];
         let selected = focus == Some(Field::Configuration(index));
-        let value = if secret {
-            if editor.text.is_empty() {
-                "Enter API key…".into()
+        if !secret {
+            self.text_field(parent, &editor.text, FormField(index), selected, 48., 12.);
+            return;
+        }
+        let value = if editor.text.is_empty() {
+            if occupied {
+                "••••••••".into()
             } else {
-                "•".repeat(editor.text.chars().count())
+                "Enter API key…".into()
             }
-        } else if selected {
-            editor.label()
-        } else if editor.text.is_empty() {
-            "Enter a value…".into()
         } else {
-            editor.text.clone()
+            "•".repeat(editor.text.chars().count())
         };
         parent
             .spawn((
                 Button,
+                Hovered::default(),
                 UiAction::Focus(Field::Configuration(index)),
                 Node {
                     width: percent(100),
@@ -497,7 +580,7 @@ impl View<'_> {
             self.button(
                 dialog,
                 if source.invitation_url.is_some() {
-                    "Copy invitation link + pairing details"
+                    "Copy invitation link and pairing details"
                 } else {
                     "Copy Durop pairing details"
                 },
@@ -632,6 +715,7 @@ impl View<'_> {
         match sources.details {
             SourceDetails::None => (),
             SourceDetails::Listener => {
+                self.rule(dialog);
                 self.label(
                     dialog,
                     "LISTENER · SHARED BY TAILSCALE SOURCES",
@@ -644,6 +728,7 @@ impl View<'_> {
                     focus,
                     2,
                     "This Mac's Tailscale IP:port",
+                    false,
                     false,
                 );
                 self.label(dialog, network.listener_hint(), 10., MUTED);
@@ -685,6 +770,7 @@ impl View<'_> {
                 );
             }
             SourceDetails::Credentials => {
+                self.rule(dialog);
                 self.label(
                     dialog,
                     "INVITATION CREDENTIALS · SHARED BY TAILSCALE SOURCES",
@@ -701,8 +787,16 @@ impl View<'_> {
                         MUTED
                     },
                 );
-                self.source_editor(dialog, modal, focus, 1, "Host Tailscale API key", true);
-                self.label(dialog, "Use TAILSCALE_API_KEY or save a key in this Mac's secure store. Keys are never included in pairing details.", 10., MUTED);
+                self.source_editor(
+                    dialog,
+                    modal,
+                    focus,
+                    1,
+                    "Host Tailscale API key",
+                    true,
+                    network.admin_secret_available,
+                );
+                self.label(dialog, "Use TAILSCALE_API_KEY or save a key in this Mac's secure store. A present key is shown as a mask; typing replaces it. Keys are never included in pairing details.", 10., MUTED);
                 dialog
                     .spawn(Node {
                         column_gap: px(8),
@@ -742,6 +836,7 @@ impl View<'_> {
             return;
         };
         self.source_selector(dialog, sources, network);
+        self.rule(dialog);
         match &sources.selection {
             SourceSelection::Local => {
                 self.label(dialog, "LOCAL CONTROLS", 10., PURPLE);
@@ -761,6 +856,7 @@ impl View<'_> {
             SourceSelection::Remote(id) => {
                 if let Some(source) = network.controllers.iter().find(|source| &source.id == id) {
                     self.controller_source(dialog, source, network);
+                    self.rule(dialog);
                     self.source_details(dialog, modal, focus, sources, network);
                 }
             }
@@ -774,7 +870,7 @@ impl View<'_> {
                 );
                 self.button(
                     dialog,
-                    "Tailscale controller…",
+                    "Configure new Tailscale controller…",
                     UiAction::SelectSource(SourceSelection::NewRemote),
                     false,
                 );
@@ -785,7 +881,7 @@ impl View<'_> {
                 if let Some(pending) = &sources.pending {
                     self.label(dialog, format!("Adding {}…", pending.name), 12., MUTED);
                 } else {
-                    self.source_editor(dialog, modal, focus, 0, "Controller name", false);
+                    self.source_editor(dialog, modal, focus, 0, "Controller name", false, false);
                     self.label(dialog, "Add creates an individual Durop pairing token. It leaves your other sources enabled.", 10., MUTED);
                     self.button(dialog, "Add controller", UiAction::AddController, true);
                 }
@@ -851,8 +947,6 @@ impl View<'_> {
             ),
         };
         root.spawn((
-            Button,
-            UiAction::Cancel,
             Node {
                 position_type: PositionType::Absolute,
                 left: px(0),
@@ -861,20 +955,36 @@ impl View<'_> {
                 height: percent(100),
                 align_items: AlignItems::Center,
                 justify_content: JustifyContent::Center,
-                padding: UiRect::all(px(24)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.102, 0.102, 0.102, 0.48)),
             GlobalZIndex(100),
             FocusPolicy::Block,
+            Pickable::IGNORE,
         ))
-        .with_children(|backdrop| {
-            backdrop
+        .with_children(|overlay| {
+            // Sibling of the dialog so child presses do not bubble into Cancel.
+            overlay.spawn((
+                Button,
+                Hovered::default(),
+                UiAction::Cancel,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0),
+                    top: px(0),
+                    width: percent(100),
+                    height: percent(100),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.102, 0.102, 0.102, 0.48)),
+                FocusPolicy::Block,
+            ));
+            overlay
                 .spawn((
                     Node {
                         width: px(650),
                         max_width: percent(100),
                         max_height: percent(100),
+                        margin: UiRect::all(px(24)),
                         padding: UiRect::all(px(32)),
                         border: UiRect::all(px(1)),
                         border_radius: BorderRadius::all(px(10)),
@@ -885,6 +995,8 @@ impl View<'_> {
                     BackgroundColor(PAPER),
                     BorderColor::all(RULE),
                     FocusPolicy::Block,
+                    ZIndex(1),
+                    Pickable::default(),
                 ))
                 .with_children(|dialog| {
                     dialog
@@ -905,9 +1017,12 @@ impl View<'_> {
                     dialog
                         .spawn((
                             ModalBody,
+                            ScrollArea,
                             ScrollPosition(Vec2::new(0., modal.scroll)),
                             Node {
                                 width: percent(100),
+                                flex_grow: 1.,
+                                flex_basis: px(0.),
                                 min_height: px(0),
                                 overflow: Overflow::scroll_y(),
                                 ..default()
@@ -1045,30 +1160,23 @@ pub(super) fn render(
         .ceil()
         .max(1.) as usize;
     model.scroll = model.scroll.clamp(0., model.max_scroll());
-    let signature = format!(
-        "{}|{:?}|{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+    let chrome_signature = format!(
+        "{}|{:?}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}",
         model.revision,
-        model.focus,
         model.dropdown,
-        model.first_row(),
         snapshot.sequence,
         runtime.status,
         runtime.catalog.revision,
-        model.matches,
         runtime.destination,
         runtime.enabled,
         network.status,
         network.connected,
-        network.remote_icons.len(),
         primary.width(),
         primary.height(),
-        model.query.label(),
-        network.hosting,
-        model.layout.rows,
-        model.viewport_height()
+        network.hosting
     );
-    let signature = format!(
-        "{signature}|{}|{}|{}|{}|{:?}",
+    let chrome_signature = format!(
+        "{chrome_signature}|{}|{}|{}|{}|{:?}",
         network.local_enabled,
         network.listen_address,
         network.admin_status,
@@ -1086,13 +1194,47 @@ pub(super) fn render(
             ))
             .collect::<Vec<_>>()
     );
-    if signature == model.signature {
+    let collection_signature = format!(
+        "{}|{}|{}|{}|{}|{}",
+        model.query.text,
+        model.matches,
+        model.first_row(),
+        network.remote_icons.len(),
+        runtime.loading,
+        snapshot.catalog_revision
+    );
+    let chrome_changed = chrome_signature != model.signature;
+    let collection_changed = collection_signature != model.collection_signature;
+    if !chrome_changed && !collection_changed {
         return;
     }
-    model.signature = signature;
+    model.signature = chrome_signature;
+    model.collection_signature = collection_signature;
+    if !chrome_changed {
+        if let Some(pane) = model.collection_pane {
+            commands.entity(pane).despawn_related::<Children>();
+            let view = View { fonts: &fonts };
+            commands.entity(pane).with_children(|collection| {
+                fill_collection(
+                    collection,
+                    &view,
+                    &model,
+                    clips,
+                    remote,
+                    snapshot,
+                    &runtime,
+                    &network,
+                    &mut icons,
+                    &mut images,
+                );
+            });
+        }
+        return;
+    }
     if let Some(root) = model.root.take() {
         commands.entity(root).despawn();
     }
+    model.collection_pane = None;
     let root = commands
         .spawn((
             Node {
@@ -1139,10 +1281,21 @@ pub(super) fn render(
                 view.selector(
                     header,
                     "FROM",
-                    &Model::source_summary(network.local_enabled, network.controllers.iter().filter(|source| source.enabled).count()),
+                    &Model::source_summary(
+                        network.local_enabled,
+                        network
+                            .controllers
+                            .iter()
+                            .filter(|source| source.enabled)
+                            .count(),
+                    ),
                     Dropdown::From,
                     false,
-                    if compact { provider_width.max(230.) } else { 230. },
+                    if compact {
+                        provider_width.max(230.)
+                    } else {
+                        230.
+                    },
                 );
                 view.selector(
                     header,
@@ -1172,8 +1325,6 @@ pub(super) fn render(
                 );
                 header
                     .spawn((
-                        Button,
-                        UiAction::Focus(Field::Search),
                         Node {
                             flex_grow: 1.,
                             width: if compact { percent(100) } else { auto() },
@@ -1194,6 +1345,7 @@ pub(super) fn render(
                         } else {
                             RULE
                         }),
+                        Hovered::default(),
                         HoverColors {
                             resting: PAPER,
                             hovered: BACKGROUND,
@@ -1201,239 +1353,58 @@ pub(super) fn render(
                     ))
                     .with_children(|search| {
                         view.label(search, "SEARCH", 10., MUTED);
-                        view.label(
-                            search,
-                            if model.focus == Some(Field::Search) {
-                                model.query.label()
-                            } else if model.query.text.is_empty() {
-                                "Find a reaction…".into()
-                            } else {
-                                model.query.text.clone()
+                        search.spawn((
+                            Node {
+                                width: percent(100),
+                                overflow: Overflow::clip(),
+                                ..default()
                             },
-                            13.,
-                            if model.query.text.is_empty() {
+                            TextInput,
+                            EditableText {
+                                allow_newlines: false,
+                                max_characters: Some(4096),
+                                ..EditableText::new(&model.query.text)
+                            },
+                            fonts.mono(13.),
+                            TextColor(if model.query.text.is_empty() {
                                 MUTED
                             } else {
                                 INK
-                            },
-                        );
-                    });
-            });
-        parent
-            .spawn(Node {
-                width: percent(100),
-                height: px(24),
-                min_height: px(24),
-                margin: UiRect::top(px(4)),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                ..default()
-            })
-            .with_children(|section| {
-                view.label(
-                    section,
-                    if remote {
-                        "REMOTE COLLECTION"
-                    } else {
-                        "YOUR COLLECTION"
-                    },
-                    10.,
-                    PURPLE,
-                );
-                view.label(section, format!("{} REACTIONS", model.matches), 10., MUTED);
-            });
-        parent
-            .spawn(Node {
-                width: percent(100),
-                flex_grow: 1.,
-                min_height: px(0),
-                column_gap: px(14),
-                overflow: Overflow::clip(),
-                ..default()
-            })
-            .with_children(|collection| {
-                collection
-                    .spawn((
-                        CatalogBody,
-                        ScrollPosition(Vec2::new(0., model.scroll)),
-                        Node {
-                            flex_grow: 1.,
-                            min_width: px(0),
-                            min_height: px(0),
-                            flex_direction: FlexDirection::Column,
-                            overflow: Overflow::scroll_y(),
-                            ..default()
-                        },
-                    ))
-                    .with_children(|viewport| {
-                        // The full extent keeps native bounds stable while only nearby rows exist.
-                        viewport
-                            .spawn(Node {
-                                width: percent(100),
-                                height: px(model.content_height().max(model.viewport_height())),
-                                min_height: px(model.content_height().max(model.viewport_height())),
-                                flex_shrink: 0.,
-                                flex_direction: FlexDirection::Column,
-                                ..default()
-                            })
-                            .with_children(|grid| {
-                                let visible = model.visible(clips);
-                                if visible.is_empty() {
-                                    grid.spawn(Node {
-                                        width: percent(100),
-                                        flex_grow: 1.,
-                                        flex_direction: FlexDirection::Column,
-                                        align_items: AlignItems::Center,
-                                        justify_content: JustifyContent::Center,
-                                        row_gap: px(14),
-                                        ..default()
-                                    })
-                                    .with_children(|empty| {
-                                        empty.spawn((
-                                            Text::new(if runtime.loading {
-                                                "Gathering your collection…"
-                                            } else if remote && !network.connected {
-                                                "Connect your host"
-                                            } else {
-                                                "Nothing here, yet."
-                                            }),
-                                            fonts.display(28.),
-                                            TextColor(INK),
-                                        ));
-                                        view.label(
-                                            empty,
-                                            if remote && !network.connected {
-                                                "Choose To → Remote host to enter its IP and Durop pairing token."
-                                            } else {
-                                                "Try another search or choose a catalog above."
-                                            },
-                                            12.,
-                                            MUTED,
-                                        );
-                                    });
-                                }
-                                for (row_index, indices) in
-                                    visible.chunks(model.layout.columns).enumerate()
-                                {
-                                    grid.spawn(Node {
-                                        position_type: PositionType::Absolute,
-                                        top: px((model.first_row() + row_index) as f32
-                                            * model.row_stride()),
-                                        width: percent(100),
-                                        height: px(model.layout.card_height),
-                                        column_gap: px(20),
-                                        min_height: px(model.layout.card_height),
-                                        ..default()
-                                    })
-                                    .with_children(|row| {
-                                        for index in indices {
-                                            let clip = &clips[*index];
-                                            let key = format!(
-                                                "{}:{}:{}:{}",
-                                                remote,
-                                                snapshot.catalog_revision,
-                                                clip.identity,
-                                                remote
-                                                    && network
-                                                        .remote_icons
-                                                        .contains_key(&clip.identity)
-                                            );
-                                            if !icons.0.contains_key(&key) {
-                                                let bytes = if remote {
-                                                    network
-                                                        .remote_icons
-                                                        .get(&clip.identity)
-                                                        .cloned()
-                                                } else {
-                                                    Icons::read_icon(&clip.icon_path).ok()
-                                                };
-                                                let handle = bytes
-                                                    .and_then(|bytes| {
-                                                        Icons::icon_image(&bytes).ok()
-                                                    })
-                                                    .map(|image| images.add(image));
-                                                if icons.0.len() >= 128 {
-                                                    let old =
-                                                        icons.0.keys().next().cloned().unwrap();
-                                                    if let Some(Some(handle)) = icons.0.remove(&old)
-                                                    {
-                                                        images.remove(handle.id());
-                                                    }
-                                                }
-                                                icons.0.insert(key.clone(), handle);
-                                            }
-                                            let image = icons.0.get(&key).cloned().flatten();
-                                            let dimensions = image
-                                                .as_ref()
-                                                .and_then(|handle| images.get(handle))
-                                                .map(|image| {
-                                                    Vec2::new(
-                                                        image.width() as f32,
-                                                        image.height() as f32,
-                                                    )
-                                                });
-                                            let active =
-                                                snapshot.instances.iter().rev().find(|instance| {
-                                                    instance.clip_id == clip.identity
-                                                        && !instance.state.is_terminal()
-                                                });
-                                            let status =
-                                                if runtime.errors.contains_key(&clip.identity) {
-                                                    "ERROR"
-                                                } else {
-                                                    "PLAY →"
-                                                };
-                                            view.card(
-                                                row,
-                                                clip,
-                                                image,
-                                                dimensions,
-                                                model.layout,
-                                                status,
-                                                active
-                                                    .map(|instance| instance.instance_id.as_str()),
-                                            );
-                                        }
-                                    });
-                                }
-                            });
-                    });
-                collection
-                    .spawn((
-                        Button,
-                        Scrollbar,
-                        RelativeCursorPosition::default(),
-                        Node {
-                            width: px(8),
-                            min_width: px(8),
-                            height: percent(100),
-                            border_radius: BorderRadius::all(px(4)),
-                            ..default()
-                        },
-                        BackgroundColor(YELLOW.with_alpha(0.22)),
-                        FocusPolicy::Block,
-                    ))
-                    .with_children(|track| {
-                        let (top, height) = model.thumb_geometry(model.viewport_height());
-                        track.spawn((
-                            ScrollThumb,
-                            Node {
-                                position_type: PositionType::Absolute,
-                                top: px(top),
-                                width: percent(100),
-                                height: px(height),
-                                border_radius: BorderRadius::all(px(4)),
-                                ..default()
-                            },
-                            BackgroundColor(if model.max_scroll() == 0. {
-                                RULE
-                            } else {
-                                PURPLE
                             }),
-                            FocusPolicy::Pass,
+                            TabIndex(0),
+                            SearchField,
                         ));
                     });
             });
+        model.collection_pane = Some(
+            parent
+                .spawn((
+                    CollectionPane,
+                    Node {
+                        width: percent(100),
+                        flex_grow: 1.,
+                        flex_basis: px(0.),
+                        min_height: px(0.),
+                        flex_direction: FlexDirection::Column,
+                        ..default()
+                    },
+                ))
+                .with_children(|pane| {
+                    fill_collection(
+                        pane,
+                        &view,
+                        &model,
+                        clips,
+                        remote,
+                        snapshot,
+                        &runtime,
+                        &network,
+                        &mut icons,
+                        &mut images,
+                    );
+                })
+                .id(),
+        );
         parent
             .spawn(Node {
                 min_height: px(40),
@@ -1489,5 +1460,219 @@ pub(super) fn render(
         if let Some(modal) = &model.modal {
             view.modal(parent, modal, model.focus, &network, &runtime);
         }
+    });
+}
+
+/// Rebuild visible catalog rows without destroying header search TextInput widgets.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Collection contents read independent catalog, icon and layout caches"
+)]
+fn fill_collection(
+    pane: &mut ChildSpawnerCommands,
+    view: &View,
+    model: &Model,
+    clips: &[Clip],
+    remote: bool,
+    snapshot: &crate::commands::HostSnapshot,
+    runtime: &Runtime,
+    network: &crate::network_app::NetworkState,
+    icons: &mut Icons,
+    images: &mut Assets<Image>,
+) {
+    pane.spawn(Node {
+        width: percent(100),
+        height: px(24),
+        min_height: px(24),
+        margin: UiRect::top(px(4)),
+        justify_content: JustifyContent::SpaceBetween,
+        align_items: AlignItems::Center,
+        ..default()
+    })
+    .with_children(|section| {
+        view.label(
+            section,
+            if remote {
+                "REMOTE COLLECTION"
+            } else {
+                "YOUR COLLECTION"
+            },
+            10.,
+            PURPLE,
+        );
+        view.label(section, format!("{} REACTIONS", model.matches), 10., MUTED);
+    });
+    pane.spawn(Node {
+        width: percent(100),
+        flex_grow: 1.,
+        flex_basis: px(0.),
+        min_height: px(0),
+        column_gap: px(14),
+        overflow: Overflow::clip(),
+        ..default()
+    })
+    .with_children(|collection| {
+        collection
+            .spawn((
+                CatalogBody,
+                ScrollArea,
+                ScrollPosition(Vec2::new(0., model.scroll)),
+                Node {
+                    flex_grow: 1.,
+                    flex_basis: px(0.),
+                    min_width: px(0),
+                    min_height: px(0),
+                    flex_direction: FlexDirection::Column,
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                },
+            ))
+            .with_children(|viewport| {
+                viewport
+                    .spawn(Node {
+                        width: percent(100),
+                        height: px(model.content_height().max(model.viewport_height())),
+                        min_height: px(model.content_height().max(model.viewport_height())),
+                        flex_shrink: 0.,
+                        flex_direction: FlexDirection::Column,
+                        ..default()
+                    })
+                    .with_children(|grid| {
+                        let visible = model.visible(clips);
+                        if visible.is_empty() {
+                            grid.spawn(Node {
+                                width: percent(100),
+                                flex_grow: 1.,
+                                flex_direction: FlexDirection::Column,
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                row_gap: px(14),
+                                ..default()
+                            })
+                            .with_children(|empty| {
+                                empty.spawn((
+                                    Text::new(if runtime.loading {
+                                        "Gathering your collection…"
+                                    } else if remote && !network.connected {
+                                        "Connect your host"
+                                    } else {
+                                        "Nothing here, yet."
+                                    }),
+                                    view.fonts.display(28.),
+                                    TextColor(INK),
+                                ));
+                                view.label(
+                                    empty,
+                                    if remote && !network.connected {
+                                        "Choose To → Remote host to enter its IP and Durop pairing token."
+                                    } else {
+                                        "Try another search or choose a catalog above."
+                                    },
+                                    12.,
+                                    MUTED,
+                                );
+                            });
+                        }
+                        for (row_index, indices) in
+                            visible.chunks(model.layout.columns).enumerate()
+                        {
+                            grid.spawn(Node {
+                                position_type: PositionType::Absolute,
+                                top: px((model.first_row() + row_index) as f32 * model.row_stride()),
+                                width: percent(100),
+                                height: px(model.layout.card_height),
+                                column_gap: px(20),
+                                min_height: px(model.layout.card_height),
+                                ..default()
+                            })
+                            .with_children(|row| {
+                                for index in indices {
+                                    let clip = &clips[*index];
+                                    let key = format!(
+                                        "{}:{}:{}:{}",
+                                        remote,
+                                        snapshot.catalog_revision,
+                                        clip.identity,
+                                        remote && network.remote_icons.contains_key(&clip.identity)
+                                    );
+                                    if !icons.0.contains_key(&key) {
+                                        let bytes = if remote {
+                                            network.remote_icons.get(&clip.identity).cloned()
+                                        } else {
+                                            Icons::read_icon(&clip.icon_path).ok()
+                                        };
+                                        let handle = bytes
+                                            .and_then(|bytes| Icons::icon_image(&bytes).ok())
+                                            .map(|image| images.add(image));
+                                        if icons.0.len() >= 128 {
+                                            let old = icons.0.keys().next().cloned().unwrap();
+                                            if let Some(Some(handle)) = icons.0.remove(&old) {
+                                                images.remove(handle.id());
+                                            }
+                                        }
+                                        icons.0.insert(key.clone(), handle);
+                                    }
+                                    let image = icons.0.get(&key).cloned().flatten();
+                                    let dimensions = image
+                                        .as_ref()
+                                        .and_then(|handle| images.get(handle))
+                                        .map(|image| {
+                                            Vec2::new(image.width() as f32, image.height() as f32)
+                                        });
+                                    let active = snapshot.instances.iter().rev().find(|instance| {
+                                        instance.clip_id == clip.identity
+                                            && !instance.state.is_terminal()
+                                    });
+                                    let status = if runtime.errors.contains_key(&clip.identity) {
+                                        "ERROR"
+                                    } else {
+                                        "PLAY →"
+                                    };
+                                    view.card(
+                                        row,
+                                        clip,
+                                        image,
+                                        dimensions,
+                                        model.layout,
+                                        status,
+                                        active.map(|instance| instance.instance_id.as_str()),
+                                    );
+                                }
+                            });
+                        }
+                    });
+            });
+        collection
+            .spawn((
+                Button,
+                Hovered::default(),
+                Scrollbar,
+                RelativeCursorPosition::default(),
+                Node {
+                    width: px(8),
+                    min_width: px(8),
+                    height: percent(100),
+                    border_radius: BorderRadius::all(px(4)),
+                    ..default()
+                },
+                BackgroundColor(YELLOW.with_alpha(0.22)),
+                FocusPolicy::Block,
+            ))
+            .with_children(|track| {
+                let (top, height) = model.thumb_geometry(model.viewport_height());
+                track.spawn((
+                    ScrollThumb,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        top: px(top),
+                        width: percent(100),
+                        height: px(height),
+                        border_radius: BorderRadius::all(px(4)),
+                        ..default()
+                    },
+                    BackgroundColor(if model.max_scroll() == 0. { RULE } else { PURPLE }),
+                    FocusPolicy::Pass,
+                ));
+            });
     });
 }

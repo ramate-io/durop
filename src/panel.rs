@@ -18,7 +18,12 @@ use bevy::{
         keyboard::{Key, KeyboardInput},
         mouse::MouseWheel,
     },
+    input_focus::InputFocus,
+    picking::{events::PointerPress, hover::Hovered, pointer::PointerButton},
     prelude::*,
+    text::EditableText,
+    ui::Pressed,
+    ui_widgets::TextInput,
     window::{Ime, PrimaryWindow, WindowRef},
 };
 use configuration::{
@@ -126,10 +131,14 @@ struct Model {
     scroll: f32,
     /// Measured logical height of the collection viewport; zero until its first layout.
     viewport_height: f32,
-    /// Last render-state fingerprint used to avoid unnecessary tree rebuilds.
+    /// Last chrome fingerprint used to avoid unnecessary full tree rebuilds.
     signature: String,
+    /// Last collection fingerprint; search widgets survive collection-only rebuilds.
+    collection_signature: String,
     /// Current panel widget subtree.
     root: Option<Entity>,
+    /// Collection pane retained when only search results change.
+    collection_pane: Option<Entity>,
     /// Open provider selector; closed before a configuration dialog appears.
     dropdown: Option<Dropdown>,
     /// Pending provider settings; applying is the only path to side effects.
@@ -409,6 +418,21 @@ struct Scrollbar;
 #[derive(Component)]
 struct ModalBody;
 
+/// Mark the search TextInput so collection rebuilds can leave it in place.
+#[derive(Component)]
+struct SearchField;
+
+/// Mark a non-secret form TextInput by its editor index.
+#[derive(Component)]
+struct FormField(usize);
+
+/// Collection viewport rebuilt independently of header search widgets.
+///
+/// `flex_basis: 0` and no overflow clip keep the pane shrinkable so CatalogBody
+/// receives a bounded height and wheel scrolling can move virtualized rows.
+#[derive(Component)]
+struct CollectionPane;
+
 /// Reusable hover colors avoid rebuilding the tree while the pointer moves.
 #[derive(Component)]
 struct HoverColors {
@@ -599,14 +623,16 @@ impl Model {
 
     /// Summarize enabled sources without implying they are mutually exclusive or connected.
     fn source_summary(local_enabled: bool, remote_count: usize) -> String {
-        let controllers = format!(
-            "{remote_count} controller{}",
-            if remote_count == 1 { "" } else { "s" }
-        );
-        if local_enabled {
-            format!("Local + {controllers}")
-        } else {
-            controllers
+        let controllers = match remote_count {
+            0 => None,
+            1 => Some("1 controller".into()),
+            count => Some(format!("{count} controllers")),
+        };
+        match (local_enabled, controllers) {
+            (true, Some(controllers)) => format!("Local and {controllers}"),
+            (true, None) => "Local".into(),
+            (false, Some(controllers)) => controllers,
+            (false, None) => "0 controllers".into(),
         }
     }
 
@@ -653,8 +679,12 @@ impl Model {
         }
     }
 
-    /// Trim pasted credentials while leaving ordinary user-entered field values exact.
-    #[cfg(target_os = "macos")]
+    /// Native TextInput owns search and non-secret form fields, including selection and IME.
+    fn uses_text_widget(&self, field: Field) -> bool {
+        !self.is_secret(field)
+    }
+
+    /// Masked credential fields keep the custom editor so secrets never enter a visible widget.
     fn is_secret(&self, field: Field) -> bool {
         match field {
             Field::Search => false,
@@ -754,7 +784,7 @@ fn scrollbar(
     mut model: ResMut<Model>,
     tracks: Query<
         (
-            &Interaction,
+            Has<Pressed>,
             &bevy::ui::RelativeCursorPosition,
             &ComputedNode,
         ),
@@ -767,7 +797,7 @@ fn scrollbar(
         model.dragging = false;
         return;
     }
-    for (interaction, cursor, node) in &tracks {
+    for (pressed, cursor, node) in &tracks {
         let Some(position) = cursor.normalized else {
             continue;
         };
@@ -777,7 +807,7 @@ fn scrollbar(
         }
         let pointer = (position.y + 0.5) * track_height;
         let (top, height) = model.thumb_geometry(track_height);
-        if *interaction == Interaction::Pressed && !model.dragging {
+        if pressed && !model.dragging {
             model.dragging = true;
             model.drag_offset = if (top..=top + height).contains(&pointer) {
                 pointer - top
@@ -813,15 +843,81 @@ fn scroll_thumb(
 }
 
 /// Apply subtle feedback to interactive paper surfaces without triggering layout churn.
-fn hover(
-    mut widgets: Query<(&Interaction, &HoverColors, &mut BackgroundColor), Changed<Interaction>>,
-) {
-    for (interaction, colors, mut background) in &mut widgets {
-        background.0 = if *interaction == Interaction::None {
-            colors.resting
-        } else {
+fn hover(mut widgets: Query<(&Hovered, &HoverColors, &mut BackgroundColor), Changed<Hovered>>) {
+    for (hovered, colors, mut background) in &mut widgets {
+        background.0 = if hovered.get() {
             colors.hovered
+        } else {
+            colors.resting
         };
+    }
+}
+
+/// Copy native TextInput contents into the panel model without destroying selection.
+fn sync_text_widgets(
+    mut model: ResMut<Model>,
+    search: Query<&EditableText, (With<SearchField>, Changed<EditableText>)>,
+    forms: Query<(&FormField, &EditableText), Changed<EditableText>>,
+    focused: Query<(Entity, Option<&SearchField>, Option<&FormField>)>,
+    input_focus: Option<Res<InputFocus>>,
+) {
+    if let Ok(editable) = search.single() {
+        let text = editable.value().to_string();
+        if model.query.text != text {
+            model.query.text = text;
+            model.query.cursor = model.query.text.len();
+            model.scroll = 0.;
+        }
+    }
+    for (FormField(index), editable) in &forms {
+        let text = editable.value().to_string();
+        if let Some(edit) = model.editor(Field::Configuration(*index))
+            && edit.text != text
+        {
+            edit.text = text;
+            edit.cursor = edit.text.len();
+        }
+    }
+    let Some(entity) = input_focus.as_ref().and_then(|focus| focus.get()) else {
+        if model
+            .focus
+            .is_some_and(|field| model.uses_text_widget(field))
+        {
+            model.focus = None;
+        }
+        return;
+    };
+    let Ok((_, search_field, form_field)) = focused.get(entity) else {
+        return;
+    };
+    if search_field.is_some() {
+        model.focus = Some(Field::Search);
+    } else if let Some(FormField(index)) = form_field {
+        model.focus = Some(Field::Configuration(*index));
+    }
+}
+
+/// Keep TextInput chrome selected without rebuilding the widget and losing selection.
+fn text_widget_borders(
+    input_focus: Option<Res<InputFocus>>,
+    search: Query<Entity, With<SearchField>>,
+    forms: Query<Entity, With<FormField>>,
+    child_of: Query<&ChildOf>,
+    mut borders: Query<&mut BorderColor>,
+) {
+    let focused = input_focus.and_then(|focus| focus.get());
+    for entity in search.iter().chain(forms.iter()) {
+        let Some(parent) = child_of.get(entity).ok().map(ChildOf::parent) else {
+            continue;
+        };
+        let Ok(mut border) = borders.get_mut(parent) else {
+            continue;
+        };
+        *border = BorderColor::all(if focused == Some(entity) {
+            theme::PURPLE
+        } else {
+            theme::RULE
+        });
     }
 }
 
@@ -883,11 +979,14 @@ impl Plugin for PanelPlugin {
             .init_resource::<Icons>()
             .init_resource::<Fonts>()
             .add_systems(Startup, setup)
+            .add_observer(capture_ui_presses)
             .add_systems(
                 Update,
                 (
                     buttons,
                     text_input,
+                    sync_text_widgets,
+                    text_widget_borders,
                     scroll,
                     scrollbar,
                     scroll_thumb,
@@ -900,6 +999,7 @@ impl Plugin for PanelPlugin {
             .add_systems(
                 Update,
                 view::render
+                    .after(sync_text_widgets)
                     .after(crate::app::media_bridge)
                     .before(crate::overlay::sync_overlay),
             );
@@ -1012,10 +1112,54 @@ impl Model {
     }
 }
 
+/// Assign Pressed only to the innermost `UiAction` so parent Cancel/Play widgets do not fire.
+fn capture_ui_presses(
+    mut press: On<PointerPress>,
+    actions: Query<(), With<UiAction>>,
+    parents: Query<&ChildOf>,
+    mut commands: Commands,
+) {
+    if press.original_event_target() != press.entity {
+        return;
+    }
+    if press.button != PointerButton::Primary {
+        return;
+    }
+    let mut current = press.original_event_target();
+    loop {
+        if actions.contains(current) {
+            press.propagate(false);
+            commands.entity(current).insert(Pressed);
+            return;
+        }
+        let Ok(parent) = parents.get(current) else {
+            return;
+        };
+        current = parent.parent();
+    }
+}
+
+/// True when `entity` is an ancestor of `descendant` in the UI tree.
+fn is_ancestor(entity: Entity, descendant: Entity, parents: &Query<&ChildOf>) -> bool {
+    let mut current = descendant;
+    while let Ok(parent) = parents.get(current) {
+        if parent.parent() == entity {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
 /// Dispatch one pointer press; rebuilding widgets must not repeat a held click.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy systems take one argument per query, resource, or input"
+)]
 fn buttons(
     mut model: ResMut<Model>,
-    buttons: Query<(&Interaction, &UiAction), Changed<Interaction>>,
+    pressed: Query<(Entity, &UiAction), Added<Pressed>>,
+    parents: Query<&ChildOf>,
     mut actions: ResMut<Actions>,
     mut network: ResMut<crate::network_app::NetworkState>,
     runtime: Res<Runtime>,
@@ -1028,8 +1172,21 @@ fn buttons(
     {
         return;
     }
-    for (interaction, action) in &buttons {
-        if *interaction != Interaction::Pressed || !model.allows(action) {
+    // ui_widgets::Button inserts Pressed on ancestors when a child is clicked.
+    // Keep only the innermost action so Stop does not also Play, and dialog
+    // clicks do not cancel via a parent backdrop.
+    let hits: Vec<(Entity, UiAction)> = pressed
+        .iter()
+        .map(|(entity, action)| (entity, action.clone()))
+        .collect();
+    for (entity, action) in &hits {
+        if hits
+            .iter()
+            .any(|(other, _)| *other != *entity && is_ancestor(*entity, *other, &parents))
+        {
+            continue;
+        }
+        if !model.allows(action) {
             continue;
         }
         model.revision = model.revision.wrapping_add(1);
@@ -1042,6 +1199,14 @@ fn buttons(
             UiAction::Focus(field) => {
                 model.focus = Some(*field);
                 model.dropdown = None;
+                if *field == Field::Configuration(1)
+                    && network.admin_secret_available
+                    && let Some(edit) = model.editor(*field)
+                    && edit.text.is_empty()
+                {
+                    // Occupied empty secret fields are a replaceable mask, not an append target.
+                    edit.select_all = true;
+                }
             }
             UiAction::Dropdown(Dropdown::From) => {
                 if network.listen_address.is_empty() && network.discovered_listener.is_none() {
@@ -1172,6 +1337,9 @@ fn buttons(
             UiAction::SourceDetails(details) => {
                 if let Some(modal) = &mut model.modal {
                     modal.show_source_details(*details);
+                }
+                if *details == SourceDetails::Credentials {
+                    network.unlock_administration();
                 }
                 model.focus = None;
             }
@@ -1310,9 +1478,15 @@ fn text_input(
     _main: bevy::ecs::system::NonSendMarker,
     mut raw: MessageReader<bevy::winit::RawWinitWindowEvent>,
     native: Option<NonSend<bevy::winit::WinitWindows>>,
+    mut input_focus: Option<ResMut<InputFocus>>,
+    text_inputs: Query<Entity, With<TextInput>>,
 ) {
     let (entity, mut window) = primary.into_inner();
-    window.ime_enabled = model.focus.is_some();
+    let widget_owns = input_focus
+        .as_ref()
+        .and_then(|focus| focus.get())
+        .is_some_and(|focused| text_inputs.contains(focused));
+    window.ime_enabled = model.focus.is_some() || widget_owns;
     if !window.focused {
         model.modifiers = 0;
         model.raw_modifiers = 0;
@@ -1322,6 +1496,9 @@ fn text_input(
         return;
     }
     let mut committed = false;
+    if widget_owns {
+        ime.clear();
+    }
     for event in ime.read() {
         model.revision = model.revision.wrapping_add(1);
         let Some(field) = model.focus else {
@@ -1398,6 +1575,16 @@ fn text_input(
             }
         }
         if key.state != ButtonState::Pressed {
+            continue;
+        }
+        if widget_owns {
+            if key.logical_key == Key::Escape && (model.modal.is_some() || model.dropdown.is_some())
+            {
+                model.close();
+                if let Some(focus) = input_focus.as_mut() {
+                    focus.clear();
+                }
+            }
             continue;
         }
         model.revision = model.revision.wrapping_add(1);
@@ -1493,7 +1680,7 @@ fn scroll(
     let (primary, window) = primary.into_inner();
     // Winit forwards physical pixel deltas, including fractional OS momentum on Retina.
     let scale_factor = window.scale_factor().max(f32::EPSILON);
-    for (node, mut position) in &mut catalogs {
+    for (node, _) in &mut catalogs {
         let height = node.size().y * node.inverse_scale_factor();
         if height <= 0. {
             continue;
@@ -1503,38 +1690,42 @@ fn scroll(
             .ceil()
             .max(1.) as usize;
         model.scroll = model.scroll.clamp(0., model.max_scroll());
-        position.y = model.scroll;
     }
-    // Clamp modal bounds on resize even when no wheel message arrives.
-    if let Some(modal) = &mut model.modal {
-        for (node, mut position) in &mut bodies {
-            let maximum =
-                ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
-            modal.scroll = modal.scroll.clamp(0., maximum);
-            position.y = modal.scroll;
-        }
-    }
+    let mut delta = 0.;
+    let mut saw_wheel = false;
     for event in wheel.read() {
         if event.window != primary || !event.y.is_finite() {
             continue;
         }
-        let delta = match event.unit {
+        saw_wheel = true;
+        delta += match event.unit {
             bevy::input::mouse::MouseScrollUnit::Line => event.y * 40.,
             bevy::input::mouse::MouseScrollUnit::Pixel => event.y / scale_factor,
         };
-        if let Some(modal) = &mut model.modal {
-            for (node, mut position) in &mut bodies {
-                let maximum =
-                    ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
-                modal.scroll = (position.y - delta).clamp(0., maximum);
-                position.y = modal.scroll;
-            }
-        } else if delta != 0. {
+    }
+    if let Some(modal) = &mut model.modal {
+        for (node, mut position) in &mut bodies {
+            let maximum =
+                ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
+            modal.scroll = if saw_wheel {
+                (position.y - delta).clamp(0., maximum)
+            } else {
+                position.y.clamp(0., maximum)
+            };
+            position.y = modal.scroll;
+        }
+    } else if saw_wheel {
+        if delta != 0. {
             model.dropdown = None;
             model.scroll = (model.scroll - delta).clamp(0., model.max_scroll());
-            for (_, mut position) in &mut catalogs {
-                position.y = model.scroll;
-            }
+        }
+        for (_, mut position) in &mut catalogs {
+            position.y = model.scroll;
+        }
+    } else {
+        for (_, mut position) in &mut catalogs {
+            model.scroll = position.y.clamp(0., model.max_scroll());
+            position.y = model.scroll;
         }
     }
 }

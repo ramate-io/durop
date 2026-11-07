@@ -6,7 +6,7 @@ default-members = ["."]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.97"
 license = "MIT"
 
 [workspace.dependencies]
@@ -25,7 +25,7 @@ name = "durop"
 default-run = "durop"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.97"
 license = "MIT"
 
 [dependencies]
@@ -34,7 +34,7 @@ durop-catalog.workspace = true
 durop-host.workspace = true
 durop-media.workspace = true
 durop-transport.workspace = true
-bevy = { version = "=0.19.1", default-features = false, features = ["std", "async_executor", "bevy_window", "bevy_winit", "x11", "bevy_asset", "bevy_render", "bevy_camera", "bevy_core_pipeline", "bevy_sprite", "bevy_sprite_render", "bevy_text", "default_font", "png", "bevy_ui", "bevy_ui_render"] }
+bevy = { version = "0.20", default-features = false, features = ["std", "async_executor", "bevy_window", "bevy_winit", "x11", "bevy_asset", "bevy_render", "bevy_camera", "bevy_core_pipeline", "bevy_sprite", "bevy_sprite_render", "bevy_text", "default_font", "png", "bevy_ui", "bevy_ui_render", "bevy_ui_widgets", "bevy_picking", "ui_picking", "system_clipboard"] }
 
 serde.workspace = true
 serde_json.workspace = true

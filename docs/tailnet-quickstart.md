@@ -60,7 +60,7 @@ nix develop --command cargo run -p durop --bin durop --locked
 ```
 
 1. In **To**, choose the local display. In **Catalog**, choose the clips to play.
-2. In **From**, choose **+ → Tailscale controller**, enter a name, and **Add controller**.
+2. In **From**, choose **+ → Configure new Tailscale controller…**, enter a name, and **Add controller**.
    Buttons across the top select which source to edit; local and remote sources
    stay independently enabled. In the new source's **Listener settings**, Durop
    prefills this Mac's Tailscale IPv4 and TCP 48732 when the app CLI can see the
@@ -74,7 +74,7 @@ nix develop --command cargo run -p durop --bin durop --locked
    `TAILSCALE_API_KEY` from its process environment or the UI's secure credential
    storage. Root `.env` is read by the infrastructure manager only; it does not
    export variables into Durop.
-4. Choose **Copy invitation link + pairing details**, or **Copy Durop pairing
+4. Choose **Copy invitation link and pairing details**, or **Copy Durop pairing
    details** when no invitation is needed. Send these privately to that controller.
    Each named controller has a separate Durop token.
 

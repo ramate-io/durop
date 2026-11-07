@@ -1,6 +1,7 @@
 //! Regression coverage for input routing, modal isolation and bounded collection geometry.
 
 use super::*;
+use bevy::ui::Pressed;
 
 /// Start a controller-only runtime without loading a pack from user preferences.
 fn config() -> crate::app::Config {
@@ -218,7 +219,7 @@ fn pressed_stop_all_button_routes_to_shared_host_and_truthful_request_status() {
         .init_resource::<Actions>()
         .add_systems(Update, buttons);
     app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::Runtime(Action::StopAll)));
+        .spawn((Pressed, UiAction::Runtime(Action::StopAll)));
     app.update();
     assert!(matches!(
         app.world_mut().resource_mut::<Actions>().0.pop_front(),
@@ -384,11 +385,11 @@ fn provider_modal_blocks_background_play_but_preserves_emergency_stop() {
         .init_resource::<Actions>()
         .add_systems(Update, buttons);
     app.world_mut().spawn((
-        Interaction::Pressed,
+        Pressed,
         UiAction::Runtime(Action::Play("background/clip".into())),
     ));
     app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::Runtime(Action::StopAll)));
+        .spawn((Pressed, UiAction::Runtime(Action::StopAll)));
     app.update();
     let actions = &app.world().resource::<Actions>().0;
     assert_eq!(actions.len(), 1);
@@ -397,6 +398,62 @@ fn provider_modal_blocks_background_play_but_preserves_emergency_stop() {
     model.close();
     model.open(Provider::Host(HostProvider::Tailscale), &provider_context());
     assert!(model.modal.as_ref().unwrap().editors[1].text.is_empty());
+}
+
+/// ui_widgets::Button inserts Pressed on ancestors; only the innermost action may run.
+#[test]
+fn nested_button_press_dispatches_only_the_innermost_action() {
+    let runtime = Runtime::new(&config()).unwrap();
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut app = App::new();
+    app.insert_resource(runtime)
+        .insert_resource(network)
+        .init_resource::<Model>()
+        .init_resource::<Actions>()
+        .add_systems(Update, buttons);
+    let play = app
+        .world_mut()
+        .spawn((Pressed, UiAction::Runtime(Action::Play("clip".into()))))
+        .id();
+    app.world_mut().spawn((
+        Pressed,
+        UiAction::Runtime(Action::Stop("instance".into())),
+        ChildOf(play),
+    ));
+    app.update();
+    let actions: Vec<_> = app
+        .world_mut()
+        .resource_mut::<Actions>()
+        .0
+        .drain(..)
+        .collect();
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::Stop(instance) if instance == "instance"
+    ));
+}
+
+/// A parent Cancel must not dismiss the dialog when an inner Apply is the click target.
+#[test]
+fn nested_cancel_does_not_override_an_inner_apply() {
+    let runtime = Runtime::new(&config()).unwrap();
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut model = Model::default();
+    model.open(Provider::Host(HostProvider::Tailscale), &provider_context());
+    let mut app = App::new();
+    app.insert_resource(runtime)
+        .insert_resource(network)
+        .insert_resource(model)
+        .init_resource::<Actions>()
+        .add_systems(Update, buttons);
+    let cancel = app.world_mut().spawn((Pressed, UiAction::Cancel)).id();
+    app.world_mut()
+        .spawn((Pressed, UiAction::Apply, ChildOf(cancel)));
+    app.update();
+    let model = app.world().resource::<Model>();
+    assert!(model.modal.is_some(), "inner Apply keeps the invalid draft");
+    assert!(model.modal.as_ref().unwrap().error.is_some());
 }
 
 /// Validation failures stay editable; successful apply consumes the private draft.
@@ -447,8 +504,7 @@ fn native_provider_apply_in_controller_mode_retains_actionable_modal_error() {
         .insert_resource(model)
         .init_resource::<Actions>()
         .add_systems(Update, buttons);
-    app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::Apply));
+    app.world_mut().spawn((Pressed, UiAction::Apply));
     app.update();
     assert!(app.world().resource::<Actions>().0.is_empty());
     assert!(
@@ -485,7 +541,7 @@ fn scrollbar_drag_tracks_pointer_and_modal_cancels_capture() {
                 inverse_scale_factor: 1.,
                 ..default()
             },
-            Interaction::Pressed,
+            Pressed,
             bevy::ui::RelativeCursorPosition {
                 normalized: Some(Vec2::new(0., 0.5)),
                 ..default()
@@ -496,20 +552,20 @@ fn scrollbar_drag_tracks_pointer_and_modal_cancels_capture() {
     let model = app.world().resource::<Model>();
     assert!(model.dragging);
     assert_eq!(model.scroll, model.max_scroll());
-    app.world_mut().entity_mut(track).insert((
-        Interaction::None,
-        bevy::ui::RelativeCursorPosition {
+    app.world_mut()
+        .entity_mut(track)
+        .remove::<Pressed>()
+        .insert(bevy::ui::RelativeCursorPosition {
             normalized: Some(Vec2::new(0., -0.5)),
             ..default()
-        },
-    ));
+        });
     app.update();
     assert_eq!(app.world().resource::<Model>().scroll, 0.);
     app.world_mut()
         .resource_mut::<Model>()
         .open(Provider::Host(HostProvider::Native), &provider_context());
     app.world_mut().entity_mut(track).insert((
-        Interaction::Pressed,
+        Pressed,
         bevy::ui::RelativeCursorPosition {
             normalized: Some(Vec2::new(0., 0.5)),
             ..default()
@@ -539,8 +595,7 @@ fn controller_catalog_apply_preserves_remote_destination_and_draft() {
             .insert_resource(model)
             .init_resource::<Actions>()
             .add_systems(Update, buttons);
-        app.world_mut()
-            .spawn((Interaction::Pressed, UiAction::Apply));
+        app.world_mut().spawn((Pressed, UiAction::Apply));
         app.update();
         assert!(app.world().resource::<Actions>().0.is_empty());
         let model = app.world().resource::<Model>();
@@ -894,7 +949,7 @@ fn scrollbar_grab_preserves_offset_and_tracks_fractional_motion() {
         .world_mut()
         .spawn((
             Scrollbar,
-            Interaction::Pressed,
+            Pressed,
             ComputedNode {
                 size: Vec2::new(8., 1000.),
                 inverse_scale_factor: 0.5,
@@ -924,9 +979,11 @@ fn scrollbar_grab_preserves_offset_and_tracks_fractional_motion() {
 /// Sources summarize simultaneous permission instead of presenting an exclusive selector.
 #[test]
 fn from_summary_includes_local_and_multiple_controllers() {
-    assert_eq!(Model::source_summary(true, 2), "Local + 2 controllers");
-    assert_eq!(Model::source_summary(true, 0), "Local + 0 controllers");
+    assert_eq!(Model::source_summary(true, 2), "Local and 2 controllers");
+    assert_eq!(Model::source_summary(true, 0), "Local");
+    assert_eq!(Model::source_summary(true, 1), "Local and 1 controller");
     assert_eq!(Model::source_summary(false, 1), "1 controller");
+    assert_eq!(Model::source_summary(false, 0), "0 controllers");
 }
 
 /// Source forms use ephemeral editor state and never produce a provider destination intent.
@@ -986,14 +1043,14 @@ fn source_buttons_enqueue_independent_permissions_without_changing_to() {
     use crate::network_app::NetworkAction;
     let mut app = sources_app();
     app.world_mut().spawn((
-        Interaction::Pressed,
+        Pressed,
         UiAction::Network(NetworkAction::SetControllerEnabled {
             id: "alice".into(),
             enabled: false,
         }),
     ));
     app.world_mut().spawn((
-        Interaction::Pressed,
+        Pressed,
         UiAction::Network(NetworkAction::SetControllerEnabled {
             id: "bob".into(),
             enabled: true,
@@ -1032,8 +1089,7 @@ fn secure_save_consumes_only_the_admin_secret_draft() {
         .unwrap()
         .editors[1]
         .insert("  secret-key  ");
-    app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::SaveAdminSecret));
+    app.world_mut().spawn((Pressed, UiAction::SaveAdminSecret));
     app.update();
     assert!(
         matches!(app.world().resource::<crate::network_app::NetworkState>().actions.front(), Some(NetworkAction::SaveAdminSecret {secret}) if secret == "secret-key")
@@ -1051,6 +1107,32 @@ fn secure_save_consumes_only_the_admin_secret_draft() {
     assert!(app.world().resource::<Actions>().0.is_empty());
 }
 
+#[test]
+fn occupied_api_key_mask_replaces_on_next_edit() {
+    let mut app = sources_app();
+    app.world_mut()
+        .resource_mut::<crate::network_app::NetworkState>()
+        .admin_secret_available = true;
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        let modal = model.modal.as_mut().unwrap();
+        modal.select_source(SourceSelection::Remote("alice".into()));
+        modal.show_source_details(SourceDetails::Credentials);
+    }
+    app.world_mut()
+        .spawn((Pressed, UiAction::Focus(Field::Configuration(1))));
+    app.update();
+    let editor = &app
+        .world()
+        .resource::<Model>()
+        .modal
+        .as_ref()
+        .unwrap()
+        .editors[1];
+    assert!(editor.text.is_empty());
+    assert!(editor.select_all);
+}
+
 /// Inbound listener editing must never replace the independent outbound host endpoint.
 #[test]
 fn listener_apply_keeps_outbound_to_address() {
@@ -1065,8 +1147,7 @@ fn listener_apply_keeps_outbound_to_address() {
     app.world_mut()
         .resource_mut::<crate::network_app::NetworkState>()
         .address = "ws://100.111.112.113:7010/control".into();
-    app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::EnableListener));
+    app.world_mut().spawn((Pressed, UiAction::EnableListener));
     app.update();
     let network = app.world().resource::<crate::network_app::NetworkState>();
     assert_eq!(network.address, "ws://100.111.112.113:7010/control");
@@ -1089,8 +1170,7 @@ fn listener_accepts_tailnet_ip_without_an_explicit_port() {
         modal.editors[2].text = "100.101.102.103".into();
         modal.editors[2].cursor = modal.editors[2].text.len();
     }
-    app.world_mut()
-        .spawn((Interaction::Pressed, UiAction::EnableListener));
+    app.world_mut().spawn((Pressed, UiAction::EnableListener));
     app.update();
     let network = app.world().resource::<crate::network_app::NetworkState>();
     assert_eq!(network.listen_address, "100.101.102.103:48732");
@@ -1102,7 +1182,7 @@ fn listener_accepts_tailnet_ip_without_an_explicit_port() {
 
 /// Press one transient source-navigation button without leaving stale synthetic interactions.
 fn source_press(app: &mut App, action: UiAction) {
-    let button = app.world_mut().spawn((Interaction::Pressed, action)).id();
+    let button = app.world_mut().spawn((Pressed, action)).id();
     app.update();
     app.world_mut().despawn(button);
 }
