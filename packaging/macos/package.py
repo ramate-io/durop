@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build one native Apple Silicon app; no release publishing or developer setup."""
+"""Build one native Apple Silicon app and a drag-install DMG."""
 import argparse
 import hashlib
 import json
@@ -13,12 +13,16 @@ import subprocess
 import struct
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 TARGET = "aarch64-apple-darwin"
 MINIMUM = "14.0"
 BUNDLE_ID = "io.ramate.durop"
 FORBIDDEN = ("/nix/", "/opt/homebrew", "/usr/local", "/Cellar/")
+VOLUME_NAME = "Durop"
+# Artifact stems may include a release tag suffix such as 0.1.0-playtest-001.
+ARTIFACT_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def run(args, **kwargs):
@@ -27,6 +31,81 @@ def run(args, **kwargs):
 
 def capture(args, **kwargs):
     return subprocess.check_output([str(x) for x in args], text=True, **kwargs).strip()
+
+
+def cargo_package_version():
+    """Read the numeric application version used in Info.plist."""
+    package = (ROOT / "Cargo.toml").read_text().split("[package]", 1)[1].split("[", 1)[0]
+    version = re.search(r'^version\s*=\s*"([^"]+)"', package, re.M)
+    if version is None or not re.fullmatch(r"\d+\.\d+\.\d+", version.group(1)):
+        raise ValueError("POC bundle requires a numeric major.minor.patch package version")
+    return version.group(1)
+
+
+def release_tag_version(tag):
+    """Use a published Git tag as the artifact version, dropping a leading v."""
+    tag = tag.strip()
+    if tag.startswith("refs/tags/"):
+        tag = tag[len("refs/tags/"):]
+    if re.match(r"v\d", tag):
+        tag = tag[1:]
+    return tag
+
+
+def resolve_artifact_version(package_version, *, override=None, event_name=None, ref_name=None, sha=None):
+    """Prefer an explicit override, then a release tag, then a CI commit suffix."""
+    if override:
+        candidate = override
+    elif event_name == "release" and ref_name:
+        candidate = release_tag_version(ref_name)
+    elif sha:
+        candidate = f"{package_version}-{sha[:7]}"
+    else:
+        candidate = package_version
+    if not ARTIFACT_VERSION.fullmatch(candidate):
+        raise ValueError(f"artifact version is not a safe filename stem: {candidate}")
+    return candidate
+
+
+def distributable_name(artifact):
+    """Return the versioned Apple Silicon DMG filename."""
+    return f"Durop-{artifact}-macos-arm64.dmg"
+
+
+def dmg_create_is_busy(output):
+    """True when hdiutil failed because an image or volume was still attached."""
+    text = output.lower()
+    return "resource busy" in text or "device busy" in text or "resource temporarily unavailable" in text
+
+
+def detach_dmg_volume(name, image=None):
+    """Best-effort detach of a leftover packaging volume before retrying hdiutil."""
+    subprocess.run(["/usr/bin/hdiutil", "detach", f"/Volumes/{name}", "-force"], check=False, capture_output=True)
+    if image is not None and Path(image).exists():
+        subprocess.run(["/usr/bin/hdiutil", "detach", str(image), "-force"], check=False, capture_output=True)
+
+
+def create_udzo_dmg(source, destination, volume_name):
+    """Create a zlib-compressed DMG, retrying the usual hdiutil busy failures."""
+    destination = Path(destination)
+    last_output = ""
+    if hasattr(os, "sync"):
+        os.sync()
+    for attempt in range(1, 6):
+        completed = subprocess.run(
+            ["/usr/bin/hdiutil", "create", "-volname", volume_name, "-srcfolder", source, "-ov", "-format", "UDZO", destination],
+            capture_output=True, text=True,
+        )
+        last_output = (completed.stdout or "") + (completed.stderr or "")
+        if completed.returncode == 0 and destination.is_file() and destination.stat().st_size > 0:
+            return
+        if not dmg_create_is_busy(last_output) or attempt == 5:
+            break
+        detach_dmg_volume(volume_name, destination)
+        if destination.exists():
+            destination.unlink()
+        time.sleep(attempt * 2)
+    raise RuntimeError(last_output.strip() or "hdiutil create failed")
 
 
 def source_fingerprint():
@@ -46,7 +125,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cargo", default=os.environ.get("DUROP_NATIVE_CARGO", "cargo"), help="native Cargo executable or rustup shim")
     parser.add_argument("--output", type=Path, default=ROOT / "dist")
+    parser.add_argument("--version", help="artifact version used in the DMG filename")
+    parser.add_argument("--print-version", action="store_true", help="print the artifact version and exit")
     args = parser.parse_args()
+    try:
+        version = cargo_package_version()
+        artifact = resolve_artifact_version(
+            version, override=args.version or os.environ.get("VERSION"),
+            event_name=os.environ.get("GITHUB_EVENT_NAME"),
+            ref_name=os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF"),
+            sha=os.environ.get("GITHUB_SHA"),
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if args.print_version:
+        print(artifact)
+        return
     args.output=args.output.resolve()
     if platform.system() != "Darwin":
         parser.error("native macOS with Apple SDK tools is required")
@@ -59,10 +153,6 @@ def main():
     if any(part in str(cargo.resolve()) for part in FORBIDDEN):
         parser.error("Cargo must be native, outside Nix/Homebrew")
     channel = re.search(r'^channel\s*=\s*"([^"]+)"', (ROOT / "rust-toolchain.toml").read_text(), re.M).group(1)
-    package = (ROOT / "Cargo.toml").read_text().split("[package]", 1)[1].split("[", 1)[0]
-    version = re.search(r'^version\s*=\s*"([^"]+)"', package, re.M).group(1)
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        parser.error("POC bundle requires a numeric major.minor.patch package version")
     sdk = capture(["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"])
     env = {key: os.environ[key] for key in ("HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "CARGO_HOME", "RUSTUP_HOME") if key in os.environ}
     env.update(PATH=f"{cargo.parent}:/usr/bin:/bin:/usr/sbin:/sbin", SDKROOT=sdk,
@@ -116,7 +206,7 @@ def main():
         with (contents / "Info.plist").open("wb") as stream:
             plistlib.dump(plist, stream)
         revision = capture(["/usr/bin/git", "rev-parse", "HEAD"], cwd=ROOT)
-        info = {"version": version, "source_revision": revision,
+        info = {"version": version, "artifact_version": artifact, "source_revision": revision,
                 "source_dirty": bool(capture(["/usr/bin/git", "status", "--porcelain"], cwd=ROOT)),
                 "native_build_executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
                 "source_fingerprint_sha256":fingerprint,
@@ -153,9 +243,14 @@ def main():
             raise RuntimeError("read-only self-check unexpectedly wrote to its empty HOME")
         print(smoke)
         run(["/usr/bin/codesign", "--verify", "--strict", "--deep", app])
-        archive_name = f"Durop-{version}-macos-arm64.zip"
+        archive_name = distributable_name(artifact)
         archive = staging / archive_name
-        run(["/usr/bin/ditto", "-c", "-k", "--keepParent", app, archive])
+        dmg_stage = staging / "dmg-root"
+        dmg_stage.mkdir()
+        run(["/usr/bin/ditto", app, dmg_stage / "Durop.app"])
+        (dmg_stage / "Applications").symlink_to("/Applications")
+        create_udzo_dmg(dmg_stage, archive, VOLUME_NAME)
+        shutil.rmtree(dmg_stage)
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         for item in (app, archive):
             destination = args.output / item.name

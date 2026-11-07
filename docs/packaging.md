@@ -33,6 +33,8 @@ small clean environment, the SDK resolved by `xcrun`, a dedicated
 `target/native-package` build directory and a locked native arm64 release build.
 Cargo's existing native build cache is reused, while every package invocation
 still runs the locked build and mandatory bundle/resource checks.
+`packaging/macos/package.sh --print-version` prints the DMG version stem without
+building. `--version` or `VERSION` overrides it.
 
 If a native rustup launcher was installed through Homebrew, select its actual
 official toolchain executable with
@@ -40,8 +42,13 @@ official toolchain executable with
 explicitly; the launcher/installer's location must not be mistaken for the
 compiler/Cargo used to build the distributable.
 
-The output directory contains the app, a versioned ZIP, its SHA-256 checksum,
-`BUILD-INFO.json` and `VALIDATION.json`. The app contains:
+The output directory contains the app, a versioned UDZO DMG with an Applications
+symlink for drag-install, its SHA-256 checksum, `BUILD-INFO.json` and
+`VALIDATION.json`. The DMG name uses the Cargo package version locally, a short
+commit suffix in CI, and the published GitHub release tag without a leading `v`.
+A tag such as `v0.1.0-playtest-001` therefore produces
+`Durop-0.1.0-playtest-001-macos-arm64.dmg`. Info.plist keeps the numeric Cargo
+version; `BUILD-INFO.json` records both. The app contains:
 
 ```text
 Contents/
@@ -85,12 +92,13 @@ audio, cache writes or Git. This establishes location-independent resource
 lookup, not Finder/GPU playback acceptance. It uses `Contents/Resources`, not the
 working directory or source checkout.
 
-Copy `Durop.app` into Applications and launch it normally. Gatekeeper may require
-the operator's normal Open confirmation for an unnotarized downloaded app; do
-not disable Gatekeeper globally. No paid signing account is a POC prerequisite.
-Screen recording/system-audio capture permissions belong to the chosen capture
-application. Tailscale's network extension enrollment is a separate installation
-and approval, not bundled setup performed by Durop.
+Open the DMG and drag `Durop.app` onto Applications, or copy `Durop.app` from the
+packaging output directory into Applications and launch it normally. Gatekeeper
+may require the operator's normal Open confirmation for an unnotarized downloaded
+app; do not disable Gatekeeper globally. No paid signing account is a POC
+prerequisite. Screen recording/system-audio capture permissions belong to the
+chosen capture application. Tailscale's network extension enrollment is a
+separate installation and approval, not bundled setup performed by Durop.
 
 Caches live in `~/Library/Caches/io.ramate.durop/packs`; nonsecret preferences
 live in `~/Library/Application Support/io.ramate.durop/preferences.json`.
@@ -125,12 +133,13 @@ their own asset provenance files. Do not silently add a non-system media/Git
 runtime: its recursive closure, redistribution notices and source obligations
 must be handled before distribution.
 
-The workflow `.github/workflows/package.yml` builds native macOS artifacts for
-pull requests and manual dispatch; it uploads the ZIP/checksum/build/validation
-records. It does not create a release or publish artifacts outside CI. Release
-publication, Developer ID signing and notarization require a separate explicit
-operator action. The high-level development/native-build separation was reviewed
-from Maybraid's packaging README; no Maybraid source or documentation was copied.
+The workflow `.github/workflows/package.yml` builds native macOS DMGs for pull
+requests, `main` pushes that touch the same paths, published GitHub releases and
+manual dispatch. CI uploads the DMG, checksum and build/validation records.
+Publishing a GitHub release attaches the DMG and checksum to that release.
+Developer ID signing and notarization still require a separate explicit operator
+action. The high-level development/native-build separation was reviewed from
+Maybraid's packaging README; no Maybraid source or documentation was copied.
 
 See [the session runbook](session-runbook.md) for local/host/controller operation
 and outstanding second-Mac acceptance.
