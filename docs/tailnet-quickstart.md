@@ -16,38 +16,37 @@ covers complete-policy ownership, credentials, durable state and recovery.
 2. Install and sign into the [Tailscale macOS app](https://tailscale.com/docs/install/mac)
    on each host and controller Mac; approve devices when required. Keep laptops
    owned by their users; guests can remain signed into their own tailnets.
-3. If intended controllers cannot already reach the playback Mac on TCP **48732**,
-   let `manage.py ensure` pull the live ACL, merge Durop grants and save a reviewed
-   plan. Include `--controller` emails that should be admitted and `--unauthorized`
-   for the deny test. Device-share guests need the sample's `autogroup:shared` →
-   `durop-host` grant for `tcp:48732`; a same-tailnet user group alone does not
-   cover shared guests. Existing broader grants still apply. Skip this stack if
-   you do not want CDKTN to own policy and 48732 already works.
+3. If intended remotes cannot already reach the playback Mac on TCP **48732**,
+   let `ensure` pull the live ACL, name the playback host, grant
+   `autogroup:shared` that port, and save a reviewed plan. Same-tailnet users
+   who should reach the host without a device share can be added with repeatable
+   `--member` emails; guests stay in their own tailnets and accept a share of
+   this Mac. Optional `--deny` adds a policy test that must fail. Existing
+   broader grants still apply. Skip this stack if you do not want CDKTN to own
+   policy and 48732 already works.
 
-From the checkout root, with the playback Mac's Tailscale IPv4 from the app:
+From `nix develop`, with the playback Mac's Tailscale IPv4 from the app:
 
 ```sh
-nix develop .#infrastructure
-python infra/manage.py ensure durop-network \
-  --host HOST_TAILSCALE_IP \
-  --controller you@example.com \
-  --unauthorized other@example.com
+cd infra/cdktn/tailscale
+uv sync --locked
+uv run --locked --no-sync python main.py ensure --host HOST_TAILSCALE_IP
 # After reviewing the printed complete policy diff, tests, tailnet and backend:
-python infra/manage.py apply durop-network
-python infra/manage.py plan durop-network
+uv run --locked --no-sync python main.py apply
+uv run --locked --no-sync python main.py plan
 ```
 
-`ensure` installs the locked toolchain when needed, writes ignored
-`infra/cdktn/tailscale/network.config.json`, imports the singleton ACL and prints
-the saved plan. It preserves unrelated rules and refuses to overwrite a local
-config that differs; pass `--replace-config` to rebuild from the live ACL. The
-example config is only for a dedicated test tailnet. Keep `magic_dns` absent
+`ensure` writes ignored `network.config.json`, imports the singleton ACL and
+prints the saved plan. It preserves unrelated rules and refuses to overwrite a
+local config that differs; pass `--replace-config` to rebuild from the live ACL.
+The example config is only for a dedicated test tailnet. Keep `magic_dns` absent
 unless deliberately taking ownership of that preference. Repeat `ensure` without
-merge flags to re-plan from the saved file.
+`--host` to re-plan from the saved file. Optional `--member you@example.com` and
+`--deny other@example.com` add same-tailnet allow/deny tests.
 
 The final plan should report no changes. State and saved plans use a private,
 persistent directory outside the checkout. Use the same `--state-dir` for every
-command and a separate directory per tailnet. The manager automatically reads
+command and a separate directory per tailnet. The CLI automatically reads
 root `.env` as literal data; existing environment variables win. Use
 `--env-file /private/path.env` or `--no-env` to override that behavior. Provisioning
 does not enroll devices or generate Durop session pairing credentials.

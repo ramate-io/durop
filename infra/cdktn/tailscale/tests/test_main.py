@@ -7,13 +7,6 @@ import unittest
 from unittest.mock import patch
 
 import main
-import importlib.util
-
-
-# Exercise the public manager against the actual saved-plan lifecycle implementation.
-manager_spec = importlib.util.spec_from_file_location('durop_manage', main.ROOT.parents[1] / 'manage.py')
-manager = importlib.util.module_from_spec(manager_spec)
-manager_spec.loader.exec_module(manager)
 
 
 class WrapperTests(unittest.TestCase):
@@ -85,7 +78,7 @@ class WrapperTests(unittest.TestCase):
         self.calls.clear()
         original = main.digest
         for changed in [main.ROOT / 'network.py', main.ROOT / '.terraform.lock.hcl',
-                        main.ROOT.parents[1] / 'manage.py']:
+                        main.ROOT / 'env.py']:
             def modified(path):
                 return 'changed' if path == changed else original(path)
             with patch('main.digest', side_effect=modified):
@@ -119,17 +112,20 @@ class WrapperTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'outside'):
                 main.execute('synth', self.config, state, self.out)
 
-    def test_public_manager_review_and_import_lifecycle(self):
-        arguments = ['durop-network', '--no-env', '--config', str(self.config),
+    def test_public_cli_review_and_import_lifecycle(self):
+        arguments = ['--no-env', '--config', str(self.config),
                      '--state-dir', str(self.state), '--output', str(self.out)]
         with patch('main.subprocess.run', side_effect=self.fake_run):
-            self.assertEqual(manager.main(['plan', *arguments]), 0)
-            self.assertEqual(manager.main(['show', *arguments]), 0)
+            self.assertEqual(main.main(['plan', *arguments]), 0)
+            self.assertEqual(main.main(['show', *arguments]), 0)
             self.assertEqual(self.calls[-1][-2:], ['show', str(self.state / 'reviewed.tfplan')])
-            self.assertEqual(manager.main(['apply', *arguments]), 0)
+            self.assertEqual(main.main(['apply', *arguments]), 0)
             self.calls.clear()
-            self.assertEqual(manager.main(['apply', *arguments]), 1)
+            self.assertEqual(main.main(['apply', *arguments]), 1)
             self.assertEqual(self.calls, [])
+
+    def test_overlay_flags_only_valid_with_ensure(self):
+        self.assertEqual(main.main(['synth', '--no-env', '--host', '100.64.0.1']), 1)
 
     def test_import_skips_owned_policy_and_imports_configured_dns(self):
         self.execute('plan')
@@ -166,8 +162,7 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_ensure_merges_live_acl_then_imports_plans_and_shows(self):
-        overlay = main.DuropOverlay(host='100.64.1.1', controllers=('host@example.com',),
-                                    unauthorized='guest@example.com')
+        overlay = main.DuropOverlay(host='100.64.1.1')
         live = {'ssh': [{'action': 'check', 'src': ['autogroup:member'], 'dst': ['autogroup:self'],
                          'users': ['autogroup:nonroot']}]}
         self.config.unlink()
@@ -175,6 +170,9 @@ class WrapperTests(unittest.TestCase):
             self.execute_overlay(overlay)
         data = json.loads(self.config.read_text())
         self.assertEqual(data['policy']['hosts']['durop-host'], '100.64.1.1')
+        self.assertEqual(data['policy']['grants'],
+                         [{'src': ['autogroup:shared'], 'dst': ['durop-host'], 'ip': ['tcp:48732']}])
+        self.assertNotIn('groups', data['policy'])
         self.assertEqual(data['policy']['ssh'], live['ssh'])
         self.assertNotIn('magic_dns', data)
         self.assertEqual(json.loads((self.state / 'fetched-acl.json').read_text()), live)
@@ -195,8 +193,7 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(self.calls[-1][-2:], ['show', str(self.state / 'reviewed.tfplan')])
 
     def test_ensure_refuses_to_clobber_existing_config(self):
-        overlay = main.DuropOverlay(host='100.64.1.1', controllers=('host@example.com',),
-                                    unauthorized='guest@example.com')
+        overlay = main.DuropOverlay(host='100.64.1.1')
         original = self.config.read_text()
         with patch('main.fetch_live_policy', return_value={}):
             with self.assertRaisesRegex(ValueError, 'replace-config'):
@@ -205,8 +202,7 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_ensure_replace_config_overwrites_local_file(self):
-        overlay = main.DuropOverlay(host='100.64.1.1', controllers=('host@example.com',),
-                                    unauthorized='guest@example.com', replace_config=True)
+        overlay = main.DuropOverlay(host='100.64.1.1', replace_config=True)
         with patch('main.fetch_live_policy', return_value={}):
             self.execute_overlay(overlay)
         self.assertEqual(json.loads(self.config.read_text())['policy']['hosts']['durop-host'], '100.64.1.1')

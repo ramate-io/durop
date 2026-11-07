@@ -16,9 +16,6 @@
         let
           pkgs = import nixpkgs { inherit system; overlays = [ (import rust-overlay) ]; };
         in {
-          infrastructure = pkgs.mkShell {
-            packages = with pkgs; [ python312 uv nodejs_24 opentofu tailscale ];
-          };
           default = pkgs.mkShell {
             packages = with pkgs; [
               (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)

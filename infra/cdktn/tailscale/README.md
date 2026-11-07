@@ -1,33 +1,31 @@
 # Tailscale infrastructure reference
 
 Start with the role-based [Tailnet quickstart](../../../docs/tailnet-quickstart.md).
-`infra/manage.py` is the single infrastructure CLI. Typed CDK Terrain constructs
-manage the complete policy of an **existing** tailnet, plus MagicDNS only when
-explicitly configured. OpenTofu deploys with persistent local state. Nothing here
-creates a cloud playback server, enrolls a Mac, invites users or generates Durop
-session pairing credentials.
+`python main.py` is the infrastructure CLI under uv, matching other Terrain
+stacks. Typed CDK Terrain constructs manage the complete policy of an
+**existing** tailnet, plus MagicDNS only when explicitly configured. OpenTofu
+deploys with persistent local state. Nothing here creates a cloud playback
+server, enrolls a Mac, invites users or generates Durop session pairing
+credentials.
 
 ## Toolchain and commands
 
-From the checkout root:
+From `nix develop`:
 
 ```sh
-nix develop .#infrastructure
-python infra/manage.py setup durop-network
-python -m unittest discover -s scripts/tests -v
-uv --directory infra/cdktn/tailscale run --locked --no-sync python -m unittest discover -s tests -v
-python infra/manage.py synth durop-network --no-env --config infra/cdktn/tailscale/network.config.example.json
-python infra/manage.py validate durop-network --no-env --config infra/cdktn/tailscale/network.config.example.json
+cd infra/cdktn/tailscale
+uv sync --locked
+uv run --locked --no-sync python main.py setup --no-env
+python -m unittest discover -s ../../../scripts/tests -v
+uv run --locked --no-sync python -m unittest discover -s tests -v
+uv run --locked --no-sync python main.py synth --no-env --config network.config.example.json
+uv run --locked --no-sync python main.py validate --no-env --config network.config.example.json
 ```
 
-The manager is independent of the current directory. Defaults resolve against its
-own checkout; explicitly supplied relative paths resolve against the caller's
-working directory. Commands require the explicit `durop-network` stack. `setup`
-syncs locked Python/npm dependencies and regenerates bindings; it may download
-dependencies, but performs no Tailscale operations. Other commands enter the
-locked uv runtime automatically unless already running in the project's virtual
-environment. If that environment is missing, they run `setup` first. Runtime
-re-entry uses `--no-sync`.
+Defaults resolve against this directory; explicitly supplied relative paths
+resolve against the caller's working directory. `setup` syncs locked Python/npm
+dependencies and regenerates bindings; it may download dependencies, but
+performs no Tailscale operations. Runtime commands use `uv run --locked --no-sync`.
 
 | Command | Effect |
 | --- | --- |
@@ -39,13 +37,13 @@ re-entry uses `--no-sync`.
 | `show` | Verify fingerprints and display the exact saved plan. |
 | `apply` | Consume the saved review and apply only that plan. |
 | `status` | Show backend location, tracked addresses and saved-plan presence. |
-| `ensure` | Fetch the live ACL, merge Durop grants when flags are passed, import, plan and show. |
+| `ensure` | Fetch the live ACL, merge Durop grants when `--host` is passed, import, plan and show. |
 
 `import`, `plan`, `apply` and `ensure` are live operator actions and require explicit OAuth
 credentials and tailnet. No test or shell entry runs them against Tailscale.
 `validate`, `show` and `status` initialize OpenTofu and may download the locked
 provider; status inspects local ownership, not live connectivity or policy drift.
-The wrapper has no destroy command.
+The CLI has no destroy command.
 
 The committed `flake.lock` pins Python 3.12.13, Node 24.15.0, uv 0.11.16 and
 OpenTofu 1.11.8. Both Nix shells also include the open-source Tailscale CLI.
@@ -63,11 +61,12 @@ qualification passed on both platforms; no live plan/apply was performed.
 
 ## Complete policy and optional DNS ownership
 
-`ensure` downloads the live ACL as ordinary JSON (`Accept: application/json`),
-writes a private `fetched-acl.json` next to state, merges Durop host/group/port
-grants and tests, and saves ignored `network.config.json`. Pass `--host`,
-`--controller` (repeatable) and `--unauthorized`. Synthesis still never fetches
-or merges; only this operator command talks to the ACL API before generating
+`ensure --host` downloads the live ACL as ordinary JSON (`Accept: application/json`),
+writes a private `fetched-acl.json` next to state, names `durop-host`, grants
+`autogroup:shared` TCP 48732, and saves ignored `network.config.json`. Repeatable
+`--member` emails are optional same-tailnet users; device-share guests are not
+listed. Optional `--deny` adds a reject test. Synthesis still never fetches or
+merges; only this operator command talks to the ACL API before generating
 OpenTofu JSON. Unrelated grants, ACLs, SSH rules, tests, tags and posture rules
 are preserved. A conflicting `durop-host` address is refused. An existing local
 config that differs from the merge is refused unless `--replace-config` is set.
@@ -76,7 +75,7 @@ replacing a real policy with it would remove unrelated access. Existing broad
 grants remain effective. Skip `ensure`/`apply` when you do not want CDKTN to own
 policy and TCP 48732 already works.
 
-The dedicated sample includes both a same-tailnet controller group and a narrow
+The dedicated sample includes both a same-tailnet member group and a narrow
 `autogroup:shared` → `durop-host` / `tcp:48732` grant. The latter covers users who
 accepted a share of this device; the group alone does not admit shared guests.
 It grants only the Durop port on the named host and does not share additional

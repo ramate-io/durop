@@ -35,16 +35,19 @@ class FakeResponse:
 
 class PolicyTests(unittest.TestCase):
     def setUp(self):
-        self.overlay = DuropOverlay(host='100.64.1.1', controllers=('host@example.com',),
-                                    unauthorized='guest@example.com')
+        self.overlay = DuropOverlay(host='100.64.1.1', members=('host@example.com',),
+                                    deny='guest@example.com')
 
-    def test_overlay_flags_require_the_complete_set(self):
+    def test_overlay_flags_host_only_is_enough(self):
         self.assertIsNone(overlay_from_flags(None, None, None, False))
-        with self.assertRaisesRegex(ValueError, 'ensure requires --host'):
-            overlay_from_flags('100.64.1.1', None, None, False)
-        built = overlay_from_flags('100.64.1.1', ['a@b.co'], 'c@d.co', True)
+        with self.assertRaisesRegex(ValueError, '--host is the playback Mac'):
+            overlay_from_flags(None, ['a@b.co'], None, False)
+        built = overlay_from_flags('100.64.1.1', None, None, False)
         self.assertEqual(built.host, '100.64.1.1')
-        self.assertTrue(built.replace_config)
+        self.assertEqual(built.members, ())
+        self.assertIsNone(built.deny)
+        replaced = overlay_from_flags('100.64.1.1', ['a@b.co'], 'c@d.co', True)
+        self.assertTrue(replaced.replace_config)
 
     def test_merge_preserves_unrelated_rules_and_is_idempotent(self):
         live = {
@@ -60,14 +63,22 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(first['ssh'], live['ssh'])
         self.assertEqual(first['acls'], live['acls'])
         self.assertEqual(first['hosts']['durop-host'], '100.64.1.1')
-        self.assertEqual(first['groups']['group:durop-controllers'], ['host@example.com'])
+        self.assertEqual(first['groups']['group:durop-members'], ['host@example.com'])
         grants = {(tuple(grant['src']), tuple(grant['dst']), tuple(grant['ip'])) for grant in first['grants']}
         self.assertEqual(grants, {
-            (('group:durop-controllers',), ('durop-host',), ('tcp:48732',)),
+            (('group:durop-members',), ('durop-host',), ('tcp:48732',)),
             (('autogroup:shared',), ('durop-host',), ('tcp:48732',)),
         })
         with tempfile.TemporaryDirectory() as tmp:
             Settings.parse(json.loads(config_document(first)), Path(tmp))
+
+    def test_host_only_merge_grants_shared_guests_without_a_member_group(self):
+        merged = merge_durop({}, DuropOverlay(host='100.64.1.1'))
+        self.assertEqual(merged['hosts']['durop-host'], '100.64.1.1')
+        self.assertNotIn('groups', merged)
+        self.assertEqual(merged['grants'],
+                         [{'src': ['autogroup:shared'], 'dst': ['durop-host'], 'ip': ['tcp:48732']}])
+        self.assertNotIn('tests', merged)
 
     def test_conflicting_host_alias_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'different address'):

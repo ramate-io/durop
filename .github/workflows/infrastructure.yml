@@ -17,12 +17,14 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@v17
       - name: Validate locked bindings, infrastructure tests and synthesized schema
         run: |
-          nix develop .#infrastructure --command bash -euc '
-            python infra/manage.py setup durop-network --no-env
-            git diff --exit-code -- infra/cdktn/tailscale/imports infra/cdktn/tailscale/.terraform.lock.hcl
+          nix develop --command bash -euc '
             python -m unittest discover -s scripts/tests -v
-            uv --directory infra/cdktn/tailscale run --locked --no-sync python -m unittest discover -s tests -v
-            python infra/manage.py synth durop-network --no-env --config infra/cdktn/tailscale/network.config.example.json
-            python infra/manage.py validate durop-network --no-env --config infra/cdktn/tailscale/network.config.example.json
+            cd infra/cdktn/tailscale
+            uv sync --locked
+            uv run --locked --no-sync python main.py setup --no-env
+            git diff --exit-code -- imports .terraform.lock.hcl
+            uv run --locked --no-sync python -m unittest discover -s tests -v
+            uv run --locked --no-sync python main.py synth --no-env --config network.config.example.json
+            uv run --locked --no-sync python main.py validate --no-env --config network.config.example.json
             tailscale version
           '

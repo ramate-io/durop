@@ -1,4 +1,7 @@
-"""Internal lifecycle operations for infra/manage.py; apply consumes one saved plan."""
+"""Durop tailnet CLI. uv run --locked --no-sync python main.py <command>."""
+from __future__ import annotations
+
+import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -7,13 +10,17 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
+from env import load_env
 from network import synthesize
-from policy import DuropOverlay, config_document, fetch_live_policy, merge_durop
+from policy import DuropOverlay, config_document, fetch_live_policy, merge_durop, overlay_from_flags
 from settings import Settings
 
 ROOT = Path(__file__).resolve().parent
+REPO = ROOT.parents[2]
 STACK = 'durop-network'
+COMMANDS = ('setup', 'synth', 'validate', 'import', 'plan', 'show', 'apply', 'status', 'ensure')
 
 
 def digest(path: Path) -> str:
@@ -28,13 +35,12 @@ def tofu(stack_dir: Path, *args: str) -> None:
 
 def fingerprint(config: Path, state_dir: Path, stack_dir: Path) -> str:
     """Bind a saved plan to all authored, generated, locked and target inputs."""
-    paths = [ROOT / n for n in ('main.py', 'network.py', 'settings.py', 'policy.py', 'pyproject.toml',
+    paths = [ROOT / n for n in ('main.py', 'network.py', 'settings.py', 'policy.py', 'env.py', 'pyproject.toml',
              'uv.lock', 'package.json', 'package-lock.json', 'cdktf.json', '.terraform.lock.hcl', '.python-version', '.node-version')]
     paths += sorted((ROOT / 'imports').rglob('*.py')) + sorted((ROOT / 'imports').rglob('*.tgz'))
     paths += sorted((ROOT / 'imports').glob('*.json'))
     values = {str(p.relative_to(ROOT)): digest(p) for p in paths}
-    values.update({name: digest(ROOT.parents[2] / name) for name in ('flake.nix', 'flake.lock')})
-    values['manager'] = digest(ROOT.parents[1] / 'manage.py')
+    values.update({name: digest(REPO / name) for name in ('flake.nix', 'flake.lock')})
     values.update(config=digest(config), state=str(state_dir),
                   generated=digest(stack_dir / 'cdk.tf.json'),
                   provider_target=hashlib.sha256(json.dumps({name: os.environ.get(name, '') for name in ('TAILSCALE_TAILNET', 'TAILSCALE_BASE_URL', 'TAILSCALE_OAUTH_CLIENT_ID')}, sort_keys=True).encode()).hexdigest())
@@ -52,17 +58,24 @@ def operator_lock(state_dir: Path):
         yield
 
 
+def setup() -> None:
+    """Install locked dependencies and regenerate the committed provider bindings."""
+    subprocess.run(['uv', 'sync', '--locked', '--project', str(ROOT)], check=True)
+    subprocess.run(['npm', 'ci', '--ignore-scripts'], cwd=ROOT, check=True)
+    subprocess.run(['npm', 'exec', '--', 'cdktn', 'get'], cwd=ROOT,
+                   env={**os.environ, 'TERRAFORM_BINARY_NAME': 'tofu'}, check=True)
+
+
 def execute(command: str, config: Path, state_dir: Path, output: Path,
             overlay: DuropOverlay | None = None) -> None:
     """Execute a single stack lifecycle step without replacing reviewed apply inputs."""
     state_dir, output, config = state_dir.expanduser().resolve(), output.resolve(), config.resolve()
-    repo = ROOT.parents[2]
-    if state_dir == repo or repo in state_dir.parents or state_dir == output or output in state_dir.parents:
+    if state_dir == REPO or REPO in state_dir.parents or state_dir == output or output in state_dir.parents:
         raise ValueError('state/plans must live outside the checkout and generated output')
     if command not in {'synth', 'validate', 'import', 'plan', 'show', 'apply', 'status', 'ensure'}:
         raise ValueError('unknown lifecycle command')
     if overlay is not None and command != 'ensure':
-        raise ValueError('Durop overlay flags are only valid with ensure')
+        raise ValueError('host/member flags are only valid with ensure')
     if command in {'import', 'plan', 'apply', 'ensure'}:
         for name in ('TAILSCALE_TAILNET', 'TAILSCALE_OAUTH_CLIENT_ID', 'TAILSCALE_OAUTH_CLIENT_SECRET'):
             if not os.environ.get(name, '').strip():
@@ -121,7 +134,7 @@ def _write_ensured_config(config: Path, state_dir: Path, overlay: DuropOverlay |
     """Materialize complete desired state from the live ACL when merging, else require a file."""
     if overlay is None:
         if not config.is_file():
-            raise ValueError('ensure requires --host, --controller and --unauthorized, or an existing configuration')
+            raise ValueError('ensure requires --host, or an existing configuration')
         return
     live = fetch_live_policy()
     (state_dir / 'fetched-acl.json').write_text(json.dumps(live, sort_keys=True, indent=2) + '\n')
@@ -146,3 +159,45 @@ def _import_unowned(stack_dir: Path, state_dir: Path, settings: Settings) -> Non
     for address, resource_id in resources:
         if address not in owned:
             tofu(stack_dir, 'import', '-input=false', address, resource_id)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse one public CLI; run under `uv run --locked --no-sync` like other Terrain stacks."""
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=COMMANDS)
+    env = parser.add_mutually_exclusive_group()
+    env.add_argument('--env-file', type=Path, help='literal dotenv file; defaults to checkout root .env')
+    env.add_argument('--no-env', action='store_true', help='do not load a dotenv file')
+    parser.add_argument('--config', type=Path, default=ROOT / 'network.config.json')
+    parser.add_argument('--state-dir', type=Path, help='private persistent backend outside the checkout')
+    parser.add_argument('--output', type=Path, default=ROOT / 'cdktf.out')
+    parser.add_argument('--host', help='playback Mac Tailscale IP or prefix for hosts.durop-host')
+    parser.add_argument('--member', action='append',
+                        help='optional same-tailnet user email allowed on TCP 48732; guests use device sharing')
+    parser.add_argument('--deny', help='optional email that policy tests must reject on TCP 48732')
+    parser.add_argument('--replace-config', action='store_true',
+                        help='overwrite network.config.json when ensure merges the live ACL')
+    args = parser.parse_args(argv)
+    try:
+        if not args.no_env:
+            load_env(args.env_file.expanduser().resolve() if args.env_file else REPO / '.env',
+                     required=args.env_file is not None)
+        # The host's invitation token must never become provisioner authentication.
+        os.environ.pop('TAILSCALE_API_KEY', None)
+        if args.command != 'ensure' and (args.host or args.member or args.deny or args.replace_config):
+            raise ValueError('host/member flags are only valid with ensure')
+        if args.command == 'setup':
+            setup()
+            return 0
+        state = args.state_dir or Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'durop/tailscale'
+        overlay = overlay_from_flags(args.host, args.member, args.deny, args.replace_config) if args.command == 'ensure' else None
+        execute(args.command, args.config, state, args.output, overlay=overlay)
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f'{args.command} failed: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

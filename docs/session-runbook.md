@@ -41,8 +41,8 @@ remote Git LFS materialization are supported. See [pack format](packs.md).
 
 ## Host and remote controller
 
-Start with the [Tailnet quickstart](tailnet-quickstart.md) for OAuth, `manage.py
-ensure`, the Tailscale macOS app and the complete Durop pairing flow.
+Start with the [Tailnet quickstart](tailnet-quickstart.md) for OAuth, `uv run
+python main.py ensure`, the Tailscale macOS app and the complete Durop pairing flow.
 
 Install and authorize Tailscale separately on both Macs. Keep each device owned
 by its user. Guests can stay in their own tailnets and accept a share of the

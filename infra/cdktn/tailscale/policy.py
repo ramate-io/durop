@@ -11,7 +11,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 HOST_ALIAS = 'durop-host'
-CONTROLLER_GROUP = 'group:durop-controllers'
+MEMBER_GROUP = 'group:durop-members'
 PORT = 'tcp:48732'
 ACCEPT = f'{HOST_ALIAS}:48732'
 DEFAULT_API = 'https://api.tailscale.com'
@@ -19,28 +19,27 @@ DEFAULT_API = 'https://api.tailscale.com'
 
 @dataclass(frozen=True)
 class DuropOverlay:
-    """Operator-supplied identities for the Durop host, controllers and deny test."""
+    """Playback host address plus optional same-tailnet members and a deny-test identity."""
 
     host: str
-    controllers: tuple[str, ...]
-    unauthorized: str
+    members: tuple[str, ...] = ()
+    deny: str | None = None
     replace_config: bool = False
 
 
 def overlay_from_flags(
     host: str | None,
-    controllers: list[str] | None,
-    unauthorized: str | None,
+    members: list[str] | None,
+    deny: str | None,
     replace_config: bool,
 ) -> DuropOverlay | None:
-    """Build an overlay when any merge flag is present; require the complete set."""
-    controllers = list(controllers or [])
-    if not host and not controllers and not unauthorized and not replace_config:
+    """Build an overlay from ensure flags. Only --host is required to merge."""
+    members = list(members or [])
+    if not host and not members and not deny and not replace_config:
         return None
-    if not host or not controllers or not unauthorized:
-        raise ValueError('ensure requires --host, --controller and --unauthorized to merge Durop grants')
-    return DuropOverlay(host=host, controllers=tuple(controllers),
-                        unauthorized=unauthorized, replace_config=replace_config)
+    if not host:
+        raise ValueError('ensure --host is the playback Mac Tailscale address; --member and --deny are optional')
+    return DuropOverlay(host=host, members=tuple(members), deny=deny, replace_config=replace_config)
 
 
 def fetch_live_policy() -> dict[str, Any]:
@@ -64,7 +63,8 @@ def fetch_live_policy() -> dict[str, Any]:
 def merge_durop(policy: dict[str, Any], overlay: DuropOverlay) -> dict[str, Any]:
     """Return a complete policy with Durop grants inserted; preserve unrelated sections.
 
-    Existing `durop-host` or grants are left in place when they already match.
+    Always names the playback host and grants `autogroup:shared` TCP 48732 access.
+    `--member` emails are same-tailnet users only; device-share guests are not listed.
     A conflicting host address is refused rather than overwritten.
     """
     merged = deepcopy(policy)
@@ -76,26 +76,32 @@ def merge_durop(policy: dict[str, Any], overlay: DuropOverlay) -> dict[str, Any]
     if current is not None and current != overlay.host:
         raise ValueError('hosts.durop-host already maps to a different address')
     hosts[HOST_ALIAS] = overlay.host
-    members = list(groups.get(CONTROLLER_GROUP) or [])
-    for email in overlay.controllers:
-        if email not in members:
-            members.append(email)
-    groups[CONTROLLER_GROUP] = members
-    for source in ([CONTROLLER_GROUP], ['autogroup:shared']):
-        grant = {'src': source, 'dst': [HOST_ALIAS], 'ip': [PORT]}
-        if not any(_same_grant(existing, grant) for existing in grants):
-            grants.append(grant)
-    for email in overlay.controllers:
-        test = {'src': email, 'accept': [ACCEPT]}
-        if not any(_same_mapping(existing, test) for existing in tests):
-            tests.append(test)
-    deny = {'src': overlay.unauthorized, 'deny': [ACCEPT]}
-    if not any(_same_mapping(existing, deny) for existing in tests):
-        tests.append(deny)
-    merged['groups'] = groups
+    shared = {'src': ['autogroup:shared'], 'dst': [HOST_ALIAS], 'ip': [PORT]}
+    if not any(_same_grant(existing, shared) for existing in grants):
+        grants.append(shared)
+    if overlay.members:
+        existing_members = list(groups.get(MEMBER_GROUP) or [])
+        for email in overlay.members:
+            if email not in existing_members:
+                existing_members.append(email)
+        groups[MEMBER_GROUP] = existing_members
+        member_grant = {'src': [MEMBER_GROUP], 'dst': [HOST_ALIAS], 'ip': [PORT]}
+        if not any(_same_grant(existing, member_grant) for existing in grants):
+            grants.append(member_grant)
+        for email in overlay.members:
+            test = {'src': email, 'accept': [ACCEPT]}
+            if not any(_same_mapping(existing, test) for existing in tests):
+                tests.append(test)
+    if overlay.deny:
+        deny = {'src': overlay.deny, 'deny': [ACCEPT]}
+        if not any(_same_mapping(existing, deny) for existing in tests):
+            tests.append(deny)
     merged['hosts'] = hosts
     merged['grants'] = grants
-    merged['tests'] = tests
+    if groups:
+        merged['groups'] = groups
+    if tests:
+        merged['tests'] = tests
     return merged
 
 

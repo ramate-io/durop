@@ -20,7 +20,7 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(shared[0]['dst'], ['durop-host'])
         self.assertEqual(shared[0]['ip'], ['tcp:48732'])
         self.assertEqual({tuple(grant['src']) for grant in grants},
-                         {('group:durop-controllers',), ('autogroup:shared',)})
+                         {('group:durop-members',), ('autogroup:shared',)})
         self.assertTrue(all(grant['dst'] == ['durop-host'] and grant['ip'] == ['tcp:48732']
                             for grant in grants))
         self.assertTrue(all(member.endswith('@example.com')

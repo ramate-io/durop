@@ -1,6 +1,6 @@
 {
   "language": "python",
-  "app": "uv run --locked --no-sync python ../../manage.py synth durop-network --no-env",
+  "app": "uv run --locked --no-sync python main.py synth --no-env",
   "codeMakerOutput": "imports",
   "terraformProviders": [
     "tailscale/tailscale@=0.29.2"
