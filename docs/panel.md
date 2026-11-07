@@ -10,6 +10,10 @@ The top row contains **From**, **To**, **Catalog** and search. At compact widths
 moves below the selectors. Cards show real PNG previews, titles, media kinds
 and playback controls; the responsive grid renders only visible rows plus a partial
 row. Wheel/trackpad scrolling and the draggable scrollbar reach the whole collection.
+The desktop toolbar is 68 logical pixels tall; compact windows wrap complete control
+rows. Search and collection updates preserve the surrounding controls and their text
+selection. Form separators sit outside the scrolling viewport so the last action can
+scroll fully into view.
 The collection uses Bevy UI’s `ScrollPosition` and vertical scroll overflow.
 Trackpad movement updates a continuous logical-pixel offset, including fractional
 deltas and OS-provided momentum; there are no row thresholds or snapping. Mouse
@@ -140,3 +144,11 @@ Command+A/C/X/V, and copying both a card title and a wrapped form paragraph into
 search. Long titles wrap and section rules remain visible. Desktop and compact
 viewport bounds also run through Bevy layout tests; native IME candidate-window
 and standalone distribution acceptance remain separate from these checks.
+
+Regression checks use the bundled fonts and Bevy's text measurement and glyph layout,
+not just empty layout boxes. They inspect each frame's text geometry and render-camera
+assignment through search edits and virtual-row changes. This catches the transient
+camera loss caused by detaching retained text before replacing its ancestors.
+The updated native preview confirmed the 68-pixel toolbar, 46-pixel form fields,
+repeated search edits and selection, and fixed surrounding controls across multiple
+virtual-row scroll boundaries. Draft and Git form footer actions remained fully visible.

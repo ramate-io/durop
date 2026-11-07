@@ -313,11 +313,22 @@ impl Default for GridLayout {
 }
 
 impl GridLayout {
+    /// Reserve complete toolbar rows before estimating the first collection viewport.
+    fn toolbar_height(width: f32) -> f32 {
+        if width < 534. {
+            228.
+        } else if width < 840. {
+            148.
+        } else {
+            68.
+        }
+    }
+
     /// Fit large previews while allowing one-column compact windows and six-column wide windows.
     fn for_window(width: f32, height: f32) -> Self {
         let available = (width - 78.).max(180.);
         let columns = ((available + 20.) / 250.).floor().clamp(1., 6.) as usize;
-        let toolbar_extra = if width < 820. { 80. } else { 0. };
+        let toolbar_extra = Self::toolbar_height(width) - 68.;
         let viewport = (height - 296. - toolbar_extra).max(134.);
         let card_height = viewport.min(282.);
         let rows = ((viewport + 20.) / (card_height + 20.))

@@ -34,18 +34,28 @@ fn prepare_editor(
     fonts: &Fonts,
 ) -> Entity {
     if let Some(entity) = editor.entity {
-        // Detach before the old parent is recursively despawned. The new view reattaches it.
-        commands.entity(entity).remove::<ChildOf>();
+        // A refreshed region reparents this editor before retiring its previous parent.
         return entity;
     }
+    // Toolbar search shares the outer selector surface; modal editors own their field frame.
+    let search = field == Field::Search;
+    let height = if search { 24. } else { 46. };
     let mut input = commands.spawn((
         InputField(field),
         Node {
             width: percent(100),
             min_width: px(0),
-            min_height: px(46),
-            padding: UiRect::axes(px(14), px(13)),
-            border: UiRect::all(px(1)),
+            // Explicit border-box bounds avoid TextInputMeasure adding padding to its
+            // minimum content height, which otherwise expands this editor by 28 pixels.
+            height: px(height),
+            min_height: px(height),
+            max_height: px(height),
+            padding: if search {
+                UiRect::ZERO
+            } else {
+                UiRect::axes(px(14), px(13))
+            },
+            border: UiRect::all(px(if search { 0. } else { 1. })),
             border_radius: BorderRadius::all(px(5)),
             overflow: Overflow::clip(),
             ..default()
@@ -53,7 +63,11 @@ fn prepare_editor(
         fonts.mono(13.),
         TextColor(theme::INK),
         TextLayout::no_wrap(),
-        BackgroundColor(theme::BACKGROUND),
+        BackgroundColor(if search {
+            theme::PAPER
+        } else {
+            theme::BACKGROUND
+        }),
         BorderColor::all(theme::RULE),
         TabIndex(match field {
             Field::Search => 0,
@@ -83,7 +97,7 @@ fn prepare_editor(
     entity
 }
 
-/// Detach retained fields and retire fields whose owning modal/draft no longer exists.
+/// Retain live fields for direct reparenting and retire fields whose owning draft no longer exists.
 pub(super) fn prepare(
     commands: &mut Commands,
     model: &mut Model,
@@ -484,10 +498,17 @@ pub(super) fn dispatch_keyboard(world: &mut World) {
 pub(super) fn request_redraw(
     model: Res<Model>,
     mut previous: Local<Option<(u64, Option<Field>)>>,
+    catalogs: Query<&ComputedNode, With<CatalogBody>>,
     mut redraw: MessageWriter<bevy::window::RequestRedraw>,
 ) {
     let current = (model.revision, model.focus);
-    if previous.as_ref() != Some(&current) {
+    // Initial layout and resizing are measured after Update. Wake exactly until the next
+    // Update has copied the actual viewport bounds into the virtualized collection model.
+    let viewport_changed = catalogs.iter().any(|node| {
+        let height = node.size().y * node.inverse_scale_factor();
+        height > 0. && (height - model.viewport_height).abs() > 0.01
+    });
+    if previous.as_ref() != Some(&current) || viewport_changed {
         *previous = Some(current);
         redraw.write(bevy::window::RequestRedraw);
     }

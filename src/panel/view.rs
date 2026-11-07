@@ -32,22 +32,19 @@ struct SelectableText {
 /// Reuse unchanged labels once per render and retire every unused display value.
 #[derive(Default)]
 pub(super) struct SelectableTexts {
-    /// Labels detached from the previous hierarchy and available for reuse.
+    /// Labels in the previous region hierarchy and available for direct reparenting.
     available: HashMap<SelectableKey, Vec<SelectableText>>,
     /// Labels attached to the current hierarchy, including duplicate values.
     used: HashMap<SelectableKey, Vec<SelectableText>>,
 }
 
 impl SelectableTexts {
-    /// Detach before recursive root teardown so selection survives unrelated updates.
-    fn prepare(&mut self, commands: &mut Commands) {
+    /// Stage unchanged labels for direct reparenting within their persistent region.
+    fn prepare(&mut self) {
         self.available = std::mem::take(&mut self.used);
         // Reuse identical labels in render order so focus stays on the same occurrence.
         for labels in self.available.values_mut() {
             labels.reverse();
-        }
-        for label in self.available.values().flatten() {
-            commands.entity(label.root).remove::<ChildOf>();
         }
     }
 
@@ -116,7 +113,7 @@ impl View<'_> {
             parent
                 .commands()
                 .entity(parent_entity)
-                .add_child(label.root);
+                .insert_child(usize::MAX, label.root);
             label
         } else {
             let font = if display {
@@ -290,7 +287,9 @@ impl View<'_> {
                         UiAction::Dropdown(menu),
                         Node {
                             width: percent(100),
+                            height: px(68),
                             min_height: px(68),
+                            max_height: px(68),
                             padding: UiRect::axes(px(16), px(11)),
                             border: UiRect::all(px(1)),
                             border_radius: BorderRadius::all(px(6)),
@@ -1055,6 +1054,7 @@ impl View<'_> {
                 .with_children(|dialog| {
                     dialog
                         .spawn(Node {
+                            flex_shrink: 0.,
                             justify_content: JustifyContent::SpaceBetween,
                             align_items: AlignItems::Center,
                             ..default()
@@ -1064,16 +1064,17 @@ impl View<'_> {
                             self.button(heading, "Close ×", UiAction::Cancel, false);
                         });
                     self.label(dialog, subtitle, 12., MUTED);
+                    // Keep decoration outside the viewport so its size is the exact
+                    // scrollable content height used when clamping the last action into view.
+                    self.rule(dialog);
                     dialog
                         .spawn((
                             ModalBody,
-                            BorderColor::all(RULE),
                             ScrollPosition(Vec2::new(0., modal.scroll)),
                             Node {
                                 width: percent(100),
                                 min_height: px(0),
-                                border: UiRect::top(px(1)),
-                                padding: UiRect::top(px(22)),
+                                flex_direction: FlexDirection::Column,
                                 overflow: Overflow::scroll_y(),
                                 ..default()
                             },
@@ -1132,10 +1133,351 @@ impl View<'_> {
     }
 }
 
-/// Rebuild only when visible state changes, keeping secret values out of invalidation fingerprints.
+/// Stable ownership boundaries keep unrelated UI text attached while another region changes.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RegionKind {
+    /// Application name and optional tagline.
+    Brand,
+    /// Provider selectors and the persistent search editor.
+    Header,
+    /// Collection heading and match count.
+    Section,
+    /// Virtualized collection rows inside the persistent viewport.
+    Collection,
+    /// Application status and emergency controls.
+    Footer,
+    /// Independently refreshed modal hierarchy.
+    Modal,
+}
+
+/// One persistent parent and the selectable text owned by its replaceable children.
+#[derive(Default)]
+struct RenderRegion {
+    /// Parent remains attached to the live UI camera across content refreshes.
+    root: Option<Entity>,
+    /// Only presentation state used by this region participates in invalidation.
+    signature: Option<String>,
+    /// Selection survives a region refresh by moving labels before old parents retire.
+    texts: SelectableTexts,
+}
+
+impl RenderRegion {
+    /// Construct the region under an already retained root.
+    fn spawn(commands: &mut Commands, parent: Entity, kind: RegionKind, node: Node) -> Self {
+        let root = commands.spawn((kind, node)).id();
+        commands.entity(parent).add_child(root);
+        Self {
+            root: Some(root),
+            ..default()
+        }
+    }
+
+    /// Report structural changes without treating text edits in another region as invalidation.
+    fn changed(&self, signature: &str) -> bool {
+        self.signature.as_deref() != Some(signature)
+    }
+
+    /// Reparent reusable leaves before despawning old scaffolds; the parent never loses its camera.
+    fn refresh(
+        &mut self,
+        commands: &mut Commands,
+        children: &Query<&Children>,
+        fonts: &Fonts,
+        focus: &mut InputFocus,
+        signature: String,
+        fill: impl FnOnce(&View, &mut ChildSpawnerCommands),
+    ) {
+        if !self.changed(&signature) {
+            return;
+        }
+        let root = self
+            .root
+            .expect("render regions are initialized before refresh");
+        let old_children: Vec<_> = children
+            .get(root)
+            .map(|children| children.iter().collect())
+            .unwrap_or_default();
+        self.texts.prepare();
+        // Direct child labels are retired by their cache, rather than by scaffold teardown.
+        let owned_labels: Vec<_> = self
+            .texts
+            .available
+            .values()
+            .flatten()
+            .map(|label| label.root)
+            .collect();
+        {
+            let view = View {
+                fonts,
+                texts: RefCell::new(&mut self.texts),
+            };
+            commands
+                .entity(root)
+                .with_children(|parent| fill(&view, parent));
+        }
+        self.texts.finish(commands, focus);
+        for child in old_children {
+            if !owned_labels.contains(&child) {
+                commands.entity(child).despawn();
+            }
+        }
+        self.signature = Some(signature);
+    }
+}
+
+/// Persistent chrome, viewport and modal parents; each cache owns only its region's labels.
+#[derive(Default)]
+pub(super) struct RenderRegions {
+    /// Brand typography never participates in query or scroll invalidation.
+    brand: RenderRegion,
+    /// Provider controls own the search editor's parent.
+    header: RenderRegion,
+    /// Match-count labels can change without changing toolbar geometry.
+    section: RenderRegion,
+    /// Only virtualized rows are replaced; viewport and scrollbar stay attached.
+    collection: RenderRegion,
+    /// Playback/network statuses do not rebuild input widgets.
+    footer: RenderRegion,
+    /// Ordinary draft edits leave the modal hierarchy intact.
+    modal: RenderRegion,
+    /// Thumb availability color follows collection extent without replacing its entity.
+    thumb: Option<Entity>,
+}
+
+impl RenderRegions {
+    /// Fixed toolbar bounds prevent the search editor from stretching its row.
+    fn header_node(height: f32) -> Node {
+        Node {
+            width: percent(100),
+            height: px(height),
+            min_height: px(height),
+            max_height: px(height),
+            flex_shrink: 0.,
+            column_gap: px(14),
+            row_gap: px(12),
+            flex_wrap: FlexWrap::Wrap,
+            align_items: AlignItems::Stretch,
+            ..default()
+        }
+    }
+
+    /// Build the stable layout once; future updates replace only the owning region's children.
+    fn initialize(
+        &mut self,
+        commands: &mut Commands,
+        root: Entity,
+        model: &Model,
+        toolbar_height: f32,
+    ) {
+        self.brand = RenderRegion::spawn(
+            commands,
+            root,
+            RegionKind::Brand,
+            Node {
+                height: px(32),
+                min_height: px(32),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        );
+        self.header = RenderRegion::spawn(
+            commands,
+            root,
+            RegionKind::Header,
+            Self::header_node(toolbar_height),
+        );
+        self.section = RenderRegion::spawn(
+            commands,
+            root,
+            RegionKind::Section,
+            Node {
+                width: percent(100),
+                height: px(24),
+                min_height: px(24),
+                margin: UiRect::top(px(4)),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        );
+        let collection = commands
+            .spawn(Node {
+                width: percent(100),
+                flex_grow: 1.,
+                flex_basis: px(0),
+                min_height: px(0),
+                column_gap: px(14),
+                overflow: Overflow::clip(),
+                ..default()
+            })
+            .id();
+        commands.entity(root).add_child(collection);
+        let body = commands
+            .spawn((
+                CatalogBody,
+                ScrollPosition(Vec2::new(0., model.scroll)),
+                Node {
+                    flex_grow: 1.,
+                    min_width: px(0),
+                    min_height: px(0),
+                    flex_direction: FlexDirection::Column,
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                },
+            ))
+            .id();
+        commands.entity(collection).add_child(body);
+        self.collection = RenderRegion::spawn(
+            commands,
+            body,
+            RegionKind::Collection,
+            Node {
+                width: percent(100),
+                flex_shrink: 0.,
+                flex_direction: FlexDirection::Column,
+                ..default()
+            },
+        );
+        let track = commands
+            .spawn((
+                Button,
+                Hovered::default(),
+                Scrollbar,
+                RelativeCursorPosition::default(),
+                Node {
+                    width: px(8),
+                    min_width: px(8),
+                    height: percent(100),
+                    border_radius: BorderRadius::all(px(4)),
+                    ..default()
+                },
+                BackgroundColor(YELLOW.with_alpha(0.22)),
+                Pickable::default(),
+            ))
+            .id();
+        commands.entity(collection).add_child(track);
+        let (top, height) = model.thumb_geometry(model.viewport_height());
+        let thumb = commands
+            .spawn((
+                ScrollThumb,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(top),
+                    height: px(height),
+                    width: percent(100),
+                    border_radius: BorderRadius::all(px(4)),
+                    ..default()
+                },
+                BackgroundColor(RULE),
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(track).add_child(thumb);
+        self.thumb = Some(thumb);
+        self.footer = RenderRegion::spawn(
+            commands,
+            root,
+            RegionKind::Footer,
+            Node {
+                min_height: px(40),
+                width: percent(100),
+                padding: UiRect::top(px(12)),
+                border: UiRect::top(px(1)),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                column_gap: px(12),
+                ..default()
+            },
+        );
+        commands
+            .entity(self.footer.root.unwrap())
+            .insert(BorderColor::all(RULE));
+        self.modal = RenderRegion::spawn(
+            commands,
+            root,
+            RegionKind::Modal,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                top: px(0),
+                width: percent(100),
+                height: percent(100),
+                ..default()
+            },
+        );
+        commands
+            .entity(self.modal.root.unwrap())
+            .insert(Pickable::IGNORE);
+    }
+
+    /// Fingerprint only modal structure, finite choices and displayed statuses, excluding secret values.
+    fn modal_signature(
+        model: &Model,
+        runtime: &Runtime,
+        network: &crate::network_app::NetworkState,
+    ) -> String {
+        let Some(modal) = &model.modal else {
+            return "closed".into();
+        };
+        let fields: Vec<_> = modal.editors.iter().map(|editor| editor.entity).collect();
+        let structure = match &modal.draft {
+            ModalDraft::Configuration(draft) => format!(
+                "{:?}|{:?}",
+                draft.provider,
+                draft
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| !field.choices.is_empty())
+                    .map(|(index, _)| (index, &modal.editors[index].text))
+                    .collect::<Vec<_>>()
+            ),
+            ModalDraft::Sources(sources) => {
+                let selection = match &sources.selection {
+                    SourceSelection::Local => "local".into(),
+                    SourceSelection::Remote(id) => format!("remote:{id}"),
+                    SourceSelection::ChooseType => "choose".into(),
+                    SourceSelection::NewRemote => "new".into(),
+                };
+                format!(
+                    "{selection}|{}|{:?}|{}|{}|{}|{}|{:?}",
+                    sources.details as u8,
+                    sources.pending.as_ref().map(|pending| &pending.name),
+                    network.local_enabled,
+                    network.hosting,
+                    network.listen_address,
+                    network.listener_hint(),
+                    network
+                        .controllers
+                        .iter()
+                        .map(|source| (
+                            &source.id,
+                            &source.name,
+                            source.enabled,
+                            source.pairing_secret.is_some(),
+                            source.invitation_url.is_some(),
+                            &source.invitation_status
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            }
+        };
+        format!(
+            "{structure}|{fields:?}|{:?}|{:?}|{:?}|{}|{}",
+            modal.error,
+            runtime.destination,
+            runtime.mode,
+            network.admin_status,
+            network.admin_secret_available
+        )
+    }
+}
+
+/// Refresh independent UI regions while preserving the live hierarchy around input and scrolling.
 #[expect(
     clippy::too_many_arguments,
-    reason = "The view combines read-only application state with its bounded caches"
+    reason = "The view combines read-only application state with bounded region caches"
 )]
 pub(super) fn render(
     mut commands: Commands,
@@ -1148,13 +1490,15 @@ pub(super) fn render(
     fonts: Res<Fonts>,
     primary: Single<&Window, With<PrimaryWindow>>,
     inputs: Query<Entity, With<input::InputField>>,
+    children: Query<&Children>,
     mut focus: ResMut<InputFocus>,
-    mut redraw: MessageWriter<bevy::window::RequestRedraw>,
-    mut texts: Local<SelectableTexts>,
+    mut regions: Local<RenderRegions>,
 ) {
     model.reconcile_sources(&network);
     let remote = runtime.destination == Destination::Remote;
-    let compact = primary.width() < 820.;
+    let compact = primary.width() < 840.;
+    // Three minimum-width selectors need another row below a 534-pixel window.
+    let toolbar_height = GridLayout::toolbar_height(primary.width());
     let provider_width = ((primary.width() - 84.) / 3.).max(150.);
     let preferences = crate::preferences::Preferences {
         pack: crate::preferences::Preferences::stored_pack(
@@ -1219,447 +1563,405 @@ pub(super) fn render(
         .ceil()
         .max(1.) as usize;
     model.scroll = model.scroll.clamp(0., model.max_scroll());
-    let signature = format!(
-        "{}|{:?}|{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        model.revision,
-        model.focus,
-        model.dropdown,
-        model.first_row(),
-        snapshot.sequence,
-        runtime.status,
-        runtime.catalog.revision,
-        model.matches,
-        runtime.destination,
-        runtime.enabled,
-        network.status,
-        network.connected,
-        network.remote_icons.len(),
-        primary.width(),
-        primary.height(),
+
+    let brand_signature = format!("{}", primary.width() >= 620.);
+    let header_signature = |model: &Model| {
+        format!(
+            "{:?}|{}|{}|{}|{}|{}|{:?}",
+            model.dropdown,
+            primary.width(),
+            remote,
+            runtime.pack_input,
+            Model::source_summary(
+                network.local_enabled,
+                network
+                    .controllers
+                    .iter()
+                    .filter(|source| source.enabled)
+                    .count()
+            ),
+            model.focus == Some(Field::Search),
+            model.query.entity
+        )
+    };
+    let section_signature = format!("{remote}|{}", model.matches);
+    let collection_signature = format!(
+        "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
         model.query.text,
-        network.hosting,
+        model.first_row(),
+        model.layout.columns,
         model.layout.rows,
-        model.viewport_height()
+        model.layout.card_width,
+        model.layout.card_height,
+        model.viewport_height(),
+        snapshot.sequence,
+        snapshot.catalog_revision,
+        runtime.catalog.revision,
+        network.remote_icons.len(),
+        runtime.loading,
+        runtime.errors.keys().collect::<Vec<_>>()
     );
+    let collection_signature = format!("{collection_signature}|{remote}|{}", network.connected);
+    let footer_signature = format!(
+        "{remote}|{}|{}|{}",
+        runtime.status, network.status, network.connected
+    );
+    let modal_signature = RenderRegions::modal_signature(&model, &runtime, &network);
     let signature = format!(
-        "{signature}|{}|{}|{}|{}|{:?}",
-        network.local_enabled,
-        network.listen_address,
-        network.admin_status,
-        network.admin_secret_available,
-        network
-            .controllers
-            .iter()
-            .map(|source| (
-                &source.id,
-                &source.name,
-                source.enabled,
-                source.pairing_secret.is_some(),
-                source.invitation_url.is_some(),
-                &source.invitation_status
-            ))
-            .collect::<Vec<_>>()
+        "{:?}",
+        (
+            &brand_signature,
+            header_signature(&model),
+            &section_signature,
+            &collection_signature,
+            &footer_signature,
+            &modal_signature
+        )
     );
     if signature == model.signature {
         return;
     }
-    // Reactive windows need a settling frame after replacing the UI hierarchy.
-    redraw.write(bevy::window::RequestRedraw);
-    model.signature = signature;
-    input::prepare(&mut commands, &mut model, &inputs, &fonts, &mut focus);
-    texts.prepare(&mut commands);
-    if let Some(root) = model.root.take() {
-        commands.entity(root).despawn();
+    // The root is never replaced for text edits, scroll travel or asynchronous status changes.
+    if model.root.is_none() {
+        let root = commands
+            .spawn((
+                Node {
+                    width: percent(100),
+                    height: percent(100),
+                    min_height: px(0),
+                    max_height: percent(100),
+                    padding: UiRect::all(px(28)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(18),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BackgroundColor(BACKGROUND),
+                UiTargetCamera(camera.0),
+                TabGroup::default(),
+            ))
+            .id();
+        model.root = Some(root);
+        regions.initialize(&mut commands, root, &model, toolbar_height);
     }
-    let root = commands
-        .spawn((
-            Node {
+    input::prepare(&mut commands, &mut model, &inputs, &fonts, &mut focus);
+    let header_signature = header_signature(&model);
+    let modal_signature = RenderRegions::modal_signature(&model, &runtime, &network);
+    if regions.header.changed(&header_signature) {
+        commands
+            .entity(regions.header.root.unwrap())
+            .insert(RenderRegions::header_node(toolbar_height));
+    }
+    let extent = model.content_height().max(model.viewport_height());
+    if regions.collection.changed(&collection_signature) {
+        commands
+            .entity(regions.collection.root.unwrap())
+            .insert(Node {
                 width: percent(100),
-                height: percent(100),
-                min_height: px(0),
-                max_height: percent(100),
-                padding: UiRect::all(px(28)),
+                height: px(extent),
+                min_height: px(extent),
+                flex_shrink: 0.,
                 flex_direction: FlexDirection::Column,
-                row_gap: px(18),
-                overflow: Overflow::clip(),
                 ..default()
-            },
-            BackgroundColor(BACKGROUND),
-            UiTargetCamera(camera.0),
-            TabGroup::default(),
-        ))
-        .id();
-    model.root = Some(root);
-    let view = View {
-        fonts: &fonts,
-        texts: RefCell::new(&mut texts),
-    };
-    commands.entity(root).with_children(|parent| {
-        parent
-            .spawn(Node {
-                height: px(32),
-                min_height: px(32),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                ..default()
-            })
-            .with_children(|brand| {
-                view.title(brand, "durop", 29., INK);
-                if primary.width() >= 620. {
-                    view.label(brand, "A LITTLE EXPRESSION, ON CUE.", 10., MUTED);
-                }
             });
-        parent
-            .spawn(Node {
-                width: percent(100),
-                min_height: px(if compact { 148. } else { 68. }),
-                column_gap: px(14),
-                row_gap: px(12),
-                flex_wrap: FlexWrap::Wrap,
-                align_items: AlignItems::Stretch,
-                ..default()
-            })
-            .with_children(|header| {
-                view.selector(
-                    header,
-                    "FROM",
-                    &Model::source_summary(network.local_enabled, network.controllers.iter().filter(|source| source.enabled).count()),
-                    Dropdown::From,
-                    false,
-                    if compact { provider_width.max(230.) } else { 230. },
-                );
-                view.selector(
-                    header,
-                    "TO",
-                    if remote { "Remote host" } else { "This Mac" },
-                    Dropdown::To,
-                    model.dropdown == Some(Dropdown::To),
-                    if compact { provider_width } else { 170. },
-                );
-                let catalog_label = if remote {
-                    "Remote catalog"
-                } else if runtime.pack_input.starts_with("https://") {
-                    "Git repository"
-                } else if runtime.pack_input == crate::app::Config::bundled_pack().to_string_lossy()
-                {
-                    "Durop reactions"
-                } else {
-                    "Local directory"
-                };
-                view.selector(
-                    header,
-                    "CATALOG",
-                    catalog_label,
-                    Dropdown::Catalog,
-                    model.dropdown == Some(Dropdown::Catalog),
-                    if compact { provider_width } else { 210. },
-                );
-                header
-                    .spawn((
-
-                        Node {
-                            flex_grow: 1.,
-                            width: if compact { percent(100) } else { auto() },
-                            min_height: px(68),
-                            min_width: px(130),
-                            padding: UiRect::axes(px(16), px(11)),
-                            border: UiRect::all(px(1)),
-                            border_radius: BorderRadius::all(px(6)),
-                            flex_direction: FlexDirection::Column,
-                            row_gap: px(6),
-                            justify_content: JustifyContent::Center,
-                            overflow: Overflow::clip(),
-                            ..default()
-                        },
-                        BackgroundColor(PAPER),
-                        BorderColor::all(if model.focus == Some(Field::Search) {
-                            PURPLE
-                        } else {
-                            RULE
-                        }),
-                        HoverColors {
-                            resting: PAPER,
-                            hovered: BACKGROUND,
-                        },
-                    ))
-                    .with_children(|search| {
-                        view.label(search, "SEARCH", 10., MUTED);
-                        view.input(search, &model.query);
-                    });
-            });
-        parent
-            .spawn(Node {
-                width: percent(100),
-                height: px(24),
-                min_height: px(24),
-                margin: UiRect::top(px(4)),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                ..default()
-            })
-            .with_children(|section| {
-                view.label(
-                    section,
-                    if remote {
-                        "REMOTE COLLECTION"
-                    } else {
-                        "YOUR COLLECTION"
-                    },
-                    10.,
-                    PURPLE,
-                );
-                view.label(section, format!("{} REACTIONS", model.matches), 10., MUTED);
-            });
-        parent
-            .spawn(Node {
-                width: percent(100),
-                flex_grow: 1.,
-                flex_basis: px(0),
-                min_height: px(0),
-                column_gap: px(14),
-                overflow: Overflow::clip(),
-                ..default()
-            })
-            .with_children(|collection| {
-                collection
-                    .spawn((
-                        CatalogBody,
-                        ScrollPosition(Vec2::new(0., model.scroll)),
-                        Node {
-                            flex_grow: 1.,
-                            min_width: px(0),
-                            min_height: px(0),
-                            flex_direction: FlexDirection::Column,
-                            overflow: Overflow::scroll_y(),
-                            ..default()
-                        },
-                    ))
-                    .with_children(|viewport| {
-                        // The full extent keeps native bounds stable while only nearby rows exist.
-                        viewport
-                            .spawn(Node {
-                                width: percent(100),
-                                height: px(model.content_height().max(model.viewport_height())),
-                                min_height: px(model.content_height().max(model.viewport_height())),
-                                flex_shrink: 0.,
-                                flex_direction: FlexDirection::Column,
-                                ..default()
-                            })
-                            .with_children(|grid| {
-                                let visible = model.visible(clips);
-                                if visible.is_empty() {
-                                    grid.spawn(Node {
-                                        width: percent(100),
-                                        flex_grow: 1.,
-                                        flex_direction: FlexDirection::Column,
-                                        align_items: AlignItems::Center,
-                                        justify_content: JustifyContent::Center,
-                                        row_gap: px(14),
-                                        ..default()
-                                    })
-                                    .with_children(|empty| {
-                                        view.title(
-                                            empty,
-                                            if runtime.loading {
-                                                "Gathering your collection…"
-                                            } else if remote && !network.connected {
-                                                "Connect your host"
-                                            } else {
-                                                "Nothing here, yet."
-                                            },
-                                            28.,
-                                            INK,
-                                        );
-                                        view.label(
-                                            empty,
-                                            if remote && !network.connected {
-                                                "Choose To → Remote host to enter its IP and Durop pairing token."
-                                            } else {
-                                                "Try another search or choose a catalog above."
-                                            },
-                                            12.,
-                                            MUTED,
-                                        );
-                                    });
-                                }
-                                for (row_index, indices) in
-                                    visible.chunks(model.layout.columns).enumerate()
-                                {
-                                    grid.spawn(Node {
-                                        position_type: PositionType::Absolute,
-                                        top: px((model.first_row() + row_index) as f32
-                                            * model.row_stride()),
-                                        width: percent(100),
-                                        height: px(model.layout.card_height),
-                                        column_gap: px(20),
-                                        min_height: px(model.layout.card_height),
-                                        ..default()
-                                    })
-                                    .with_children(|row| {
-                                        for index in indices {
-                                            let clip = &clips[*index];
-                                            let key = format!(
-                                                "{}:{}:{}:{}",
-                                                remote,
-                                                snapshot.catalog_revision,
-                                                clip.identity,
-                                                remote
-                                                    && network
-                                                        .remote_icons
-                                                        .contains_key(&clip.identity)
-                                            );
-                                            if !icons.0.contains_key(&key) {
-                                                let bytes = if remote {
-                                                    network
-                                                        .remote_icons
-                                                        .get(&clip.identity)
-                                                        .cloned()
-                                                } else {
-                                                    Icons::read_icon(&clip.icon_path).ok()
-                                                };
-                                                let handle = bytes
-                                                    .and_then(|bytes| {
-                                                        Icons::icon_image(&bytes).ok()
-                                                    })
-                                                    .map(|image| images.add(image));
-                                                if icons.0.len() >= 128 {
-                                                    let old =
-                                                        icons.0.keys().next().cloned().unwrap();
-                                                    if let Some(Some(handle)) = icons.0.remove(&old)
-                                                    {
-                                                        images.remove(handle.id());
-                                                    }
-                                                }
-                                                icons.0.insert(key.clone(), handle);
-                                            }
-                                            let image = icons.0.get(&key).cloned().flatten();
-                                            let dimensions = image
-                                                .as_ref()
-                                                .and_then(|handle| images.get(handle))
-                                                .map(|image| {
-                                                    Vec2::new(
-                                                        image.width() as f32,
-                                                        image.height() as f32,
-                                                    )
-                                                });
-                                            let active =
-                                                snapshot.instances.iter().rev().find(|instance| {
-                                                    instance.clip_id == clip.identity
-                                                        && !instance.state.is_terminal()
-                                                });
-                                            let status =
-                                                if runtime.errors.contains_key(&clip.identity) {
-                                                    "ERROR"
-                                                } else {
-                                                    "PLAY →"
-                                                };
-                                            view.card(
-                                                row,
-                                                clip,
-                                                image,
-                                                dimensions,
-                                                model.layout,
-                                                status,
-                                                active
-                                                    .map(|instance| instance.instance_id.as_str()),
-                                            );
-                                        }
-                                    });
-                                }
-                            });
-                    });
-                collection
-                    .spawn((
-                        Button,
-                        Hovered::default(),
-                        Scrollbar,
-                        RelativeCursorPosition::default(),
-                        Node {
-                            width: px(8),
-                            min_width: px(8),
-                            height: percent(100),
-                            border_radius: BorderRadius::all(px(4)),
-                            ..default()
-                        },
-                        BackgroundColor(YELLOW.with_alpha(0.22)),
-                        Pickable::default(),
-                    ))
-                    .with_children(|track| {
-                        let (top, height) = model.thumb_geometry(model.viewport_height());
-                        track.spawn((
-                            ScrollThumb,
-                            Node {
-                                position_type: PositionType::Absolute,
-                                top: px(top),
-                                width: percent(100),
-                                height: px(height),
-                                border_radius: BorderRadius::all(px(4)),
-                                ..default()
-                            },
-                            BackgroundColor(if model.max_scroll() == 0. {
-                                RULE
-                            } else {
-                                PURPLE
-                            }),
-                            Pickable::IGNORE,
-                        ));
-                    });
-            });
-        parent
-            .spawn(Node {
-                min_height: px(40),
-                width: percent(100),
-                padding: UiRect::top(px(12)),
-                border: UiRect::top(px(1)),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                column_gap: px(12),
-                ..default()
-            })
-            .insert(BorderColor::all(RULE))
-            .with_children(|footer| {
-                footer
-                    .spawn(Node {
-                        flex_direction: FlexDirection::Column,
-                        row_gap: px(3),
+        commands
+            .entity(regions.thumb.unwrap())
+            .insert(BackgroundColor(if model.max_scroll() == 0. {
+                RULE
+            } else {
+                PURPLE
+            }));
+    }
+    regions.brand.refresh(
+        &mut commands,
+        &children,
+        &fonts,
+        &mut focus,
+        brand_signature.clone(),
+        |view, brand| {
+            view.title(brand, "durop", 29., INK);
+            if primary.width() >= 620. {
+                view.label(brand, "A LITTLE EXPRESSION, ON CUE.", 10., MUTED);
+            }
+        },
+    );
+    regions.header.refresh(
+        &mut commands,
+        &children,
+        &fonts,
+        &mut focus,
+        header_signature.clone(),
+        |view, header| {
+            view.selector(
+                header,
+                "FROM",
+                &Model::source_summary(
+                    network.local_enabled,
+                    network
+                        .controllers
+                        .iter()
+                        .filter(|source| source.enabled)
+                        .count(),
+                ),
+                Dropdown::From,
+                false,
+                if compact { provider_width } else { 230. },
+            );
+            view.selector(
+                header,
+                "TO",
+                if remote { "Remote host" } else { "This Mac" },
+                Dropdown::To,
+                model.dropdown == Some(Dropdown::To),
+                if compact { provider_width } else { 170. },
+            );
+            let catalog_label = if remote {
+                "Remote catalog"
+            } else if runtime.pack_input.starts_with("https://") {
+                "Git repository"
+            } else if runtime.pack_input == crate::app::Config::bundled_pack().to_string_lossy() {
+                "Durop reactions"
+            } else {
+                "Local directory"
+            };
+            view.selector(
+                header,
+                "CATALOG",
+                catalog_label,
+                Dropdown::Catalog,
+                model.dropdown == Some(Dropdown::Catalog),
+                if compact { provider_width } else { 210. },
+            );
+            header
+                .spawn((
+                    Node {
                         flex_grow: 1.,
+                        width: if compact { percent(100) } else { auto() },
+                        height: px(68),
+                        min_height: px(68),
+                        max_height: px(68),
+                        min_width: px(130),
+                        padding: UiRect::axes(px(16), px(11)),
+                        border: UiRect::all(px(1)),
+                        border_radius: BorderRadius::all(px(6)),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(6),
+                        justify_content: JustifyContent::Center,
                         overflow: Overflow::clip(),
                         ..default()
-                    })
-                    .with_children(|status| {
-                        view.label(
-                            status,
-                            if remote {
-                                &network.status
-                            } else {
-                                &runtime.status
-                            },
-                            10.,
-                            if remote && !network.connected {
-                                MUTED
-                            } else {
-                                GREEN
-                            },
+                    },
+                    BackgroundColor(PAPER),
+                    BorderColor::all(if model.focus == Some(Field::Search) {
+                        PURPLE
+                    } else {
+                        RULE
+                    }),
+                    HoverColors {
+                        resting: PAPER,
+                        hovered: BACKGROUND,
+                    },
+                ))
+                .with_children(|search| {
+                    view.label(search, "SEARCH", 10., MUTED);
+                    view.input(search, &model.query);
+                });
+        },
+    );
+    regions.section.refresh(
+        &mut commands,
+        &children,
+        &fonts,
+        &mut focus,
+        section_signature.clone(),
+        |view, section| {
+            view.label(
+                section,
+                if remote {
+                    "REMOTE COLLECTION"
+                } else {
+                    "YOUR COLLECTION"
+                },
+                10.,
+                PURPLE,
+            );
+            view.label(section, format!("{} REACTIONS", model.matches), 10., MUTED);
+        },
+    );
+    regions.collection.refresh(
+        &mut commands,
+        &children,
+        &fonts,
+        &mut focus,
+        collection_signature.clone(),
+        |view, grid| {
+            let visible = model.visible(clips);
+            if visible.is_empty() {
+                grid.spawn(Node {
+                    width: percent(100),
+                    flex_grow: 1.,
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    row_gap: px(14),
+                    ..default()
+                })
+                .with_children(|empty| {
+                    view.title(
+                        empty,
+                        if runtime.loading {
+                            "Gathering your collection…"
+                        } else if remote && !network.connected {
+                            "Connect your host"
+                        } else {
+                            "Nothing here, yet."
+                        },
+                        28.,
+                        INK,
+                    );
+                    view.label(
+                        empty,
+                        if remote && !network.connected {
+                            "Choose To → Remote host to enter its IP and Durop pairing token."
+                        } else {
+                            "Try another search or choose a catalog above."
+                        },
+                        12.,
+                        MUTED,
+                    );
+                });
+            }
+            for (row_index, indices) in visible.chunks(model.layout.columns).enumerate() {
+                grid.spawn(Node {
+                    position_type: PositionType::Absolute,
+                    top: px((model.first_row() + row_index) as f32 * model.row_stride()),
+                    width: percent(100),
+                    height: px(model.layout.card_height),
+                    column_gap: px(20),
+                    min_height: px(model.layout.card_height),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for index in indices {
+                        let clip = &clips[*index];
+                        let key = format!(
+                            "{}:{}:{}:{}",
+                            remote,
+                            snapshot.catalog_revision,
+                            clip.identity,
+                            remote && network.remote_icons.contains_key(&clip.identity)
                         );
-                        view.label(
-                            status,
-                            if remote {
-                                "ESC TO STOP · CLICK A CARD TO PLAY".to_owned()
+                        if !icons.0.contains_key(&key) {
+                            let bytes = if remote {
+                                network.remote_icons.get(&clip.identity).cloned()
                             } else {
-                                format!("{} · ESC TO STOP", network.status)
-                            },
-                            9.,
-                            MUTED,
+                                Icons::read_icon(&clip.icon_path).ok()
+                            };
+                            let handle = bytes
+                                .and_then(|bytes| Icons::icon_image(&bytes).ok())
+                                .map(|image| images.add(image));
+                            if icons.0.len() >= 128 {
+                                let old = icons.0.keys().next().cloned().unwrap();
+                                if let Some(Some(handle)) = icons.0.remove(&old) {
+                                    images.remove(handle.id());
+                                }
+                            }
+                            icons.0.insert(key.clone(), handle);
+                        }
+                        let image = icons.0.get(&key).cloned().flatten();
+                        let dimensions = image
+                            .as_ref()
+                            .and_then(|handle| images.get(handle))
+                            .map(|image| Vec2::new(image.width() as f32, image.height() as f32));
+                        let active = snapshot.instances.iter().rev().find(|instance| {
+                            instance.clip_id == clip.identity && !instance.state.is_terminal()
+                        });
+                        let status = if runtime.errors.contains_key(&clip.identity) {
+                            "ERROR"
+                        } else {
+                            "PLAY →"
+                        };
+                        view.card(
+                            row,
+                            clip,
+                            image,
+                            dimensions,
+                            model.layout,
+                            status,
+                            active.map(|instance| instance.instance_id.as_str()),
                         );
-                    });
-                if remote && network.connected {
-                    view.button(footer, "Disconnect", UiAction::Disconnect, false);
-                }
-                view.button(footer, "STOP ALL", UiAction::Runtime(Action::StopAll), true);
-            });
-        if let Some(modal) = &model.modal {
-            view.modal(parent, modal, model.focus, &network, &runtime);
-        }
-    });
-    texts.finish(&mut commands, &mut focus);
+                    }
+                });
+            }
+        },
+    );
+    regions.footer.refresh(
+        &mut commands,
+        &children,
+        &fonts,
+        &mut focus,
+        footer_signature.clone(),
+        |view, footer| {
+            footer
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(3),
+                    flex_grow: 1.,
+                    overflow: Overflow::clip(),
+                    ..default()
+                })
+                .with_children(|status| {
+                    view.label(
+                        status,
+                        if remote {
+                            &network.status
+                        } else {
+                            &runtime.status
+                        },
+                        10.,
+                        if remote && !network.connected {
+                            MUTED
+                        } else {
+                            GREEN
+                        },
+                    );
+                    view.label(
+                        status,
+                        if remote {
+                            "ESC TO STOP · CLICK A CARD TO PLAY".to_owned()
+                        } else {
+                            format!("{} · ESC TO STOP", network.status)
+                        },
+                        9.,
+                        MUTED,
+                    );
+                });
+            if remote && network.connected {
+                view.button(footer, "Disconnect", UiAction::Disconnect, false);
+            }
+            view.button(footer, "STOP ALL", UiAction::Runtime(Action::StopAll), true);
+        },
+    );
+    regions.modal.refresh(
+        &mut commands,
+        &children,
+        &fonts,
+        &mut focus,
+        modal_signature.clone(),
+        |view, parent| {
+            if let Some(modal) = &model.modal {
+                view.modal(parent, modal, model.focus, &network, &runtime);
+            }
+        },
+    );
+    model.signature = format!(
+        "{:?}",
+        (
+            &brand_signature,
+            &header_signature,
+            &section_signature,
+            &collection_signature,
+            &footer_signature,
+            &modal_signature
+        )
+    );
 }

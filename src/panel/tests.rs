@@ -80,6 +80,8 @@ fn input_app() -> (App, Entity) {
     .init_resource::<Icons>()
     .init_resource::<Fonts>()
     .init_resource::<Assets<Image>>()
+    .init_resource::<Assets<Font>>()
+    .register_required_components::<EditableText, bevy::ui::widget::EditableTextContentSizeState>()
     .add_message::<Ime>()
     .add_message::<bevy::window::RequestRedraw>()
     .add_message::<bevy::picking::events::PointerRelease>()
@@ -108,16 +110,23 @@ fn input_app() -> (App, Entity) {
             .chain()
             .after(EditableTextSystems),
     );
-    let font = Font::from_bytes(
+    let mono = Font::from_bytes(
         std::fs::read(crate::app::resource_root().join("assets/fonts/IBMPlexMono-Regular.ttf"))
+            .unwrap(),
+    );
+    let display = Font::from_bytes(
+        std::fs::read(crate::app::resource_root().join("assets/fonts/ExpletusSans-Regular.ttf"))
             .unwrap(),
     );
     {
         let mut context = app.world_mut().resource_mut::<bevy::text::FontCx>();
-        context.collection.register_fonts(font.data, None);
+        context.collection.register_fonts(mono.data.clone(), None);
         context.set_sans_serif_family("IBM Plex Mono").unwrap();
         context.set_monospace_family("IBM Plex Mono").unwrap();
     }
+    let mono = app.world_mut().resource_mut::<Assets<Font>>().add(mono);
+    let display = app.world_mut().resource_mut::<Assets<Font>>().add(display);
+    app.insert_resource(Fonts { mono, display });
     let window = app
         .world_mut()
         .spawn((
@@ -654,12 +663,11 @@ fn modal_wheel_scroll_is_clamped_and_does_not_move_catalog_rows() {
 
 /// A complete compact card retains its two-line title and action row below the preview.
 #[test]
-fn short_window_cards_fit_titles_and_controls_inside_the_collection() {
+fn short_window_cards_keep_complete_controls_and_scroll_small_viewports() {
     for (width, height) in [(720., 520.), (400., 520.), (1160., 520.), (1160., 820.)] {
         let layout = GridLayout::for_window(width, height);
-        let toolbar_extra = if width < 760. { 80. } else { 0. };
-        let available_height = height - 296. - toolbar_extra;
-        assert!(layout.card_height <= available_height);
+        assert!((134. ..=282.).contains(&layout.card_height));
+        assert!(layout.card_width > 0.);
         assert!(layout.preview_height >= 24.);
         // Title 44px + controls 20px + padding/border 26px + two 10px gaps.
         assert_eq!(
@@ -1378,7 +1386,7 @@ fn actual_view_refresh_retains_engine_selection_focus_and_composition() {
         .resource_mut::<crate::network_app::NetworkState>()
         .status = "Remote status changed".into();
     app.update();
-    assert_ne!(app.world().resource::<Model>().root, Some(root));
+    assert_eq!(app.world().resource::<Model>().root, Some(root));
     assert_eq!(app.world().resource::<Model>().query.entity, Some(input));
     assert_eq!(app.world().resource::<InputFocus>().get(), Some(input));
     assert_eq!(
@@ -1566,7 +1574,7 @@ fn rendered_source_listener_can_close_and_reopen_without_dead_input_handles() {
     assert_eq!(app.world().resource::<InputFocus>().get(), Some(reopened));
 }
 
-/// A same-frame final edit and Apply must commit the engine value even if a status refresh destroys its button.
+/// A same-frame final edit and Apply must commit engine text while an unrelated status region refreshes.
 #[test]
 fn queued_final_engine_edit_and_apply_survive_transient_view_refresh() {
     use bevy::text::TextEdit;
@@ -1601,11 +1609,12 @@ fn queued_final_engine_edit_and_apply_survive_transient_view_refresh() {
     app.world_mut().trigger(Activate { entity: button });
     app.world_mut().resource_mut::<Runtime>().status = "Refresh before text commit".into();
     app.update();
-    assert!(app.world().get_entity(button).is_err());
+    assert!(app.world().get_entity(button).is_ok());
     assert!(app.world().resource::<Model>().modal.is_none());
     assert!(app.world().resource::<Actions>().0.iter().any(|action| matches!(action, Action::LoadPack(source) if source.starts_with("https://example.com/final.git#"))));
     app.update();
     assert!(app.world().get_entity(input).is_err());
+    assert!(app.world().get_entity(button).is_err());
 }
 
 /// Fast modifier chords must reach Bevy editing with their event-time flags, even in one update.
@@ -1663,46 +1672,97 @@ fn ordered_command_down_a_command_up_selects_instead_of_typing_a() {
     assert!(app.world().resource::<Actions>().0.is_empty());
 }
 
-/// Install Bevy's actual camera propagation and Taffy layout over the production rendered tree.
+/// Measure production UI at the ordinary one-physical-pixel-per-logical-pixel desktop scale.
 fn enable_headless_layout(app: &mut App, width: u32, height: u32) {
+    enable_headless_layout_at_scale(app, width, height, 1.);
+}
+
+/// Run real Bevy text measurement and layout at an explicit desktop/Retina render scale.
+fn enable_headless_layout_at_scale(app: &mut App, width: u32, height: u32, scale: f32) {
     use bevy::app::{HierarchyPropagatePlugin, PropagateSet};
-    use bevy::ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera};
+    use bevy::ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, UiSystems};
     app.add_plugins((
         HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(PostUpdate),
         HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(PostUpdate),
     ))
     .init_resource::<bevy::ui::ui_surface::UiSurface>()
     .init_resource::<bevy::text::RemSize>()
+    .init_resource::<bevy::text::TextPipeline>()
+    .init_resource::<bevy::text::ScaleCx>()
+    .init_resource::<bevy::text::FontAtlasSet>()
+    .configure_sets(
+        PostUpdate,
+        (
+            UiSystems::Prepare,
+            UiSystems::Propagate,
+            UiSystems::Content,
+            UiSystems::Layout,
+            EditableTextSystems,
+            UiSystems::PostLayout,
+        )
+            .chain(),
+    )
+    .configure_sets(
+        PostUpdate,
+        PropagateSet::<ComputedUiTargetCamera>::default().in_set(UiSystems::Propagate),
+    )
+    .configure_sets(
+        PostUpdate,
+        PropagateSet::<ComputedUiRenderTargetInfo>::default().in_set(UiSystems::Propagate),
+    )
     .add_systems(
         PostUpdate,
-        bevy::ui::update::propagate_ui_target_cameras
-            .before(PropagateSet::<ComputedUiTargetCamera>::default())
-            .before(PropagateSet::<ComputedUiRenderTargetInfo>::default()),
+        bevy::ui::update::propagate_ui_target_cameras.in_set(UiSystems::Prepare),
     )
     .add_systems(
         PostUpdate,
         (
+            bevy::text::load_font_assets_into_font_collection,
+            bevy::text::detect_text_needs_rerender,
             bevy::ui::sync_font_size_to_em_size,
-            bevy::ui::ui_layout_system,
-            bevy::ui::widget::sync_editable_text_viewports,
+            bevy::ui::widget::measure_text_system,
+            bevy::ui::widget::update_editable_text_content_size,
+            bevy::ui::widget::update_editable_text_styles,
         )
             .chain()
-            .after(PropagateSet::<ComputedUiTargetCamera>::default())
-            .after(PropagateSet::<ComputedUiRenderTargetInfo>::default())
+            .in_set(UiSystems::Content),
+    )
+    .add_systems(
+        PostUpdate,
+        bevy::ui::ui_layout_system.in_set(UiSystems::Layout),
+    )
+    .add_systems(
+        PostUpdate,
+        bevy::ui::widget::sync_editable_text_viewports
+            .after(UiSystems::Layout)
             .before(EditableTextSystems),
     )
+    .add_systems(
+        PostUpdate,
+        (
+            bevy::ui::widget::text_system,
+            bevy::ui::widget::update_editable_text_layout,
+        )
+            .chain()
+            .in_set(UiSystems::PostLayout)
+            .before(bevy::input_focus::InputFocusSystems::FocusChangeEvents),
+    )
     .add_systems(Update, scroll.before(view::render));
+    let physical_size = UVec2::new(
+        (width as f32 * scale) as u32,
+        (height as f32 * scale) as u32,
+    );
     let camera = app.world().resource::<PanelCamera>().0;
     app.world_mut().entity_mut(camera).insert(Camera {
         computed: bevy::camera::ComputedCameraValues {
             target_info: Some(bevy::camera::RenderTargetInfo {
-                physical_size: UVec2::new(width, height),
-                scale_factor: 1.,
+                physical_size,
+                scale_factor: scale,
             }),
             ..default()
         },
         viewport: Some(bevy::camera::Viewport {
-            physical_size: UVec2::new(width, height),
+            physical_size,
             ..default()
         }),
         ..default()
@@ -1711,7 +1771,8 @@ fn enable_headless_layout(app: &mut App, width: u32, height: u32) {
         .world_mut()
         .query_filtered::<&mut Window, With<PrimaryWindow>>();
     for mut window in windows.iter_mut(app.world_mut()) {
-        window.resolution = bevy::window::WindowResolution::new(width, height);
+        window.resolution = bevy::window::WindowResolution::new(physical_size.x, physical_size.y)
+            .with_scale_factor_override(scale);
     }
 }
 
@@ -2233,4 +2294,359 @@ fn secret_append_and_backspace_update_revision_and_request_redraw() {
             .is_empty()
     );
     assert!(app.world().get::<EditableText>(secret).is_none());
+}
+
+/// Capture drawn glyph geometry by displayed value, independently of rebuilt entity identities.
+#[derive(Clone, Debug, PartialEq)]
+struct MeasuredTextGeometry {
+    /// Physical center on the primary render target.
+    center: Vec2,
+    /// Actual allocated text node extent after Taffy and glyph measurement.
+    size: Vec2,
+    /// The render extraction target must remain available on every frame.
+    camera: Option<Entity>,
+    /// Hierarchical visibility participates in actual glyph extraction.
+    visible: bool,
+    /// Physical text bounds after shaping, independent of the enclosing node's allocation.
+    layout_size: Vec2,
+    /// Every local glyph position catches shifting text even when its node stays stationary.
+    glyph_positions: Vec<Vec2>,
+}
+
+impl MeasuredTextGeometry {
+    /// Sort duplicate labels by position so equivalent trees compare deterministically.
+    fn compare(left: &Self, right: &Self) -> std::cmp::Ordering {
+        left.center
+            .y
+            .total_cmp(&right.center.y)
+            .then(left.center.x.total_cmp(&right.center.x))
+    }
+
+    /// Read all nonempty displayed text after the production measurement/layout schedules finish.
+    fn capture(world: &mut World) -> BTreeMap<String, Vec<Self>> {
+        let mut result: BTreeMap<String, Vec<Self>> = BTreeMap::new();
+        for (text, node, transform, layout, camera, visibility) in world
+            .query::<(
+                &Text,
+                &ComputedNode,
+                &UiGlobalTransform,
+                &bevy::text::TextLayoutInfo,
+                Option<&bevy::ui::ComputedUiTargetCamera>,
+                &InheritedVisibility,
+            )>()
+            .iter(world)
+        {
+            if !text.0.is_empty() {
+                result.entry(text.0.clone()).or_default().push(Self {
+                    center: transform.translation,
+                    size: node.size(),
+                    camera: camera.and_then(bevy::ui::ComputedUiTargetCamera::get),
+                    visible: visibility.get(),
+                    layout_size: layout.size,
+                    glyph_positions: layout.glyphs.iter().map(|glyph| glyph.position).collect(),
+                });
+            }
+        }
+        for copies in result.values_mut() {
+            copies.sort_by(Self::compare);
+        }
+        result
+    }
+
+    /// Every retained displayed value must keep its measured glyph geometry on the idle frame.
+    fn assert_stable(
+        before: &BTreeMap<String, Vec<Self>>,
+        after: &BTreeMap<String, Vec<Self>>,
+        transition: &str,
+    ) {
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>(),
+            "{transition}: unchanged displayed text disappeared or appeared late"
+        );
+        for (text, geometry) in before {
+            let next = after
+                .get(text)
+                .expect("identical key sets were checked above");
+            assert_eq!(
+                geometry, next,
+                "{transition}: unchanged text {text:?} moved or resized between rebuild and idle frames"
+            );
+        }
+    }
+}
+
+/// Capture region anchors and unchanged chrome children to ensure edits preserve ownership.
+fn retained_region_identity(world: &mut World) -> BTreeMap<Entity, (Option<Entity>, Vec<Entity>)> {
+    world
+        .query::<(
+            Entity,
+            &view::RegionKind,
+            Option<&ChildOf>,
+            Option<&Children>,
+        )>()
+        .iter(world)
+        .map(|(entity, kind, parent, children)| {
+            let retained_children = if *kind == view::RegionKind::Collection {
+                vec![]
+            } else {
+                children
+                    .map(|children| children.iter().collect())
+                    .unwrap_or_default()
+            };
+            (entity, (parent.map(ChildOf::parent), retained_children))
+        })
+        .collect()
+}
+
+/// Typing and virtual-row replacement must render measured text in place on their first frame.
+#[test]
+fn measured_text_geometry_is_stable_on_typing_and_virtual_scroll_rebuild_frames() {
+    for scale in [1., 2.] {
+        let (mut app, window) = input_app();
+        enable_headless_layout_at_scale(&mut app, 1160, 820, scale);
+        {
+            let mut runtime = app.world_mut().resource_mut::<Runtime>();
+            runtime.destination = Destination::Local;
+            runtime.mode = Mode::Local;
+            runtime.catalog = std::sync::Arc::new(
+                crate::catalog::load_local(
+                    &crate::app::resource_root().join("sample-packs/reactions"),
+                )
+                .unwrap(),
+            );
+            runtime.status = "Measured layout fixture".into();
+        }
+        for _ in 0..5 {
+            app.update();
+        }
+        let initial = MeasuredTextGeometry::capture(app.world_mut());
+        let region_identity = retained_region_identity(app.world_mut());
+        assert!(!region_identity.is_empty());
+        assert!(initial["durop"].iter().all(|geometry| geometry.size.x > 0.
+            && geometry.size.y > 0.
+            && !geometry.glyph_positions.is_empty()));
+        // Whitespace changes the real search draft while preserving the complete catalog result set.
+        key(&mut app, window, Key::Space, KeyCode::Space, Some(" "));
+        app.update();
+        let event_frame = MeasuredTextGeometry::capture(app.world_mut());
+        assert_eq!(
+            region_identity,
+            retained_region_identity(app.world_mut()),
+            "typing event replaced chrome ownership"
+        );
+        MeasuredTextGeometry::assert_stable(&initial, &event_frame, "typing event frame");
+        app.update();
+        let typed = MeasuredTextGeometry::capture(app.world_mut());
+        assert_eq!(
+            region_identity,
+            retained_region_identity(app.world_mut()),
+            "typing refresh replaced chrome ownership"
+        );
+        MeasuredTextGeometry::assert_stable(&initial, &typed, "typing rebuild frame");
+        for _ in 0..3 {
+            app.update();
+            let typed_idle = MeasuredTextGeometry::capture(app.world_mut());
+            MeasuredTextGeometry::assert_stable(&typed, &typed_idle, "typing rebuild to idle");
+        }
+        let stride = app.world().resource::<Model>().row_stride();
+        app.world_mut().write_message(MouseWheel {
+            window,
+            unit: bevy::input::mouse::MouseScrollUnit::Pixel,
+            x: 0.,
+            phase: bevy::input::touch::TouchPhase::Moved,
+            y: -(stride + 8.) * scale,
+        });
+        app.update();
+        assert!(app.world().resource::<Model>().first_row() > 0);
+        let scrolled = MeasuredTextGeometry::capture(app.world_mut());
+        assert_eq!(
+            region_identity,
+            retained_region_identity(app.world_mut()),
+            "virtual scroll replaced chrome ownership"
+        );
+        for _ in 0..3 {
+            app.update();
+            let scrolled_idle = MeasuredTextGeometry::capture(app.world_mut());
+            MeasuredTextGeometry::assert_stable(&scrolled, &scrolled_idle, "virtualized scrolling");
+        }
+        app.world_mut().resource_mut::<Model>().open(
+            Provider::Catalog(CatalogProvider::GitHttps),
+            &provider_context(),
+        );
+        for _ in 0..4 {
+            app.update();
+        }
+        let modal_geometry = MeasuredTextGeometry::capture(app.world_mut());
+        let modal_identity = retained_region_identity(app.world_mut());
+        key(
+            &mut app,
+            window,
+            Key::Character("x".into()),
+            KeyCode::KeyX,
+            Some("x"),
+        );
+        for _ in 0..3 {
+            app.update();
+            assert_eq!(
+                modal_identity,
+                retained_region_identity(app.world_mut()),
+                "ordinary draft editing replaced modal ownership"
+            );
+            let modal_frame = MeasuredTextGeometry::capture(app.world_mut());
+            MeasuredTextGeometry::assert_stable(
+                &modal_geometry,
+                &modal_frame,
+                "modal draft typing",
+            );
+        }
+    }
+}
+
+/// Real glyph metrics must not stretch the toolbar or its single-line search input.
+#[test]
+fn measured_toolbar_and_search_fit_responsive_rows() {
+    for width in [1160, 840, 839, 720, 534, 533, 400] {
+        let (mut app, _) = input_app();
+        enable_headless_layout(&mut app, width, 820);
+        for _ in 0..5 {
+            app.update();
+        }
+        let search = app.world().resource::<Model>().query.entity.unwrap();
+        let search_node = app.world().get::<ComputedNode>(search).unwrap();
+        assert_eq!(
+            search_node.size().y * search_node.inverse_scale_factor(),
+            24.,
+            "search height at width {width}"
+        );
+        let search_container = app.world().get::<ChildOf>(search).unwrap().parent();
+        let toolbar = app
+            .world()
+            .get::<ChildOf>(search_container)
+            .unwrap()
+            .parent();
+        let toolbar_node = app.world().get::<ComputedNode>(toolbar).unwrap();
+        assert_eq!(
+            toolbar_node.size().y * toolbar_node.inverse_scale_factor(),
+            GridLayout::toolbar_height(width as f32),
+            "toolbar height at width {width}"
+        );
+    }
+}
+
+/// Compact source settings must scroll their final Back action fully into the content viewport.
+#[test]
+fn measured_compact_source_details_reach_final_action_without_clipping() {
+    for details in [SourceDetails::Listener, SourceDetails::Credentials] {
+        let (mut app, window) = input_app();
+        enable_headless_layout(&mut app, 720, 520);
+        let mut source_fixture = sources_app();
+        app.insert_resource(
+            source_fixture
+                .world_mut()
+                .remove_resource::<crate::network_app::NetworkState>()
+                .unwrap(),
+        );
+        {
+            let mut model = app.world_mut().resource_mut::<Model>();
+            model.open_sources("100.101.102.103:48732");
+            let modal = model.modal.as_mut().unwrap();
+            modal.select_source(SourceSelection::Remote("alice".into()));
+            modal.show_source_details(details);
+        }
+        for _ in 0..5 {
+            app.update();
+        }
+        app.world_mut().write_message(MouseWheel {
+            window,
+            unit: bevy::input::mouse::MouseScrollUnit::Pixel,
+            x: 0.,
+            y: -10000.,
+            phase: bevy::input::touch::TouchPhase::Moved,
+        });
+        for _ in 0..3 {
+            app.update();
+        }
+        let body = app
+            .world_mut()
+            .query_filtered::<Entity, With<ModalBody>>()
+            .single(app.world())
+            .unwrap();
+        let body_node = app.world().get::<ComputedNode>(body).unwrap();
+        let body_transform = app.world().get::<UiGlobalTransform>(body).unwrap();
+        let viewport_top = body_transform
+            .affine()
+            .transform_point2(body_node.content_box().min)
+            .y;
+        let viewport_bottom = body_transform
+            .affine()
+            .transform_point2(body_node.content_box().max)
+            .y;
+        let back_label = app
+            .world_mut()
+            .query::<(Entity, &Text)>()
+            .iter(app.world())
+            .find_map(|(entity, text)| (text.0 == "Back to controller").then_some(entity))
+            .unwrap();
+        let back = app.world().get::<ChildOf>(back_label).unwrap().parent();
+        let back_node = app.world().get::<ComputedNode>(back).unwrap();
+        let back_transform = app.world().get::<UiGlobalTransform>(back).unwrap();
+        let back_top = back_transform.translation.y - back_node.size().y * 0.5;
+        let back_bottom = back_transform.translation.y + back_node.size().y * 0.5;
+        assert!(
+            back_top >= viewport_top - 1. && back_bottom <= viewport_bottom + 1.,
+            "final source action [{back_top}, {back_bottom}] clipped by viewport [{viewport_top}, {viewport_bottom}]"
+        );
+        let form = app.world().get::<Children>(body).unwrap()[0];
+        let form_node = app.world().get::<ComputedNode>(form).unwrap();
+        let form_transform = app.world().get::<UiGlobalTransform>(form).unwrap();
+        let form_top = form_transform.translation.y - form_node.size().y * 0.5;
+        assert!(
+            back_bottom - form_top <= form_node.size().y + 1.,
+            "scroll content omits the final source action"
+        );
+    }
+}
+
+/// Reusing an unchanged count must append it after the replacement heading in its stable region.
+#[test]
+fn measured_collection_heading_changes_preserve_left_right_order_and_camera() {
+    let (mut app, _) = input_app();
+    enable_headless_layout(&mut app, 1160, 820);
+    app.world_mut().resource_mut::<Runtime>().destination = Destination::Local;
+    for _ in 0..5 {
+        app.update();
+    }
+    let count = app
+        .world_mut()
+        .query::<(Entity, &Text)>()
+        .iter(app.world())
+        .find_map(|(entity, text)| (text.0 == "0 REACTIONS").then_some(entity))
+        .unwrap();
+    for (destination, heading) in [
+        (Destination::Remote, "REMOTE COLLECTION"),
+        (Destination::Local, "YOUR COLLECTION"),
+        (Destination::Remote, "REMOTE COLLECTION"),
+    ] {
+        app.world_mut().resource_mut::<Runtime>().destination = destination;
+        app.update();
+        let frame = MeasuredTextGeometry::capture(app.world_mut());
+        assert!(
+            frame[heading][0].center.x < frame["0 REACTIONS"][0].center.x,
+            "count moved before the replacement heading"
+        );
+        assert!(frame[heading][0].camera.is_some());
+        assert!(frame["0 REACTIONS"][0].camera.is_some());
+        assert!(app.world().get::<Text>(count).is_some());
+        app.update();
+        let idle = MeasuredTextGeometry::capture(app.world_mut());
+        assert_eq!(
+            frame[heading], idle[heading],
+            "replacement heading changed geometry or camera on the idle frame"
+        );
+        assert_eq!(
+            frame["0 REACTIONS"], idle["0 REACTIONS"],
+            "retained count changed geometry or camera on the idle frame"
+        );
+    }
 }
