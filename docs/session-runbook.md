@@ -53,7 +53,7 @@ Nix CLI's macOS daemon caveat. Durop does not enroll machines or apply policy.
 Do not expose its listener through a wildcard/LAN address or public forwarding.
 
 On the playback Mac, choose its local display in **To** and load the intended
-pack in **Catalog**. In **From**, choose **+ → Tailscale controller**, enter a name,
+pack in **Catalog**. In **From**, choose **+ → Configure new Tailscale controller…**, enter a name,
 and **Add controller**. Select that source and open **Listener settings**, enter
 this Mac's Tailscale IP and port (for example `100.x.y.z:48732`), and choose
 **Enable remote listener**. The listener
@@ -70,7 +70,7 @@ in the host's tailnet. Network policy must admit shared guests on TCP 48732,
 such as the sample's narrow `autogroup:shared` grant. See the official
 [sharing guide](https://tailscale.com/docs/features/sharing).
 
-Choose **Copy invitation link + pairing details**, or **Copy Durop pairing
+Choose **Copy invitation link and pairing details**, or **Copy Durop pairing
 details** when no new share is needed. Send these privately to that controller;
 keep the clipboard and pairing panel out of recordings. Infrastructure OAuth
 credentials and the host API key never belong in these pairing details.

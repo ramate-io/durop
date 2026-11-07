@@ -46,11 +46,13 @@ distinct. A card's Stop button targets its latest active occurrence; **STOP ALL*
 stops every occurrence. Remote mode displays the remote catalog and authoritative
 snapshot; disconnected commands have no local fallback or offline replay.
 
-Text entry supports Unicode/IME composition, arrows, Home/End, Backspace and
-Ctrl/Cmd+A replacement. Cmd/Ctrl+V pastes on macOS. Escape closes a modal/menu first,
-then leaves a focused editor, and otherwise stops playback. Space outside editing
-plays the first visible local tile. Bundled fonts have limited script coverage;
-missing glyphs do not discard the underlying search text.
+Search and non-secret form fields use Bevy's native `TextInput` for click-drag
+selection, Shift+arrows, IME and clipboard paste. Pairing tokens and the Tailscale
+API key stay on the masked editor so secrets are never replayed into a visible
+widget. Escape closes a modal/menu first, then leaves a focused editor, and
+otherwise stops playback. Space outside editing plays the first visible local tile.
+Bundled fonts have limited script coverage; missing glyphs do not discard the
+underlying search text.
 
 ## Launch and persistence
 

@@ -26,7 +26,7 @@ Prefer methods and constructors on the type that owns the behavior. Free functio
 
 The shell includes the X11 libraries needed by the chosen Bevy window backend on Linux. Apple builds need the platform SDK and developer tools as described in the README. Do not add machine-specific SDK or Homebrew paths.
 
-Initial bootstrap validation: on Apple Silicon macOS 27.0.1 with Rust 1.95.0, the Nix shell passed formatting, locked check, test, clippy and build. The [merged bootstrap CI run](https://github.com/ramate-io/durop/actions/runs/41737039260) passed formatting, locked check, tests and native builds on ubuntu-24.04 and macos-14. CI does not launch or validate macOS window behavior.
+Initial bootstrap validation: on Apple Silicon macOS 27.0.1 with Rust 1.95.0, the Nix shell passed formatting, locked check, test, clippy and build. The [merged bootstrap CI run](https://github.com/ramate-io/durop/actions/runs/41737039260) passed formatting, locked check, tests and native builds on ubuntu-24.04 and macos-14. CI does not launch or validate macOS window behavior. Bevy 0.20 requires the workspace MSRV of Rust 1.97.1 from `rust-toolchain.toml`.
 
 For the current application, run the README checks and the focused native probes described in `docs/media-backend.md`. Native distribution uses the independent Cargo/Apple-SDK path in `docs/packaging.md`, with an explicit macOS 14 deployment floor, ad-hoc signing, recursive Mach-O validation and a read-only arbitrary-directory resource check. Native packaging CI artifacts do not establish Finder, GPU, audible output, recorded A/V synchronization or two-Mac acceptance. Keep measured native evidence and remaining physical-device gaps explicit; the user handles second-Mac qualification.
 

@@ -70,6 +70,17 @@ impl Administration {
 
     // Exported credentials override saved credentials without silently overwriting them.
     fn load() -> Result<(Option<Arc<dyn InvitationProvider>>, String), String> {
+        Self::resolve(true)
+    }
+
+    // Env and the file fallback never present Keychain UI over the catalog.
+    fn load_unattended() -> Result<(Option<Arc<dyn InvitationProvider>>, String), String> {
+        Self::resolve(false)
+    }
+
+    fn resolve(
+        native_keychain: bool,
+    ) -> Result<(Option<Arc<dyn InvitationProvider>>, String), String> {
         let (key, origin) =
             match AdminApiKey::from_environment().map_err(|error| error.to_string())? {
                 Some(key) => (
@@ -77,7 +88,13 @@ impl Administration {
                     "Using TAILSCALE_API_KEY from the host environment",
                 ),
                 None => (
-                    Self::store().load().map_err(|error| error.to_string())?,
+                    if native_keychain {
+                        Self::store().load().map_err(|error| error.to_string())?
+                    } else {
+                        Self::store()
+                            .load_unattended()
+                            .map_err(|error| error.to_string())?
+                    },
                     "Using securely saved host API token",
                 ),
             };
@@ -101,12 +118,21 @@ impl NetworkState {
     pub(super) fn initialize_administration(&mut self) {
         if !self.administration.initialized {
             self.administration.initialized = true;
-            self.load_administration(None, false);
+            // Never prompt for Keychain while the catalog or From/To chrome is opening.
+            self.load_administration(None, false, false);
         }
     }
 
+    /// Read the native Keychain only when invitation credentials are actually needed.
+    pub(crate) fn unlock_administration(&mut self) {
+        if self.administration.provider.is_some() || self.administration.credential_busy {
+            return;
+        }
+        self.load_administration(None, false, true);
+    }
+
     // Save/remove is explicit; then resolve the actual credential according to precedence.
-    fn load_administration(&mut self, save: Option<String>, remove: bool) {
+    fn load_administration(&mut self, save: Option<String>, remove: bool, native_keychain: bool) {
         if self.administration.credential_busy {
             self.admin_status =
                 "Wait for the current protected credential operation to finish".into();
@@ -134,7 +160,11 @@ impl NetworkState {
                         .delete()
                         .map_err(|error| error.to_string())?;
                 }
-                Administration::load()
+                if native_keychain {
+                    Administration::load()
+                } else {
+                    Administration::load_unattended()
+                }
             })
             .await
             .unwrap_or_else(|_| Err("Protected credential operation failed".into()));
@@ -199,9 +229,9 @@ impl NetworkState {
             NetworkAction::RevokeInvitation { id } => self.revoke_invitation(&id),
             NetworkAction::RefreshInvitations => self.refresh_invitations(),
             NetworkAction::SaveAdminSecret { secret } => {
-                self.load_administration(Some(secret), false)
+                self.load_administration(Some(secret), false, true)
             }
-            NetworkAction::RemoveAdminSecret => self.load_administration(None, true),
+            NetworkAction::RemoveAdminSecret => self.load_administration(None, true, true),
             NetworkAction::CopyControllerHandoff { id } => self.copy_handoff(&id),
             _ => {}
         }
@@ -488,7 +518,7 @@ mod tests {
         let mut network = network();
         network.administration.credential_busy = true;
         network.administration.generation = 3;
-        network.load_administration(None, true);
+        network.load_administration(None, true, true);
         assert_eq!(
             network.administration.generation, 3,
             "a second store operation must not race the first"

@@ -213,12 +213,12 @@ impl PlatformSecretStore {
     }
 }
 
-impl SecretStore for PlatformSecretStore {
-    fn load(&self) -> Result<Option<AdminApiKey>, InvitationError> {
-        #[cfg(target_os = "macos")]
-        if let Ok(Some(key)) = keychain::load() {
-            return Ok(Some(key));
-        }
+impl PlatformSecretStore {
+    /// Read the file fallback without native Keychain prompts.
+    ///
+    /// Startup and catalog browsing must not block on `login` Keychain UI; invitation
+    /// credentials still call [`SecretStore::load`], which may prompt.
+    pub fn load_unattended(&self) -> Result<Option<AdminApiKey>, InvitationError> {
         #[cfg(unix)]
         {
             self.file_load()
@@ -227,6 +227,16 @@ impl SecretStore for PlatformSecretStore {
         {
             Err(InvitationError::Storage)
         }
+    }
+}
+
+impl SecretStore for PlatformSecretStore {
+    fn load(&self) -> Result<Option<AdminApiKey>, InvitationError> {
+        #[cfg(target_os = "macos")]
+        if let Ok(Some(key)) = keychain::load() {
+            return Ok(Some(key));
+        }
+        self.load_unattended()
     }
 
     fn save(&self, key: &AdminApiKey) -> Result<(), InvitationError> {
