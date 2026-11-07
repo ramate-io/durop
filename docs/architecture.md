@@ -14,6 +14,12 @@ root. Use `--workspace` for checks and tests so library tests are included.
 | `durop-transport` | Authenticated Tailscale sessions and WebSocket protocol | Protocol |
 | `durop` | Bevy UI, application coordination, native window policy and diagnostics | All five libraries |
 
+The application pins Bevy 0.20.1 with granular rendering and window features.
+`bevy_ui_widgets` supplies text input behavior and input focus, `ui_picking`
+connects pointer input to widgets, and `system_clipboard` enables operating-system
+copy/paste. `DefaultPlugins` registers their plugins; text fields pair
+`EditableText` state with the `TextInput` widget.
+
 Libraries must not import application modules or Bevy. The application translates
 host effects to media requests and returns generation-tagged backend events. The
 media library exposes a main-thread service for native progress; `src/media_app.rs`

@@ -82,18 +82,6 @@ pub fn poll(mut actions: ResMut<crate::app::Actions>) {
     }
 }
 
-/// Read only in response to the focused editor's explicit Cmd/Ctrl+V action.
-pub fn paste_text() -> Option<String> {
-    unsafe {
-        let class = AnyClass::get(c"NSPasteboard")?;
-        let board: *mut AnyObject = msg_send![class, generalPasteboard];
-        let kind = objc2_foundation::NSString::from_str("public.utf8-plain-text");
-        let text: *mut objc2_foundation::NSString = msg_send![board,stringForType:&*kind];
-        let text = text.as_ref()?;
-        (text.length() <= 4096).then(|| text.to_string())
-    }
-}
-
 /// Write private connection details only after the host explicitly chooses Copy.
 pub fn copy_text(text: &str) -> bool {
     unsafe {
