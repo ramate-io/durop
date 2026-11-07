@@ -89,14 +89,16 @@ do not extend the pending command's deadline.
 
 The trusted catalog loader supplies only controller-safe metadata and an immutable
 map of known clip IDs to validated PNG bytes. No remote filesystem path or asset URL
-is supported. There are at most 256 icons, each at most 32 KiB, and metadata is at
+is supported. There are at most 256 icons, each at most 160 KiB, and metadata is at
 most 64 KiB. Full playback assets and Git credentials never belong in that map.
+JSON encodes icon bytes as a number array, so one icon frame stays within the
+768 KiB output bound.
 
 ## Bounds and host wiring
 
 At most four connections (including unauthenticated upgrades) exist per session.
 An upgrade has three seconds; input frames/messages are at most 16 KiB; output is
-at most 256 KiB and has a five-second send deadline. Idle connections close after
+at most 768 KiB and has a five-second send deadline. Idle connections close after
 60 seconds. Every incoming message, including ping/pong, consumes one of 20 requests
 per one-second window. Malformed JSON, unknown fields, binary messages, oversized
 frames, and excess rates terminate the connection. Credentials are fixed length.

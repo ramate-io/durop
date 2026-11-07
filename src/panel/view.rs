@@ -646,6 +646,7 @@ impl View<'_> {
                     "This Mac's Tailscale IP:port",
                     false,
                 );
+                self.label(dialog, network.listener_hint(), 10., MUTED);
                 self.button(
                     dialog,
                     if network.hosting {
@@ -670,7 +671,12 @@ impl View<'_> {
                         false,
                     );
                 }
-                self.label(dialog, "Use this Mac's assigned Tailscale address. The selected To destination stays independent.", 10., MUTED);
+                self.label(
+                    dialog,
+                    "The selected To destination stays independent of this listener.",
+                    10.,
+                    MUTED,
+                );
                 self.button(
                     dialog,
                     "Back to controller",

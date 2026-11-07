@@ -545,6 +545,32 @@ impl Model {
 
     /// Select the result of an explicit Add and recover if a selected source was revoked.
     fn reconcile_sources(&mut self, network: &crate::network_app::NetworkState) {
+        if let Some(modal) = &mut self.modal
+            && matches!(modal.draft, ModalDraft::Sources(_))
+            && modal
+                .editors
+                .get(2)
+                .is_some_and(|editor| editor.text.is_empty())
+        {
+            let endpoint = network.listener_endpoint();
+            if !endpoint.is_empty() {
+                modal.editors[2] = Editor {
+                    text: endpoint.to_owned(),
+                    cursor: endpoint.len(),
+                    ..default()
+                };
+            }
+        }
+        if let Some(modal) = &mut self.modal
+            && matches!(
+                &modal.draft,
+                ModalDraft::Sources(sources) if sources.details == SourceDetails::Listener
+            )
+            && !network.hosting
+            && network.status.starts_with("Remote host unavailable:")
+        {
+            modal.error = Some(network.status.clone());
+        }
         let Some(modal) = &mut self.modal else {
             return;
         };
@@ -1018,7 +1044,10 @@ fn buttons(
                 model.dropdown = None;
             }
             UiAction::Dropdown(Dropdown::From) => {
-                model.open_sources(&network.listen_address);
+                if network.listen_address.is_empty() && network.discovered_listener.is_none() {
+                    network.discover_listener();
+                }
+                model.open_sources(network.listener_endpoint());
             }
             UiAction::Dropdown(menu) => {
                 model.dropdown = if model.dropdown == Some(*menu) {
@@ -1112,7 +1141,7 @@ fn buttons(
                             network
                                 .actions
                                 .push_back(crate::network_app::NetworkAction::EnableHost);
-                            model.open_sources(&network.listen_address);
+                            model.open_sources(network.listener_endpoint());
                         }
                         ConfigurationIntent::Bundled { path }
                         | ConfigurationIntent::LocalDirectory { path } => {

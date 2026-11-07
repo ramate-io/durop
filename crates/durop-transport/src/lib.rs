@@ -41,8 +41,14 @@ use tokio_tungstenite::{
 const MAX_CONNECTIONS: usize = 4;
 // Requests are small commands/identities; full media is never accepted on this channel.
 const MAX_INPUT: usize = 16 * 1024;
-// Leaves room for JSON-expanded bounded PNG bytes and authoritative snapshots.
-const MAX_OUTPUT: usize = 256 * 1024;
+/// TCP port used when a tailnet IP is supplied without an explicit port.
+pub const DEFAULT_LISTEN_PORT: u16 = 48732;
+
+/// Compressed PNG size accepted in the remote catalog; JSON encodes each byte as a number.
+pub const MAX_ICON_PNG: usize = 160 * 1024;
+// JSON arrays expand PNG bytes about four times; keep snapshots and one icon in one frame.
+const MAX_OUTPUT: usize = 768 * 1024;
+const _: () = assert!(MAX_OUTPUT >= MAX_ICON_PNG * 4 + 1024);
 // Each stage has its own deadline; an idle or backpressured peer cannot pin a task.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,6 +73,8 @@ enum BindingGuard {
 pub enum TransportError {
     /// The selected address, origin list, credential, or catalog exceeds policy bounds.
     InvalidConfiguration,
+    /// The trusted catalog projection exceeded icon or metadata wire bounds.
+    InvalidCatalog,
     /// The configured address or installed Tailscale CLI cannot verify a running tailnet.
     TailnetUnavailable,
     /// An operating-system socket or interface operation failed.
@@ -85,6 +93,7 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidConfiguration => f.write_str("invalid remote session configuration"),
+            Self::InvalidCatalog => f.write_str("remote catalog preview exceeds sharing bounds"),
             Self::TailnetUnavailable => f.write_str("configured Tailscale address or CLI is unavailable; install/authorize Tailscale and verify this Mac's tailnet address (the macOS app's bundled CLI is supported)"),
             Self::Io(error) => write!(f, "transport I/O: {error}"),
             Self::Random => f.write_str("secure randomness unavailable"),
@@ -166,7 +175,7 @@ pub struct RemoteCatalog {
 /// Bound decoded PNG allocation as well as compressed wire size.
 pub fn valid_icon_png(png: &[u8]) -> bool {
     png.len() >= 33
-        && png.len() <= 32 * 1024
+        && png.len() <= MAX_ICON_PNG
         && png.starts_with(b"\x89PNG\r\n\x1a\n")
         && png[8..12] == 13u32.to_be_bytes()
         && &png[12..16] == b"IHDR"
@@ -183,7 +192,7 @@ impl RemoteCatalog {
     /// The trusted catalog loader supplies the bytes; the wire never accepts asset paths.
     pub fn new(metadata: Value, icons: BTreeMap<String, Vec<u8>>) -> Result<Self, TransportError> {
         if serde_json::to_vec(&metadata)
-            .map_err(|_| TransportError::InvalidConfiguration)?
+            .map_err(|_| TransportError::InvalidCatalog)?
             .len()
             > 64 * 1024
             || icons.len() > 256
@@ -191,7 +200,7 @@ impl RemoteCatalog {
                 .iter()
                 .any(|(id, png)| id.is_empty() || id.len() > 256 || !valid_icon_png(png))
         {
-            return Err(TransportError::InvalidConfiguration);
+            return Err(TransportError::InvalidCatalog);
         }
         Ok(Self { metadata, icons })
     }
@@ -829,6 +838,45 @@ async fn verify_tailnet_address(ip: IpAddr) -> Result<(), TransportError> {
         return Err(TransportError::TailnetUnavailable);
     }
     Ok(())
+}
+
+/// Choose this node's assigned tailnet IP from CLI status and OS interfaces.
+/// Prefers IPv4 when both families are present so the listener form stays copyable.
+fn select_local_tailnet_ip(status: &Value, interfaces: &[IpAddr]) -> Option<IpAddr> {
+    if status.get("BackendState").and_then(Value::as_str) != Some("Running") {
+        return None;
+    }
+    let mut v4 = None;
+    let mut v6 = None;
+    for address in status.pointer("/Self/TailscaleIPs")?.as_array()? {
+        let Ok(ip) = address.as_str()?.parse::<IpAddr>() else {
+            continue;
+        };
+        if !is_tailnet_ip(ip) || !interfaces.contains(&ip) {
+            continue;
+        }
+        match ip {
+            IpAddr::V4(_) if v4.is_none() => v4 = Some(ip),
+            IpAddr::V6(_) if v6.is_none() => v6 = Some(ip),
+            _ => {}
+        }
+    }
+    v4.or(v6)
+}
+
+/// Discover this Mac's assigned tailnet address for the default Durop listener port.
+/// Requires a running Tailscale node whose CGNAT or fd7a address is on a local interface.
+pub async fn local_listener_address() -> Result<SocketAddr, TransportError> {
+    let interfaces: Vec<IpAddr> = if_addrs::get_if_addrs()
+        .map_err(TransportError::Io)?
+        .into_iter()
+        .map(|interface| interface.ip())
+        .collect();
+    let parsed: Value = serde_json::from_slice(&tailscale_output(&["status", "--json"]).await?)
+        .map_err(|_| TransportError::TailnetUnavailable)?;
+    let ip =
+        select_local_tailnet_ip(&parsed, &interfaces).ok_or(TransportError::TailnetUnavailable)?;
+    Ok(SocketAddr::new(ip, DEFAULT_LISTEN_PORT))
 }
 
 /// Resolve an installed executable without invoking shell aliases or installation prompts.

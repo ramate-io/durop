@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -147,6 +147,8 @@ enum Update {
     HostEnded(u64),
     // Report only the current enable attempt; stale generations are ignored by dispatch.
     HostFailed(u64, String),
+    // One-shot OS/CLI lookup of this Mac's assigned tailnet listener address.
+    ListenerDiscovered(Option<String>),
     // The authenticated initial snapshot authorizes the Connecting -> Connected transition.
     Connected(u64, HostSnapshot, RemoteCatalogView),
     // Complete remote state supersedes any previously displayed event-derived state.
@@ -173,6 +175,10 @@ pub struct NetworkState {
     local_permission: Arc<std::sync::atomic::AtomicBool>,
     /// Address to receive commands on, independent of the selected destination.
     pub listen_address: String,
+    /// Assigned tailnet listener discovered from this Mac's Tailscale status, if any.
+    pub discovered_listener: Option<String>,
+    // True after the one-shot OS/CLI lookup finishes, including failure.
+    listener_lookup_done: bool,
     /// Independently authorized controller inputs for the current application session.
     pub controllers: Vec<ControllerSource>,
     /// Redacted administrative capability and secure-storage status.
@@ -251,7 +257,42 @@ impl NetworkState {
     #[cfg(test)]
     /// Construct the same bounded orchestration without a native window event loop.
     pub(crate) fn for_ui_test(snapshot: HostSnapshot) -> Self {
-        NetworkState::new(snapshot, &NetworkConfig::default(), Arc::new(|| {}))
+        let mut network = NetworkState::new(snapshot, &NetworkConfig::default(), Arc::new(|| {}));
+        network.listener_lookup_done = true;
+        network
+    }
+
+    /// Listener field value: explicit address, else the discovered tailnet IP:port.
+    pub fn listener_endpoint(&self) -> &str {
+        if !self.listen_address.is_empty() {
+            &self.listen_address
+        } else {
+            self.discovered_listener.as_deref().unwrap_or("")
+        }
+    }
+
+    /// Explain the discovered or required listener address without repeating user input.
+    pub fn listener_hint(&self) -> String {
+        if let Some(address) = &self.discovered_listener {
+            format!("Detected {address}. MagicDNS names are not accepted.")
+        } else if self.listener_lookup_done {
+            "Tailscale did not report this Mac's address. Enter the 100.x IP and port 48732 from the Tailscale app.".into()
+        } else {
+            "Looking up this Mac's Tailscale address…".into()
+        }
+    }
+
+    /// Read-only status/CLI lookup; never enrolls a device or changes tailnet policy.
+    pub fn discover_listener(&self) {
+        let updates = self.update_tx.clone();
+        let wake = self.wake.clone();
+        self.runtime.spawn(async move {
+            let found = transport::local_listener_address()
+                .await
+                .ok()
+                .map(|address| address.to_string());
+            notify(&updates, &wake, Update::ListenerDiscovered(found)).await;
+        });
     }
 
     #[cfg(test)]
@@ -561,7 +602,9 @@ fn setup(
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
     });
-    commands.insert_resource(NetworkState::new(runtime.host.snapshot(), &config, wake));
+    let network = NetworkState::new(runtime.host.snapshot(), &config, wake);
+    network.discover_listener();
+    commands.insert_resource(network);
 }
 
 impl NetworkState {
@@ -619,6 +662,8 @@ impl NetworkState {
             local_enabled: true,
             local_permission: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             listen_address: config.listen_address.clone().unwrap_or_default(),
+            discovered_listener: None,
+            listener_lookup_done: false,
             controllers: Vec::new(),
             admin_status: "Configure an API token to create invitations".into(),
             admin_secret_available: false,
@@ -779,6 +824,15 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
                 network.receive_requested = false;
                 network.status = format!("Remote host unavailable: {error}")
             }
+            Update::ListenerDiscovered(found) => {
+                network.listener_lookup_done = true;
+                if let Some(address) = found {
+                    network.discovered_listener = Some(address.clone());
+                    if network.listen_address.is_empty() {
+                        network.listen_address = address;
+                    }
+                }
+            }
             Update::HostEnded(generation) if generation == network.host_generation => {
                 network.receive_requested = false;
                 network.disable_host();
@@ -863,7 +917,13 @@ impl NetworkConfig {
         } else {
             address
         };
-        address.parse().map_err(|_| ())
+        if let Ok(endpoint) = address.parse() {
+            return Ok(endpoint);
+        }
+        address
+            .parse::<IpAddr>()
+            .map(|ip| SocketAddr::new(ip, crate::transport::DEFAULT_LISTEN_PORT))
+            .map_err(|_| ())
     }
 }
 
@@ -893,10 +953,24 @@ impl RemoteCatalogView {
             });
             let mut png = Vec::new();
             std::fs::File::open(&clip.icon_path)
-                .map_err(|_| "Catalog icon unavailable")?
-                .take(32 * 1024 + 1)
+                .map_err(|_| format!("Catalog icon unavailable for {}", clip.identity))?
+                .take((crate::transport::MAX_ICON_PNG + 1) as u64)
                 .read_to_end(&mut png)
-                .map_err(|_| "Catalog icon unavailable")?;
+                .map_err(|_| format!("Catalog icon unavailable for {}", clip.identity))?;
+            if png.len() > crate::transport::MAX_ICON_PNG {
+                return Err(format!(
+                    "Clip {} icon is {} KiB; remote sharing allows at most {} KiB",
+                    clip.identity,
+                    png.len().div_ceil(1024),
+                    crate::transport::MAX_ICON_PNG / 1024
+                ));
+            }
+            if !crate::transport::valid_icon_png(&png) {
+                return Err(format!(
+                    "Clip {} icon is not a bounded PNG preview",
+                    clip.identity
+                ));
+            }
             icons.insert(clip.identity.clone(), png);
         }
         let view = RemoteCatalogView {
@@ -1427,5 +1501,18 @@ mod tests {
         let mut duplicates = view.clone();
         duplicates.clips.push(view.clips[0].clone());
         assert!(!duplicates.validate());
+        assert_eq!(
+            NetworkConfig::parse_address("100.75.38.86").unwrap(),
+            "100.75.38.86:48732".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn bundled_reactions_project_within_remote_icon_bounds() {
+        let catalog = crate::catalog::load_local(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sample-packs/reactions"),
+        )
+        .unwrap();
+        RemoteCatalogView::project(&catalog).unwrap();
     }
 }

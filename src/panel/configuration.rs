@@ -526,7 +526,7 @@ impl ConfigurationDraft {
     fn endpoint(value: &str) -> Result<SocketAddr, ValidationError> {
         let invalid = || ValidationError {
             field: ConfigurationFieldKey::Endpoint,
-            message: "Use an explicit Tailscale IP and nonzero port, optionally ws://IP:port/control.",
+            message: "Use this Mac's Tailscale IP and port 48732. MagicDNS names are not accepted.",
         };
         let value = value.trim();
         let address = if let Some(rest) = value.strip_prefix("ws://") {
@@ -534,7 +534,13 @@ impl ConfigurationDraft {
         } else {
             value
         };
-        let endpoint: SocketAddr = address.parse().map_err(|_| invalid())?;
+        let endpoint: SocketAddr = if let Ok(endpoint) = address.parse() {
+            endpoint
+        } else if let Ok(ip) = address.parse::<IpAddr>() {
+            SocketAddr::new(ip, crate::transport::DEFAULT_LISTEN_PORT)
+        } else {
+            return Err(invalid());
+        };
         let tailnet = match endpoint.ip() {
             IpAddr::V4(ip) => ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]),
             IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
@@ -775,6 +781,10 @@ mod tests {
         }
         assert!(ConfigurationDraft::endpoint("ws://100.100.0.10:48732/control").is_ok());
         assert!(ConfigurationDraft::endpoint("[fd7a:115c:a1e0::1]:48732").is_ok());
+        assert_eq!(
+            ConfigurationDraft::endpoint("100.100.0.10").unwrap(),
+            "100.100.0.10:48732".parse().unwrap()
+        );
         for token in ["", "tskey-api-not-an-app-token", "not-hex", "a"] {
             assert!(ConfigurationDraft::credential(token).is_err());
         }

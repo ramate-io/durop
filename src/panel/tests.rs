@@ -1078,6 +1078,28 @@ fn listener_apply_keeps_outbound_to_address() {
     assert!(app.world().resource::<Actions>().0.is_empty());
 }
 
+#[test]
+fn listener_accepts_tailnet_ip_without_an_explicit_port() {
+    let mut app = sources_app();
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        let modal = model.modal.as_mut().unwrap();
+        modal.select_source(SourceSelection::Remote("alice".into()));
+        modal.show_source_details(SourceDetails::Listener);
+        modal.editors[2].text = "100.101.102.103".into();
+        modal.editors[2].cursor = modal.editors[2].text.len();
+    }
+    app.world_mut()
+        .spawn((Interaction::Pressed, UiAction::EnableListener));
+    app.update();
+    let network = app.world().resource::<crate::network_app::NetworkState>();
+    assert_eq!(network.listen_address, "100.101.102.103:48732");
+    assert!(matches!(
+        network.actions.front(),
+        Some(crate::network_app::NetworkAction::EnableHost)
+    ));
+}
+
 /// Press one transient source-navigation button without leaving stale synthetic interactions.
 fn source_press(app: &mut App, action: UiAction) {
     let button = app.world_mut().spawn((Interaction::Pressed, action)).id();

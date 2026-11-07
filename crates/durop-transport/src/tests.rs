@@ -374,14 +374,44 @@ fn png_icon_dimensions_are_bounded_before_decode() {
     assert!(valid_icon_png(&png));
     png[16..20].copy_from_slice(&65536u32.to_be_bytes());
     assert!(!valid_icon_png(&png));
-    assert!(
+    assert!(matches!(
         RemoteCatalog::new(
             serde_json::json!({}),
             BTreeMap::from([("huge".into(), png)])
-        )
-        .is_err()
-    );
+        ),
+        Err(TransportError::InvalidCatalog)
+    ));
     assert!(!valid_icon_png(b"\x89PNG\r\n\x1a\n"));
+    let mut oversized = include_bytes!("../../../assets/overlay-proof.png").to_vec();
+    oversized.resize(MAX_ICON_PNG + 1, 0);
+    assert!(!valid_icon_png(&oversized));
+}
+
+#[test]
+fn local_tailnet_ip_prefers_assigned_ipv4() {
+    let status = serde_json::json!({
+        "BackendState": "Running",
+        "Self": {
+            "TailscaleIPs": ["fd7a:115c:a1e0::1", "100.75.38.86", "192.168.1.10"]
+        }
+    });
+    let interfaces = [
+        "fd7a:115c:a1e0::1".parse().unwrap(),
+        "100.75.38.86".parse().unwrap(),
+        "192.168.1.10".parse().unwrap(),
+    ];
+    assert_eq!(
+        super::select_local_tailnet_ip(&status, &interfaces).unwrap(),
+        "100.75.38.86".parse::<std::net::IpAddr>().unwrap()
+    );
+    assert!(
+        super::select_local_tailnet_ip(
+            &serde_json::json!({"BackendState": "Stopped"}),
+            &interfaces
+        )
+        .is_none()
+    );
+    assert!(super::select_local_tailnet_ip(&status, &["10.0.0.1".parse().unwrap()]).is_none());
 }
 
 #[tokio::test]

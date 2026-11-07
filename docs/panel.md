@@ -16,7 +16,7 @@ deltas and OS-provided momentum; there are no row thresholds or snapping. Mouse
 wheel lines convert to pixels, and the scrollbar follows the same continuous offset.
 Search matches every word across title, tags and category. Thumbnails are bounded
 before decode (one MiB, 512×512), with a bounded 128-entry cache including failures.
-Remote icons additionally satisfy the transport's 32 KiB limit.
+Remote icons additionally satisfy the transport's 160 KiB limit.
 
 **Host → Native** selects the primary or an enumerated display. **Host → Tailscale**
 accepts the remote host's explicit Tailscale IP:port and Durop pairing token. This

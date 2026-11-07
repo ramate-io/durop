@@ -62,10 +62,11 @@ nix develop --command cargo run -p durop --bin durop --locked
 1. In **To**, choose the local display. In **Catalog**, choose the clips to play.
 2. In **From**, choose **+ → Tailscale controller**, enter a name, and **Add controller**.
    Buttons across the top select which source to edit; local and remote sources
-   stay independently enabled. In the new source's **Listener settings**, enter
-   this Mac's Tailscale address and TCP 48732, then **Enable remote listener**.
+   stay independently enabled. In the new source's **Listener settings**, Durop
+   prefills this Mac's Tailscale IPv4 and TCP 48732 when the app CLI can see the
+   enrolled node. Confirm or correct the address, then **Enable remote listener**.
    Durop verifies the address belongs to the local enrolled node. Listener settings
-   are shared by all Tailscale sources.
+   are shared by all Tailscale sources. MagicDNS names are not accepted.
 3. If that user needs network access, open **Invitation credentials** to configure
    the host token, then choose **Create network invitation** in their source form.
    This shares only this host device with that user; it does not
