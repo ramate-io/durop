@@ -72,6 +72,10 @@ enum Packet {
         command_id: String,
         outcome: CommandOutcome,
     },
+    // Acknowledges cancellation after all earlier frames on this socket.
+    Canceled {
+        command_id: String,
+    },
     // Gaps/overflow invalidate buffered history and force snapshot recovery.
     Event {
         event: HostEvent,
@@ -110,6 +114,8 @@ enum Expected {
     Catalog,
     Icon(String),
     Outcome(String),
+    // A barrier drains any outcome that raced the abandoned command's cancellation.
+    Canceled(String),
 }
 
 impl Expected {
@@ -120,7 +126,8 @@ impl Expected {
                 true
             }
             (Self::Icon(expected), Packet::Icon { clip_id, .. }) => expected == clip_id,
-            (Self::Outcome(expected), Packet::Outcome { command_id, .. }) => expected == command_id,
+            (Self::Outcome(expected), Packet::Outcome { command_id, .. })
+            | (Self::Canceled(expected), Packet::Canceled { command_id }) => expected == command_id,
             _ => false,
         }
     }
@@ -322,6 +329,45 @@ impl ControllerClient {
         Ok(outcome)
     }
 
+    /// Submit while preserving an upstream admission guard across a relay hop.
+    ///
+    /// The guard is checked before sending and at most every ten milliseconds while
+    /// waiting. Revocation cancels this socket's pending host admission and drains
+    /// its acknowledgment barrier, leaving unrelated controllers connected. `None`
+    /// means the upstream source ended; a destination command already accepted
+    /// before cancellation cannot be undone. Guard closures must be nonblocking.
+    pub async fn submit_guarded_envelope(
+        &mut self,
+        envelope: Envelope,
+        active: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<Option<CommandOutcome>, ControllerError> {
+        if !active() {
+            return Ok(None);
+        }
+        let command_id = envelope.command_id.clone();
+        let result = tokio::select! {
+            biased;
+            _ = async {
+                loop {
+                    if !active() { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => None,
+            result = self.submit_envelope(envelope) => Some(result),
+        };
+        match result {
+            Some(outcome) => outcome.map(Some),
+            None => {
+                self.roundtrip(
+                    serde_json::json!({"type":"cancel", "command_id":command_id}),
+                    Expected::Canceled(command_id),
+                )
+                .await?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Fetch bounded controller-safe metadata over the authenticated connection.
     pub async fn catalog(&mut self) -> Result<Value, ControllerError> {
         let packet = self
@@ -499,6 +545,10 @@ impl ControllerClient {
             match packet {
                 Packet::Event { event } => self.record_event(event),
                 Packet::Snapshot { snapshot } => self.apply_snapshot(snapshot)?,
+                Packet::Outcome { command_id, .. } if matches!(&expected, Expected::Canceled(id) if id == &command_id) =>
+                    {}
+                Packet::Error { code }
+                    if code == "busy" && matches!(expected, Expected::Canceled(_)) => {}
                 Packet::Error { code } => {
                     return Err(match code.as_str() {
                         "busy" => ControllerError::Busy,

@@ -41,8 +41,14 @@ use tokio_tungstenite::{
 const MAX_CONNECTIONS: usize = 4;
 // Requests are small commands/identities; full media is never accepted on this channel.
 const MAX_INPUT: usize = 16 * 1024;
-// Leaves room for JSON-expanded bounded PNG bytes and authoritative snapshots.
-const MAX_OUTPUT: usize = 256 * 1024;
+/// TCP port used when a tailnet IP is supplied without an explicit port.
+pub const DEFAULT_LISTEN_PORT: u16 = 48732;
+
+/// Compressed PNG size accepted in the remote catalog; JSON encodes each byte as a number.
+pub const MAX_ICON_PNG: usize = 160 * 1024;
+// JSON arrays expand PNG bytes about four times; keep snapshots and one icon in one frame.
+const MAX_OUTPUT: usize = 768 * 1024;
+const _: () = assert!(MAX_OUTPUT >= MAX_ICON_PNG * 4 + 1024);
 // Each stage has its own deadline; an idle or backpressured peer cannot pin a task.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,6 +73,8 @@ enum BindingGuard {
 pub enum TransportError {
     /// The selected address, origin list, credential, or catalog exceeds policy bounds.
     InvalidConfiguration,
+    /// The trusted catalog projection exceeded icon or metadata wire bounds.
+    InvalidCatalog,
     /// The configured address or installed Tailscale CLI cannot verify a running tailnet.
     TailnetUnavailable,
     /// An operating-system socket or interface operation failed.
@@ -85,6 +93,7 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidConfiguration => f.write_str("invalid remote session configuration"),
+            Self::InvalidCatalog => f.write_str("remote catalog preview exceeds sharing bounds"),
             Self::TailnetUnavailable => f.write_str("configured Tailscale address or CLI is unavailable; install/authorize Tailscale and verify this Mac's tailnet address (the macOS app's bundled CLI is supported)"),
             Self::Io(error) => write!(f, "transport I/O: {error}"),
             Self::Random => f.write_str("secure randomness unavailable"),
@@ -166,7 +175,7 @@ pub struct RemoteCatalog {
 /// Bound decoded PNG allocation as well as compressed wire size.
 pub fn valid_icon_png(png: &[u8]) -> bool {
     png.len() >= 33
-        && png.len() <= 32 * 1024
+        && png.len() <= MAX_ICON_PNG
         && png.starts_with(b"\x89PNG\r\n\x1a\n")
         && png[8..12] == 13u32.to_be_bytes()
         && &png[12..16] == b"IHDR"
@@ -183,7 +192,7 @@ impl RemoteCatalog {
     /// The trusted catalog loader supplies the bytes; the wire never accepts asset paths.
     pub fn new(metadata: Value, icons: BTreeMap<String, Vec<u8>>) -> Result<Self, TransportError> {
         if serde_json::to_vec(&metadata)
-            .map_err(|_| TransportError::InvalidConfiguration)?
+            .map_err(|_| TransportError::InvalidCatalog)?
             .len()
             > 64 * 1024
             || icons.len() > 256
@@ -191,7 +200,7 @@ impl RemoteCatalog {
                 .iter()
                 .any(|(id, png)| id.is_empty() || id.len() > 256 || !valid_icon_png(png))
         {
-            return Err(TransportError::InvalidConfiguration);
+            return Err(TransportError::InvalidCatalog);
         }
         Ok(Self { metadata, icons })
     }
@@ -200,10 +209,15 @@ impl RemoteCatalog {
 /// Drain with try_recv on the host thread. Check is_active immediately before
 /// Host::accept, skip stale requests, then reply. StopAll uses a separate bounded lane.
 pub struct RemoteCommand {
-    /// Canonical command identity and host policy fields, unchanged by the adapter.
+    /// Host policy fields and command. Registry sessions namespace command IDs by
+    /// authenticated source; legacy sessions preserve the original command ID.
     pub envelope: Envelope,
     /// One reply to the originating connection; closure also cancels pending admission.
     pub reply: oneshot::Sender<CommandOutcome>,
+    /// Host-assigned identity for registry authentication; legacy sessions return None.
+    pub source_id: Option<String>,
+    // Revoking this controller invalidates queued commands independently of the session.
+    source: Arc<AtomicBool>,
     // Dropping the originating socket task invalidates requests already in the host queue.
     connection: Arc<AtomicBool>,
     // Ending host permission invalidates every connection's pending requests together.
@@ -211,10 +225,11 @@ pub struct RemoteCommand {
 }
 
 impl RemoteCommand {
-    /// Whether connection/session permission and the reply receiver remain live.
+    /// Whether source/connection/session permission and the reply receiver remain live.
     /// The host must check this immediately before accepting the command.
     pub fn is_active(&self) -> bool {
-        self.connection.load(Ordering::Acquire)
+        self.source.load(Ordering::Acquire)
+            && self.connection.load(Ordering::Acquire)
             && self.session.load(Ordering::Acquire)
             && !self.reply.is_closed()
     }
@@ -240,7 +255,8 @@ pub struct RemoteSession {
     pub address: SocketAddr,
     /// Host-owned recording session identity used for command validation/deduplication.
     pub session_id: String,
-    /// Fresh pairing credential; its Debug representation is redacted.
+    /// Legacy pairing credential; redacted by Debug. Registry-only sessions reject
+    /// this value and require a credential issued by `SourceAccessRegistry`.
     pub credential: SessionCredential,
     // Synchronous permission check shared with connections and application status views.
     active: Arc<AtomicBool>,
@@ -294,6 +310,28 @@ pub async fn enable(
     )
 }
 
+/// Enable a listener accepting only credentials issued by the supplied registry.
+/// The compatibility `RemoteSession::credential` is deliberately rejected here.
+/// Each authenticated source gets independent command identity and revocation guards.
+pub async fn enable_with_registry(
+    config: SessionConfig,
+    bridge: HostBridge,
+    catalog: RemoteCatalog,
+    registry: SourceAccessRegistry,
+) -> Result<RemoteSession, TransportError> {
+    config.validate()?;
+    verify_tailnet_address(config.address.ip()).await?;
+    let listener = TcpListener::bind(config.address).await?;
+    start_with_access(
+        listener,
+        config.allowed_origins,
+        bridge,
+        catalog,
+        BindingGuard::Tailnet,
+        Some(registry),
+    )
+}
+
 #[cfg(any(test, feature = "test-support"))]
 /// Enable an authenticated loopback fixture only in explicit test-support builds.
 pub async fn enable_test_loopback(
@@ -304,6 +342,24 @@ pub async fn enable_test_loopback(
     start(listener, vec![], bridge, catalog, BindingGuard::Loopback)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+/// Enable a registry-only loopback fixture under the explicit test-support feature.
+pub async fn enable_test_loopback_with_registry(
+    bridge: HostBridge,
+    catalog: RemoteCatalog,
+    registry: SourceAccessRegistry,
+) -> Result<RemoteSession, TransportError> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    start_with_access(
+        listener,
+        vec![],
+        bridge,
+        catalog,
+        BindingGuard::Loopback,
+        Some(registry),
+    )
+}
+
 /// Attach lifecycle ownership to an already verified listener and fresh credential.
 /// The drop guard also revokes permission if the task is aborted before its first poll.
 fn start(
@@ -312,6 +368,18 @@ fn start(
     bridge: HostBridge,
     catalog: RemoteCatalog,
     guard: BindingGuard,
+) -> Result<RemoteSession, TransportError> {
+    start_with_access(listener, origins, bridge, catalog, guard, None)
+}
+
+/// Construct either legacy single-secret or registry-only listener authentication.
+fn start_with_access(
+    listener: TcpListener,
+    origins: Vec<String>,
+    bridge: HostBridge,
+    catalog: RemoteCatalog,
+    guard: BindingGuard,
+    registry: Option<SourceAccessRegistry>,
 ) -> Result<RemoteSession, TransportError> {
     let address = listener.local_addr()?;
     let session_id = bridge.snapshot.borrow().session_id.clone();
@@ -324,6 +392,7 @@ fn start(
     let (revoke, mut revoked) = watch::channel(false);
     let state = Arc::new(ConnectionState {
         expected_authorization,
+        registry,
         origins,
         active: active.clone(),
         bridge,
@@ -381,6 +450,8 @@ fn start(
 struct ConnectionState {
     // Compared in constant time during upgrade; never included in responses or Debug output.
     expected_authorization: String,
+    // When present, legacy authorization is rejected; identity comes only from the secret.
+    registry: Option<SourceAccessRegistry>,
     // Exact browser origins, independent of tailnet membership and bearer permission.
     origins: Vec<String>,
     // Shared session permission; revocation is checked again before command admission.
@@ -418,6 +489,8 @@ struct PendingReply {
 enum ClientMessage {
     // Carries canonical policy data; the host still validates revision and clip identity.
     Command { envelope: Envelope },
+    // Cancellation affects only the same authenticated socket's outstanding request.
+    Cancel { command_id: String },
     // Reconnect/gap recovery always asks for complete authoritative state.
     Snapshot,
     // Browsing stays on the authenticated socket rather than a second HTTP server.
@@ -436,6 +509,7 @@ impl ClientMessage {
             "snapshot" | "catalog" => &["type"],
             "icon" => &["type", "clip_id"],
             "command" => &["type", "envelope"],
+            "cancel" => &["type", "command_id"],
             _ => return None,
         };
         if object.len() != allowed.len()
@@ -469,6 +543,10 @@ enum ServerMessage<'a> {
         command_id: &'a str,
         outcome: CommandOutcome,
     },
+    // A distinct barrier lets a client drain a racing abandoned outcome without ambiguity.
+    Canceled {
+        command_id: &'a str,
+    },
     // Sequenced host transitions do not imply physical presentation.
     Event {
         event: &'a HostEvent,
@@ -486,17 +564,23 @@ fn handshake(
     request: &Request,
     mut response: Response,
     state: &ConnectionState,
+    lease: &mut Option<access::AccessLease>,
 ) -> Result<Response, ErrorResponse> {
     let authorized = request.headers().get_all("authorization").iter().count() == 1
         && request
             .headers()
             .get("authorization")
             .map(|value| {
-                bool::from(
-                    value
-                        .as_bytes()
-                        .ct_eq(state.expected_authorization.as_bytes()),
-                )
+                if let Some(registry) = &state.registry {
+                    *lease = registry.authenticate(value.as_bytes());
+                    lease.is_some()
+                } else {
+                    bool::from(
+                        value
+                            .as_bytes()
+                            .ct_eq(state.expected_authorization.as_bytes()),
+                    )
+                }
             })
             .unwrap_or(false);
     let origin = match request.headers().get_all("origin").iter().count() {
@@ -551,12 +635,13 @@ async fn connection(
         .write_buffer_size(0)
         .max_write_buffer_size(MAX_OUTPUT + 1024);
     // Callback requires an unboxed ErrorResponse (an upstream API constraint).
+    let mut lease = None;
     #[allow(clippy::result_large_err)]
     let upgraded = timeout(
         HANDSHAKE_TIMEOUT,
         accept_hdr_async_with_config(
             tcp,
-            |request: &Request, response| handshake(request, response, &state),
+            |request: &Request, response| handshake(request, response, &state, &mut lease),
             Some(config),
         ),
     )
@@ -564,8 +649,17 @@ async fn connection(
     let Ok(Ok(mut ws)) = upgraded else {
         return;
     };
+    let source = lease
+        .as_ref()
+        .map(|lease| lease.active.clone())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+    let mut source_revoked = lease.as_ref().map(|lease| lease.revoked.subscribe());
+    if !source.load(Ordering::Acquire) {
+        return;
+    }
     let mut events = state.bridge.events.subscribe();
-    let snapshot = state.bridge.snapshot.borrow().clone();
+    let mut snapshots = state.bridge.snapshot.clone();
+    let snapshot = snapshots.borrow_and_update().clone();
     if !send(
         &mut ws,
         &ServerMessage::Snapshot {
@@ -584,6 +678,12 @@ async fn connection(
         tokio::select! {
             biased;
             _ = revoked.changed() => break,
+            _ = async {
+                match source_revoked.as_mut() {
+                    Some(revoked) => { let _ = revoked.changed().await; },
+                    None => std::future::pending::<()>().await,
+                }
+            } => break,
             _ = tokio::time::sleep_until(idle_deadline) => break,
             incoming = ws.next() => {
                 let Some(Ok(message)) = incoming else { break; };
@@ -593,7 +693,7 @@ async fn connection(
                     requests = 0;
                 }
                 requests += 1;
-                if requests > REQUESTS_PER_SECOND || !state.active.load(Ordering::Acquire) { break; }
+                if requests > REQUESTS_PER_SECOND || !state.active.load(Ordering::Acquire) || !source.load(Ordering::Acquire) { break; }
                 let Message::Text(text) = message else {
                     match message {
                         Message::Ping(bytes) => {
@@ -608,13 +708,23 @@ async fn connection(
                 };
                 let Some(request) = ClientMessage::parse(&text) else { break; };
                 let response = match request {
+                    ClientMessage::Cancel { command_id } => {
+                        if command_id.is_empty() || command_id.len() > 128 { break; }
+                        if pending.as_ref().is_some_and(|pending| pending.command_id == command_id) {
+                            // Dropping the reply receiver synchronously invalidates host admission.
+                            pending = None;
+                        }
+                        send(&mut ws, &ServerMessage::Canceled { command_id: &command_id }).await
+                    }
                     ClientMessage::Snapshot => { let snapshot = state.bridge.snapshot.borrow().clone(); send(&mut ws, &ServerMessage::Snapshot { snapshot: &snapshot }).await },
                     ClientMessage::Catalog => send(&mut ws, &ServerMessage::Catalog { catalog: &state.catalog.metadata }).await,
                     ClientMessage::Icon { clip_id } => match state.catalog.icons.get(&clip_id) { Some(png) => send(&mut ws, &ServerMessage::Icon { clip_id: &clip_id, png }).await, None => send(&mut ws, &ServerMessage::Error { code: "unknown_icon" }).await },
-                    ClientMessage::Command { envelope } => {
+                    ClientMessage::Command { mut envelope } => {
                         // Revision, IDs, deduplication, and playback remain authoritative in Host.
                         if envelope.session_id != state.session_id || envelope.protocol_version != PROTOCOL_VERSION { break; }
                         let command_id = envelope.command_id.clone();
+                        if command_id.is_empty() || command_id.len() > 128 { break; }
+                        if let Some(lease) = &lease { envelope.command_id = lease.command_id(&command_id); }
                         let emergency = matches!(envelope.command, PlaybackCommand::StopAll);
                         if pending.is_some() && !emergency {
                             if !send(&mut ws, &ServerMessage::Error { code: "busy" }).await { break; }
@@ -625,7 +735,7 @@ async fn connection(
                             pending = None;
                         }
                         let (reply, received) = oneshot::channel();
-                        let command = RemoteCommand { envelope, reply, connection: live.clone(), session: state.active.clone() };
+                        let command = RemoteCommand { envelope, reply, source_id: lease.as_ref().map(|lease| lease.source_id.clone()), source: source.clone(), connection: live.clone(), session: state.active.clone() };
                         let queue = if emergency { &state.bridge.emergency } else { &state.bridge.commands };
                         if queue.try_send(command).is_err() {
                             send(&mut ws, &ServerMessage::Error { code: "busy" }).await
@@ -654,6 +764,12 @@ async fn connection(
                     }
                     _ => break,
                 }
+            }
+            changed = snapshots.changed() => {
+                if changed.is_err() { break; }
+                let snapshot = snapshots.borrow_and_update().clone();
+                if snapshot.session_id != state.session_id { break; }
+                if !send(&mut ws, &ServerMessage::Snapshot { snapshot: &snapshot }).await { break; }
             }
             event = events.recv() => {
                 let delivered = match event {
@@ -724,26 +840,68 @@ async fn verify_tailnet_address(ip: IpAddr) -> Result<(), TransportError> {
     Ok(())
 }
 
+/// Choose this node's assigned tailnet IP from CLI status and OS interfaces.
+/// Prefers IPv4 when both families are present so the listener form stays copyable.
+fn select_local_tailnet_ip(status: &Value, interfaces: &[IpAddr]) -> Option<IpAddr> {
+    if status.get("BackendState").and_then(Value::as_str) != Some("Running") {
+        return None;
+    }
+    let mut v4 = None;
+    let mut v6 = None;
+    for address in status.pointer("/Self/TailscaleIPs")?.as_array()? {
+        let Ok(ip) = address.as_str()?.parse::<IpAddr>() else {
+            continue;
+        };
+        if !is_tailnet_ip(ip) || !interfaces.contains(&ip) {
+            continue;
+        }
+        match ip {
+            IpAddr::V4(_) if v4.is_none() => v4 = Some(ip),
+            IpAddr::V6(_) if v6.is_none() => v6 = Some(ip),
+            _ => {}
+        }
+    }
+    v4.or(v6)
+}
+
+/// Discover this Mac's assigned tailnet address for the default Durop listener port.
+/// Requires a running Tailscale node whose CGNAT or fd7a address is on a local interface.
+pub async fn local_listener_address() -> Result<SocketAddr, TransportError> {
+    let interfaces: Vec<IpAddr> = if_addrs::get_if_addrs()
+        .map_err(TransportError::Io)?
+        .into_iter()
+        .map(|interface| interface.ip())
+        .collect();
+    let parsed: Value = serde_json::from_slice(&tailscale_output(&["status", "--json"]).await?)
+        .map_err(|_| TransportError::TailnetUnavailable)?;
+    let ip =
+        select_local_tailnet_ip(&parsed, &interfaces).ok_or(TransportError::TailnetUnavailable)?;
+    Ok(SocketAddr::new(ip, DEFAULT_LISTEN_PORT))
+}
+
 /// Resolve an installed executable without invoking shell aliases or installation prompts.
 fn find_tailscale(search: &std::ffi::OsStr, fallbacks: &[PathBuf]) -> Option<PathBuf> {
     std::env::split_paths(search)
         .map(|directory| directory.join("tailscale"))
         .chain(fallbacks.iter().cloned())
-        .find(|path| {
-            if !path.is_file() {
-                return false;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                path.metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            {
-                true
-            }
-        })
+        .find(|path| is_executable_file(path))
+}
+
+/// Validate a known candidate directly, without introducing a current-directory search.
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Use argument arrays and force the macOS app's CLI mode without opening its UI.
@@ -759,7 +917,6 @@ fn tailscale_command(executable: &Path, arguments: &[&str]) -> tokio::process::C
 /// Read at most 256 KiB within two seconds; cancellation kills the child process.
 /// Callers supply only read-only status, netcheck, or ping arguments.
 async fn tailscale_output(arguments: &[&str]) -> Result<Vec<u8>, TransportError> {
-    use std::process::Stdio;
     let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
     #[cfg(target_os = "macos")]
     let fallbacks = [
@@ -770,7 +927,29 @@ async fn tailscale_output(arguments: &[&str]) -> Result<Vec<u8>, TransportError>
     let fallbacks = [];
     let executable =
         find_tailscale(&search, &fallbacks).ok_or(TransportError::TailnetUnavailable)?;
-    let mut child = tailscale_command(&executable, arguments)
+    let mut candidates = vec![executable];
+    for fallback in &fallbacks {
+        if !candidates.contains(fallback) && is_executable_file(fallback) {
+            candidates.push(fallback.clone());
+        }
+    }
+    // A Nix CLI may target an absent open-source daemon while the GUI app is enrolled.
+    // Try only known executable candidates; all calls remain bounded and read-only.
+    for executable in candidates {
+        if let Ok(output) = tailscale_output_from(&executable, arguments).await {
+            return Ok(output);
+        }
+    }
+    Err(TransportError::TailnetUnavailable)
+}
+
+/// Bound one read-only CLI attempt and suppress subprocess error text that may contain identities.
+async fn tailscale_output_from(
+    executable: &Path,
+    arguments: &[&str],
+) -> Result<Vec<u8>, TransportError> {
+    use std::process::Stdio;
+    let mut child = tailscale_command(executable, arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -792,6 +971,28 @@ async fn tailscale_output(arguments: &[&str]) -> Result<Vec<u8>, TransportError>
         return Err(TransportError::TailnetUnavailable);
     }
     Ok(output)
+}
+
+/// Discover the current local Tailscale device ID through bounded read-only CLI status.
+/// No device/account data beyond the identifier is returned. A stopped daemon fails closed.
+pub async fn local_device_id() -> Result<String, TransportError> {
+    let status: Value = serde_json::from_slice(&tailscale_output(&["status", "--json"]).await?)
+        .map_err(|_| TransportError::TailnetUnavailable)?;
+    if status.get("BackendState").and_then(Value::as_str) != Some("Running") {
+        return Err(TransportError::TailnetUnavailable);
+    }
+    status
+        .pointer("/Self/ID")
+        .and_then(Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .map(str::to_owned)
+        .ok_or(TransportError::TailnetUnavailable)
 }
 
 /// Read-only, bounded report; never invokes enrollment or policy changes. No raw
@@ -816,10 +1017,17 @@ pub async fn diagnostics(peer: Option<IpAddr>) -> Result<Value, TransportError> 
     )
 }
 
+mod access;
+
+/// Tailscale invitation and host-only administration credential contracts.
+pub mod invitations;
+
 mod client;
 
 #[cfg(test)]
 mod tests;
+
+pub use access::{SourceAccess, SourceAccessRegistry};
 
 pub use client::{ControllerClient, ControllerError, ControllerUpdate};
 

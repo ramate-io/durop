@@ -83,11 +83,7 @@ impl PlacementModal {
     pub(super) fn editors(value: VisualPlacement) -> [Editor; 3] {
         [value.width_bps, value.x_bps, value.y_bps].map(|bps| {
             let text = format!("{}.{:02}", bps / 100, bps % 100);
-            Editor {
-                cursor: text.len(),
-                text,
-                ..default()
-            }
+            Editor { text, ..default() }
         })
     }
 
@@ -110,11 +106,7 @@ impl PlacementModal {
         let value = (i32::from(current) + i32::from(direction) * 100)
             .clamp(if index == 0 { 1 } else { 0 }, 10_000) as u16;
         let text = format!("{}.{:02}", value / 100, value % 100);
-        *editor = Editor {
-            cursor: text.len(),
-            text,
-            ..default()
-        };
+        *editor = Editor { text, ..default() };
         self.reset = false;
         self.error = None;
     }

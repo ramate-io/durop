@@ -17,8 +17,9 @@ nix develop
 cargo run -p durop --bin durop --locked
 ```
 
-This opens the bundled [reaction catalog](sample-packs/reactions). Choose **Host →
-Native** to configure a display, search, and click a card; **STOP ALL** stops playback. `cargo run --locked` also
+This opens the bundled [reaction catalog](sample-packs/reactions). In **From**, enable
+local controls; in **To**, choose the local display. Search and click a card;
+**STOP ALL** stops playback. **Catalog** selects the media pack. `cargo run --locked` also
 works from the workspace root. Without entering the shell first:
 
 ```sh
@@ -27,7 +28,7 @@ nix develop --command cargo run -p durop --bin durop --locked
 
 For a standalone `.app`, follow [packaging](docs/packaging.md). For arguments,
 pack sources, host/controller modes and pairing, see the [session guide](docs/session-runbook.md).
-For Tailscale admin setup, CDK Terrain policy and pairing in the controller,
+For Tailscale administration, sharing one host with guests and controller pairing,
 follow the [Tailnet quickstart](docs/tailnet-quickstart.md).
 
 ## Work

@@ -19,3 +19,6 @@ futures-util = { version = "0.3.34", features = ["sink"] }
 getrandom = "0.4.3"
 if-addrs = "0.14"
 subtle = "2.6"
+sha2.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+libc = "0.2"

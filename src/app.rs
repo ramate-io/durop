@@ -325,6 +325,21 @@ impl Runtime {
 
     /// Wrap a local command with the active session/revision and attempt bounded admission.
     fn submit(&mut self, command: PlaybackCommand, network: &mut crate::network_app::NetworkState) {
+        self.submit_with_origin(command, network, false);
+    }
+
+    // Shutdown/catalog replacement must stop media even with local input disabled.
+    fn cleanup(&mut self, network: &mut crate::network_app::NetworkState) {
+        self.submit_with_origin(PlaybackCommand::StopAll, network, true);
+    }
+
+    // Only internal cleanup bypasses the From permission; UI commands remain guarded.
+    fn submit_with_origin(
+        &mut self,
+        command: PlaybackCommand,
+        network: &mut crate::network_app::NetworkState,
+        system: bool,
+    ) {
         self.next_command += 1;
         let envelope = Envelope {
             protocol_version: PROTOCOL_VERSION,
@@ -333,7 +348,12 @@ impl Runtime {
             catalog_revision: self.catalog.revision.clone(),
             command,
         };
-        if let Err(reason) = network.queue_local(envelope) {
+        let admission = if system {
+            network.queue_system(envelope)
+        } else {
+            network.queue_local(envelope)
+        };
+        if let Err(reason) = admission {
             self.status = format!("Queue admission failed: {reason:?}");
         }
     }
@@ -413,6 +433,19 @@ pub(crate) fn actions(
     monitors: Query<&bevy::window::Monitor>,
 ) {
     for action in actions.0.drain(..) {
+        if !network.local_enabled
+            && matches!(
+                action,
+                Action::Play(_)
+                    | Action::PlayVisual { .. }
+                    | Action::SetVisual { .. }
+                    | Action::Stop(_)
+                    | Action::StopAll
+            )
+        {
+            runtime.status = "Local controls are disabled in From".into();
+            continue;
+        }
         match action {
             Action::Play(clip_id) => {
                 runtime.submit_selected(PlaybackCommand::Play { clip_id }, &mut network);
@@ -450,7 +483,7 @@ pub(crate) fn actions(
                 }
                 runtime.enabled = !runtime.enabled;
                 if !runtime.enabled {
-                    runtime.submit(PlaybackCommand::StopAll, &mut network);
+                    runtime.cleanup(&mut network);
                     network
                         .actions
                         .push_back(crate::network_app::NetworkAction::DisableHost);
@@ -478,7 +511,7 @@ pub(crate) fn actions(
             Action::Quit => {
                 runtime.quitting = true;
                 runtime.enabled = false;
-                runtime.submit(PlaybackCommand::StopAll, &mut network);
+                runtime.cleanup(&mut network);
                 network
                     .actions
                     .push_back(crate::network_app::NetworkAction::DisableHost);
@@ -511,7 +544,7 @@ pub(crate) fn actions(
                     runtime.status = "Pack load already in progress".into();
                     continue;
                 }
-                runtime.submit(PlaybackCommand::StopAll, &mut network);
+                runtime.cleanup(&mut network);
                 network
                     .actions
                     .push_back(crate::network_app::NetworkAction::DisableHost);

@@ -109,7 +109,8 @@ fn main() {
     App::new()
         .insert_resource(runtime)
         .insert_resource(network_app::NetworkConfig {
-            address: config.listen.clone().or_else(|| config.connect.clone()),
+            address: config.connect.clone(),
+            listen_address: config.listen.clone(),
             enable_host: config.listen.is_some(),
         })
         .add_plugins(

@@ -1,17 +1,26 @@
 # Remote-session adapter
 
-This is the independent issue #8 transport component. Application mode controls,
-the native host dispatcher, and two-Mac acceptance remain integration work. It does
-not start a listener by being compiled or by opening the bootstrap window.
+This library supplies authenticated input sessions, controller connections and
+host invitation administration. The application connects it to **From** inputs
+and the selected **To** destination. Merely opening Durop does not start a listener;
+sharing is explicit. Two-Mac acceptance remains a separate operator check.
 
-The host explicitly calls `transport::enable` on its one long-lived Tokio runtime,
-providing `SessionConfig`, `HostBridge`, and `RemoteCatalog`. Keep the returned
-`RemoteSession` only while remote access is enabled. `revoke()` immediately marks
-queued requests inactive and schedules connection/listener shutdown; `close().await`
-waits for shutdown. Dropping the handle also revokes. A new enable generates a new
-256-bit OS-random credential. Show `credential.bearer()` only in the explicit host
-pairing UI; never put it in a URL, command-line argument, file, analytics, or log.
-The credential's Debug representation is redacted.
+The application calls `transport::enable_with_registry` on its long-lived Tokio
+runtime, providing `SessionConfig`, `HostBridge`, `RemoteCatalog`, and a shared
+`SourceAccessRegistry`. Each host-assigned source gets its own 256-bit OS-random
+credential through `issue`. Disabling or revoking a source invalidates its current
+connections and queued work without affecting other sources. Re-enabling permits
+fresh authentication; it never revives old queued work. Registry authentication
+namespaces host command IDs per credential generation, preserving the controller's
+original ID in its wire reply and preventing cross-source deduplication collisions.
+
+Keep the returned `RemoteSession` only while remote input is enabled. `revoke()`
+immediately marks queued requests inactive and schedules connection/listener
+shutdown; `close().await` waits for shutdown. Dropping the handle also revokes.
+The compatibility `enable` API still creates one legacy session credential;
+registry-only listeners reject that value. Show source credentials only in the
+explicit host pairing UI; never put them in URLs, arguments, persisted files,
+analytics, or logs. Their Debug representations are redacted.
 
 Production configuration requires an exact configured Tailscale IPv4 or IPv6 address
 and a nonzero port (the infrastructure example uses TCP 48732). Enable requires the
@@ -20,14 +29,15 @@ running self identity. Each session checks again every two seconds. Failure revo
 the session, aborts its tasks, and closes the listener. A slow status command times
 out after two seconds. No wildcard, loopback, LAN, MagicDNS resolution, interface
 fallback, enrollment, or infrastructure apply is performed. The loopback bypass is
-compiled only for isolated tests. Keep the `tailscale` CLI on the application's PATH;
-the standalone macOS Tailscale app may require its documented CLI setup.
+compiled only for isolated tests. The CLI resolver checks PATH and known macOS
+app/CLI locations. If a PATH CLI cannot reach its daemon, it tries the official
+macOS app executable in CLI mode; every attempt is bounded and read-only.
 
 The POC uses `ws://TAILSCALE_IP:48732/control`: confidentiality and peer-network
 authentication depend on Tailscale's encrypted network, while the independent
 session credential grants application access. A public listener is unsupported.
 Install and authorize Tailscale separately. Follow the [network runbook](../infra/cdktn/tailscale/README.md)
-for policy backup/import, reviewed deployment, installation/login, and the narrow
+for `ensure`/reviewed apply, installation/login, and the narrow
 controller-to-host port grant. Tailnet membership alone grants no durop access.
 Ending a durop session leaves Tailscale enrollment and policy intact.
 
@@ -62,18 +72,33 @@ saturation or another in-flight normal command yields `busy`; do not retry blind
 with a new command ID. Host events are `{"type":"event","event":...}`.
 Track canonical event sequence numbers, discard events at/below the latest snapshot
 sequence, and request a snapshot after a gap. A lagging server-side subscriber sends
-a new snapshot rather than inferring missing state.
+a new snapshot rather than inferring missing state. Changes to the host snapshot
+watch channel also push full snapshots to idle controllers, including through
+relays. Watch updates can coalesce; the latest complete state is authoritative.
+
+A controller may cancel its one outstanding request with
+`{"type":"cancel","command_id":"unique-request"}`. The server drops only a
+matching pending reply on that authenticated connection, immediately invalidating
+its host admission guard, then replies
+`{"type":"canceled","command_id":"unique-request"}`. Other connections remain
+independent even if they use the same wire ID. Cancellation cannot undo playback
+already accepted by the host. An outcome can race cancellation; the distinct
+`canceled` acknowledgment is the ordered barrier after any earlier outcome.
+Cancellation messages consume the same request-rate budget as other traffic and
+do not extend the pending command's deadline.
 
 The trusted catalog loader supplies only controller-safe metadata and an immutable
 map of known clip IDs to validated PNG bytes. No remote filesystem path or asset URL
-is supported. There are at most 256 icons, each at most 32 KiB, and metadata is at
+is supported. There are at most 256 icons, each at most 160 KiB, and metadata is at
 most 64 KiB. Full playback assets and Git credentials never belong in that map.
+JSON encodes icon bytes as a number array, so one icon frame stays within the
+768 KiB output bound.
 
 ## Bounds and host wiring
 
 At most four connections (including unauthenticated upgrades) exist per session.
 An upgrade has three seconds; input frames/messages are at most 16 KiB; output is
-at most 256 KiB and has a five-second send deadline. Idle connections close after
+at most 768 KiB and has a five-second send deadline. Idle connections close after
 60 seconds. Every incoming message, including ping/pong, consumes one of 20 requests
 per one-second window. Malformed JSON, unknown fields, binary messages, oversized
 frames, and excess rates terminate the connection. Credentials are fixed length.
@@ -89,8 +114,11 @@ the shared host policy path and skip stale requests. This includes disconnected,
 revoked, superseded, and timed-out requests. Drain the emergency lane first; a newly
 accepted StopAll must invalidate normal requests already queued across all controllers
 (use the host ingress barrier). A same-connection StopAll also closes that connection's
-pending normal reply. Return the canonical host outcome through `reply`, publish
-host events and fresh snapshots, and keep their sizes within the output bound.
+pending normal reply. Publish the resulting authoritative snapshot before returning
+the canonical host outcome through `reply`, so a direct controller's immediate
+refresh cannot observe state from before its acknowledged command. Backend-start events
+remain separate from command acceptance. Publish host events and keep snapshots
+and events within the output bound.
 
 Never persist an adapter queue or replay controller button presses on reconnection.
 Reconnection gets the current snapshot. Already accepted playback can finish after
@@ -116,7 +144,15 @@ revision, PlaybackCommand)` for canonical typed outcomes, `catalog()` and `icon(
 for bounded browsing, `refresh_snapshot()` for current state, and `next_update()`
 for typed events or replacement snapshots. The panel can select `next_update()`
 alongside its bounded online UI action channel. Await commands and browse calls to
-completion; do not select and cancel those exchanges. Cancelling `next_update()`
+completion; do not select and cancel those exchanges directly. Relays use
+`submit_guarded_envelope(envelope, active_guard)` to preserve upstream permission
+while awaiting the destination. It checks the guard before sending and at most
+every ten milliseconds while waiting. On revocation it cancels the destination
+request, drains any racing outcome through the cancellation barrier, and returns
+`None`; other sources retain the destination connection. A failed or unsupported
+cancellation closes the connection, and its acknowledgment has the normal
+five-second I/O deadline. Cancellation of an already accepted command does not
+undo that command. Cancelling `next_update()`
 during gap recovery may leave a requested snapshot in flight; the next exchange
 accepts that late snapshot before its correlated reply. `current_snapshot()` supplies the
 session/revision for initial controls; publish host snapshots before related events.
@@ -140,7 +176,8 @@ Run `nix develop --command cargo test -p durop-transport --locked`, followed by 
 repository's formatting, locked check/test, and clippy commands. Real loopback sockets
 exercise successful authentication, rejection of credentials/origin/path/version,
 bounded connections and rates, malformed/oversized messages, catalog/icon scoping,
-reconnect snapshots, priority StopAll, disconnect cancellation, and revocation. These
+reconnect snapshots, priority StopAll, disconnect cancellation, independent source
+revocation, per-connection cancellation barriers, and idle snapshot propagation. These
 tests never bind to a real Tailscale interface or change network configuration.
 Four additional loopback tests use the production client for actual browse/commands,
 typed outcomes, event-gap recovery, reconnect/revocation, offline refusal, and pending

@@ -10,6 +10,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NetworkTests(unittest.TestCase):
+    def test_dedicated_sample_limits_shared_guests_to_durop_host_port(self):
+        """Prevent the guest example from accidentally granting other hosts or services."""
+        settings = Settings.load(ROOT / 'network.config.example.json', Path('/private/sample-state'))
+        grants = settings.policy['grants']
+        shared = [grant for grant in grants if 'autogroup:shared' in grant['src']]
+        self.assertEqual(len(shared), 1)
+        self.assertEqual(shared[0]['src'], ['autogroup:shared'])
+        self.assertEqual(shared[0]['dst'], ['durop-host'])
+        self.assertEqual(shared[0]['ip'], ['tcp:48732'])
+        self.assertEqual({tuple(grant['src']) for grant in grants},
+                         {('group:durop-members',), ('autogroup:shared',)})
+        self.assertTrue(all(grant['dst'] == ['durop-host'] and grant['ip'] == ['tcp:48732']
+                            for grant in grants))
+        self.assertTrue(all(member.endswith('@example.com')
+                            for members in settings.policy['groups'].values() for member in members))
+        self.assertIsNone(settings.magic_dns)
+
     def test_deterministic_complete_policy_and_backend(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp).resolve()

@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/8c50a710ddca43d7a530fb805ad55bde8d0141c5";
-    rust-overlay.url = "github:oxalica/rust-overlay/e7a078c7feb51f37955a832b22a96de5fccb1f7a";
+    rust-overlay.url = "github:oxalica/rust-overlay/74cebce67ef6671ea48fda353a5be2d229bd2920";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -16,13 +16,10 @@
         let
           pkgs = import nixpkgs { inherit system; overlays = [ (import rust-overlay) ]; };
         in {
-          infrastructure = pkgs.mkShell {
-            packages = with pkgs; [ python312 uv nodejs_24 opentofu ];
-          };
           default = pkgs.mkShell {
             packages = with pkgs; [
               (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-              git jq opentofu python312 uv nodejs_24 pkg-config
+              git jq opentofu python312 uv nodejs_24 tailscale pkg-config
             ] ++ lib.optionals stdenv.isLinux [ xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr libxkbcommon ];
             LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux
               (pkgs.lib.makeLibraryPath (with pkgs; [ xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr libxkbcommon ]));

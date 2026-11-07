@@ -15,7 +15,12 @@ class Settings:
 
     @classmethod
     def load(cls, path: Path, state_dir: Path) -> 'Settings':
-        data = json.loads(path.read_text())
+        """Read and validate a complete configuration file."""
+        return cls.parse(json.loads(path.read_text()), state_dir)
+
+    @classmethod
+    def parse(cls, data: Any, state_dir: Path) -> 'Settings':
+        """Validate a complete configuration object already loaded as JSON."""
         if not isinstance(data, dict):
             raise ValueError('configuration must be an object')
         if set(data) - {'policy', 'magic_dns'} or not isinstance(data.get('policy'), dict):

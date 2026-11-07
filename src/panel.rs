@@ -1,7 +1,11 @@
 //! Native controller panel with bounded virtualization and Unicode/IME editing.
 
 pub(crate) mod configuration;
+
 mod placement;
+
+mod input;
+
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -16,12 +20,19 @@ use crate::{
 use bevy::{
     camera::{RenderTarget, visibility::RenderLayers},
     input::{
-        ButtonState,
         keyboard::{Key, KeyboardInput},
         mouse::MouseWheel,
     },
+    input_focus::{
+        FocusCause, FocusedInput, InputFocus,
+        tab_navigation::{TabGroup, TabIndex, TabNavigationPlugin},
+    },
+    picking::hover::Hovered,
     prelude::*,
-    window::{Ime, PrimaryWindow, WindowRef},
+    text::{EditableText, EditableTextFilter, EditableTextSystems, TextCursorStyle},
+    ui::{InteractionDisabled, Pressed},
+    ui_widgets::{Activate, ActivateOnPress, Button, TextInput},
+    window::{PrimaryWindow, WindowRef},
 };
 use configuration::{
     CatalogProvider, ConfigurationContext, ConfigurationDraft, ConfigurationIntent, DisplayChoice,
@@ -47,77 +58,15 @@ enum Field {
     Placement(usize),
 }
 
-/// Bounded Unicode editor with a byte-boundary cursor and separate IME preedit.
+/// Draft mirror whose live Bevy input survives surrounding view refreshes.
 #[derive(Default, Clone)]
 struct Editor {
-    /// Committed UTF-8 content.
+    /// Committed content only; IME preedit belongs to the engine editor.
     text: String,
-    /// Byte index guaranteed to lie on a character boundary.
-    cursor: usize,
-    /// IME composition displayed but not yet committed.
-    preedit: String,
-    /// Whether insertion/deletion replaces the full committed value.
-    select_all: bool,
-}
-
-impl Editor {
-    /// Replace a selection or insert printable text while preserving the character limit.
-    fn insert(&mut self, value: &str) {
-        if self.select_all {
-            self.text.clear();
-            self.cursor = 0;
-            self.select_all = false;
-        }
-        let value: String = value
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(4096usize.saturating_sub(self.text.chars().count()))
-            .collect();
-        self.text.insert_str(self.cursor, &value);
-        self.cursor += value.len();
-    }
-
-    /// Delete the selection or the preceding complete Unicode scalar.
-    fn backspace(&mut self) {
-        if self.select_all {
-            self.text.clear();
-            self.cursor = 0;
-            self.select_all = false;
-            return;
-        }
-        if let Some((i, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.text.drain(i..self.cursor);
-            self.cursor = i;
-        }
-    }
-
-    /// Move the cursor to the preceding UTF-8 character boundary.
-    fn left(&mut self) {
-        self.cursor = self.text[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map_or(0, |(i, _)| i);
-        self.select_all = false;
-    }
-
-    /// Move the cursor to the next UTF-8 character boundary.
-    fn right(&mut self) {
-        self.cursor = self.text[self.cursor..]
-            .chars()
-            .next()
-            .map_or(self.cursor, |c| self.cursor + c.len_utf8());
-        self.select_all = false;
-    }
-
-    /// Compose display text with the cursor and uncommitted IME preedit.
-    fn label(&self) -> String {
-        format!(
-            "{}|{}{}",
-            &self.text[..self.cursor],
-            self.preedit,
-            &self.text[self.cursor..]
-        )
-    }
+    /// Persistent input entity, retired when this draft is replaced or closed.
+    entity: Option<Entity>,
+    /// Masked secret fields support replacement without exposing plaintext widgets.
+    selected: bool,
 }
 
 /// Panel-only editing, pagination and render invalidation state.
@@ -159,10 +108,6 @@ struct Model {
     drag_offset: f32,
     /// Last persisted benign state, avoiding unchanged disk writes.
     saved_preferences: Option<crate::preferences::Preferences>,
-    /// Modifier state reconstructed from ordered keyboard events.
-    modifiers: u8,
-    /// Native modifier flags used when physical key messages are absent.
-    raw_modifiers: u8,
 }
 
 /// Attach a semantic action to a rendered button.
@@ -170,6 +115,7 @@ struct Model {
 enum UiAction {
     /// Queue an application lifecycle/playback intent.
     Runtime(Action),
+
     /// Play with the current session adjustment.
     Play(String),
     /// Open the isolated visual-only placement draft.
@@ -180,8 +126,7 @@ enum UiAction {
     StepPlacement(usize, i16),
     /// Apply placement to active occurrences, optionally sending another play.
     ApplyPlacement(bool),
-    /// Move text focus to one editor.
-    Focus(Field),
+
     /// Open or close a provider menu.
     Dropdown(Dropdown),
     /// Open a new isolated configuration draft.
@@ -194,29 +139,184 @@ enum UiAction {
     Cycle(usize),
     /// Revoke the selected remote connection immediately.
     Disconnect,
-    /// Revoke remote access to the local host without hiding the controller.
-    RevokeHost,
+    /// Enqueue one source operation without performing I/O on the UI thread.
+    Network(crate::network_app::NetworkAction),
+    /// Validate and bind this Mac's listener address from the source draft.
+    EnableListener,
+    /// Issue a separately revocable pairing token for the named controller.
+    AddController,
+    /// Transfer the masked draft to the secure credential store asynchronously.
+    SaveAdminSecret,
+    /// Select a source form without changing that source's permission.
+    SelectSource(SourceSelection),
+    /// Return from an uncommitted new-source draft without creating a controller.
+    CancelSource,
+    /// Expand one optional host setting inside the selected remote source.
+    SourceDetails(SourceDetails),
 }
 
 /// Header menu whose choices configure a host or catalog provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dropdown {
-    /// Native or authenticated Tailscale control.
-    Host,
+    /// Independently enabled local and authenticated remote controllers.
+    From,
+    /// This Mac's display or an authenticated remote output host.
+    To,
     /// Bundled, directory or Git catalog sources.
     Catalog,
 }
 
 /// Isolated form edits; dropping this state discards ephemeral credentials.
 struct Modal {
-    /// Provider-owned validation schema and uncommitted values.
-    draft: ConfigurationDraft,
-    /// Unicode edit state corresponding one-to-one with draft fields.
+    /// Transactional provider schema or independently applied source controls.
+    draft: ModalDraft,
+    /// Provider fields, or source name/API key/listener address in that order.
     editors: Vec<Editor>,
     /// Validation feedback shown without reflecting credential values.
     error: Option<String>,
     /// Logical offset of the bounded form body, preserved across field edits.
     scroll: f32,
+}
+
+/// Distinguish a transactional provider form from live, independently applied source controls.
+enum ModalDraft {
+    /// Provider edits become effective only after a validated Apply.
+    Configuration(ConfigurationDraft),
+    /// Source controls enqueue individual operations; editors hold name, API key and listener address.
+    Sources(SourcesDraft),
+}
+
+/// The selected form is independent of each source's enabled permission.
+#[derive(Clone, PartialEq, Eq)]
+enum SourceSelection {
+    /// The singleton source for this Mac's buttons and shortcuts.
+    Local,
+    /// One already configured remote source, identified without its secret.
+    Remote(String),
+    /// Source-type chooser opened by the empty plus slot.
+    ChooseType,
+    /// Empty Tailscale controller form that emits no action until Add.
+    NewRemote,
+}
+
+/// Only one optional shared-host setting is expanded at a time.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SourceDetails {
+    /// Show the selected source's ordinary controls only.
+    #[default]
+    None,
+    /// Configure the shared inbound listener without changing To.
+    Listener,
+    /// Explicitly edit the host's protected Tailscale invitation credential.
+    Credentials,
+}
+
+/// Track one explicit Add until the runtime supplies the created source identity.
+struct PendingSource {
+    /// Validated name used only to recognize the result of this Add.
+    name: String,
+    /// Existing identities prevent a duplicate name from selecting an older source.
+    known_ids: Vec<String>,
+}
+
+/// Panel-only navigation and uncommitted add ownership; never grants source permission.
+struct SourcesDraft {
+    /// One currently displayed source or uncommitted provider form.
+    selection: SourceSelection,
+    /// Source to restore when the plus/type/new-source flow is canceled.
+    previous: Option<SourceSelection>,
+    /// Optional host detail opened explicitly by the user.
+    details: SourceDetails,
+    /// A queued Add awaiting a concrete runtime-owned source.
+    pending: Option<PendingSource>,
+}
+
+impl Default for SourcesDraft {
+    fn default() -> Self {
+        Self {
+            selection: SourceSelection::Local,
+            previous: None,
+            details: SourceDetails::None,
+            pending: None,
+        }
+    }
+}
+
+impl Modal {
+    /// Expose provider identity only for transactional configuration forms.
+    fn provider(&self) -> Option<Provider> {
+        match &self.draft {
+            ModalDraft::Configuration(draft) => Some(draft.provider),
+            ModalDraft::Sources(_) => None,
+        }
+    }
+
+    /// Navigate source forms without queuing permission or creation actions.
+    fn select_source(&mut self, selection: SourceSelection) {
+        let ModalDraft::Sources(sources) = &mut self.draft else {
+            return;
+        };
+        if matches!(selection, SourceSelection::ChooseType)
+            && matches!(
+                sources.selection,
+                SourceSelection::Local | SourceSelection::Remote(_)
+            )
+        {
+            sources.previous = Some(sources.selection.clone());
+        } else if matches!(
+            selection,
+            SourceSelection::Local | SourceSelection::Remote(_)
+        ) {
+            sources.previous = None;
+        }
+        sources.selection = selection;
+        sources.details = SourceDetails::None;
+        sources.pending = None;
+        self.editors[0] = Editor::default();
+        self.editors[1] = Editor::default();
+        self.error = None;
+        self.scroll = 0.;
+    }
+
+    /// Cancel only the uncommitted plus flow and discard its sensitive or name edits.
+    fn cancel_source(&mut self) {
+        let ModalDraft::Sources(sources) = &mut self.draft else {
+            return;
+        };
+        let selection = sources.previous.take().unwrap_or(SourceSelection::Local);
+        self.select_source(selection);
+    }
+
+    /// Reveal a host setting explicitly; closing or switching always discards a key draft.
+    fn show_source_details(&mut self, details: SourceDetails) {
+        let ModalDraft::Sources(sources) = &mut self.draft else {
+            return;
+        };
+        if !matches!(sources.selection, SourceSelection::Remote(_)) {
+            return;
+        }
+        sources.details = if sources.details == details {
+            SourceDetails::None
+        } else {
+            details
+        };
+        self.editors[1] = Editor::default();
+        self.error = None;
+        self.scroll = 0.;
+    }
+
+    /// Only visible source editors can own keyboard or IME input.
+    fn source_fields(&self) -> Vec<usize> {
+        let ModalDraft::Sources(sources) = &self.draft else {
+            return vec![];
+        };
+        match (&sources.selection, sources.details) {
+            (SourceSelection::NewRemote, _) if sources.pending.is_none() => vec![0],
+            (SourceSelection::Remote(_), SourceDetails::Listener) => vec![2],
+            (SourceSelection::Remote(_), SourceDetails::Credentials) => vec![1],
+            _ => vec![],
+        }
+    }
 }
 
 /// Responsive geometry keeps rendered entities bounded independently of catalog size.
@@ -241,11 +341,22 @@ impl Default for GridLayout {
 }
 
 impl GridLayout {
+    /// Reserve complete toolbar rows before estimating the first collection viewport.
+    fn toolbar_height(width: f32) -> f32 {
+        if width < 534. {
+            228.
+        } else if width < 840. {
+            148.
+        } else {
+            68.
+        }
+    }
+
     /// Fit large previews while allowing one-column compact windows and six-column wide windows.
     fn for_window(width: f32, height: f32) -> Self {
         let available = (width - 78.).max(180.);
         let columns = ((available + 20.) / 250.).floor().clamp(1., 6.) as usize;
-        let toolbar_extra = if width < 760. { 80. } else { 0. };
+        let toolbar_extra = Self::toolbar_height(width) - 68.;
         let viewport = (height - 296. - toolbar_extra).max(134.);
         let card_height = viewport.min(282.);
         let rows = ((viewport + 20.) / (card_height + 20.))
@@ -310,12 +421,15 @@ impl Model {
                     | UiAction::ApplyPlacement(_)
                     | UiAction::ResetPlacement
                     | UiAction::StepPlacement(_, _)
-                    | UiAction::Focus(Field::Placement(_))
                     | UiAction::Cancel
                     | UiAction::Cycle(_)
-                    | UiAction::Focus(Field::Configuration(_))
-                    | UiAction::RevokeHost
-                    | UiAction::Configure(Provider::Host(HostProvider::TailscaleListener))
+                    | UiAction::Network(_)
+                    | UiAction::EnableListener
+                    | UiAction::AddController
+                    | UiAction::SaveAdminSecret
+                    | UiAction::SelectSource(_)
+                    | UiAction::CancelSource
+                    | UiAction::SourceDetails(_)
                     | UiAction::Runtime(Action::StopAll | Action::Stop(_))
             )
     }
@@ -370,18 +484,20 @@ impl Model {
     /// Begin a new provider draft without changing playback or network ownership.
     fn open(&mut self, provider: Provider, context: &ConfigurationContext) {
         self.placement_modal = None;
+
+        self.revision = self.revision.wrapping_add(1);
+
         let draft = ConfigurationDraft::new(provider, context);
         let editors = draft
             .fields
             .iter()
             .map(|field| Editor {
                 text: field.value.clone(),
-                cursor: field.value.len(),
                 ..default()
             })
             .collect();
         self.modal = Some(Modal {
-            draft,
+            draft: ModalDraft::Configuration(draft),
             editors,
             error: None,
             scroll: 0.,
@@ -394,26 +510,128 @@ impl Model {
     /// Discard modal state and transient menus; no provider intent is emitted.
     fn close(&mut self) {
         self.placement_modal = None;
-        if let Some(modal) = self.modal.take() {
-            modal.draft.cancel();
+        self.revision = self.revision.wrapping_add(1);
+        if let Some(Modal {
+            draft: ModalDraft::Configuration(draft),
+            ..
+        }) = self.modal.take()
+        {
+            draft.cancel();
         }
         self.dropdown = None;
         self.focus = None;
     }
 
+    /// Open live source controls with fresh, ephemeral name and API-key editors.
+    fn open_sources(&mut self, listen_address: &str) {
+        self.placement_modal = None;
+        self.revision = self.revision.wrapping_add(1);
+        self.modal = Some(Modal {
+            draft: ModalDraft::Sources(SourcesDraft::default()),
+            editors: vec![
+                Editor::default(),
+                Editor::default(),
+                Editor {
+                    text: listen_address.to_owned(),
+                    ..default()
+                },
+            ],
+            error: None,
+            scroll: 0.,
+        });
+        self.dropdown = None;
+        self.focus = None;
+        self.dragging = false;
+    }
+
+    /// Select the result of an explicit Add and recover if a selected source was revoked.
+    fn reconcile_sources(&mut self, network: &crate::network_app::NetworkState) {
+        if let Some(modal) = &mut self.modal
+            && matches!(modal.draft, ModalDraft::Sources(_))
+            && modal
+                .editors
+                .get(2)
+                .is_some_and(|editor| editor.text.is_empty() && editor.entity.is_none())
+        {
+            let endpoint = network.listener_endpoint();
+            if !endpoint.is_empty() {
+                modal.editors[2] = Editor {
+                    text: endpoint.to_owned(),
+                    ..default()
+                };
+            }
+        }
+        if let Some(modal) = &mut self.modal
+            && matches!(
+                &modal.draft,
+                ModalDraft::Sources(sources) if sources.details == SourceDetails::Listener
+            )
+            && !network.hosting
+            && network.status.starts_with("Remote host unavailable:")
+        {
+            modal.error = Some(network.status.clone());
+        }
+        let Some(modal) = &mut self.modal else {
+            return;
+        };
+        let ModalDraft::Sources(sources) = &mut modal.draft else {
+            return;
+        };
+        if let Some(pending) = &sources.pending {
+            if let Some(source) = network.controllers.iter().find(|source| {
+                source.name == pending.name && !pending.known_ids.contains(&source.id)
+            }) {
+                let selection = SourceSelection::Remote(source.id.clone());
+                modal.select_source(selection);
+            } else if !network.actions.iter().any(|action| {
+                matches!(action,
+                crate::network_app::NetworkAction::AddController {name} if name == &pending.name)
+            }) {
+                sources.pending = None;
+                modal.error = Some(network.status.clone());
+            }
+        } else if matches!(&sources.selection, SourceSelection::Remote(id)
+            if !network.controllers.iter().any(|source| &source.id == id))
+        {
+            modal.select_source(SourceSelection::Local);
+        }
+    }
+
+    /// Summarize enabled sources without implying they are mutually exclusive or connected.
+    fn source_summary(local_enabled: bool, remote_count: usize) -> String {
+        let controllers = format!(
+            "{remote_count} controller{}",
+            if remote_count == 1 { "" } else { "s" }
+        );
+        if local_enabled {
+            format!("Local + {controllers}")
+        } else {
+            controllers
+        }
+    }
+
     /// Validate editable values before consuming the draft into a typed application intent.
     fn apply(&mut self, context: &ConfigurationContext) -> Option<ConfigurationIntent> {
         let modal = self.modal.as_mut()?;
-        for (field, editor) in modal.draft.fields.iter_mut().zip(&modal.editors) {
+        let ModalDraft::Configuration(draft) = &mut modal.draft else {
+            return None;
+        };
+        for (field, editor) in draft.fields.iter_mut().zip(&modal.editors) {
             field.value.clone_from(&editor.text);
         }
-        if let Err(error) = modal.draft.validate(context) {
+        if let Err(error) = draft.validate(context) {
             modal.error = Some(error.message.into());
             return None;
         }
-        let modal = self.modal.take()?;
+        let Modal {
+            draft: ModalDraft::Configuration(draft),
+            ..
+        } = self.modal.take()?
+        else {
+            return None;
+        };
         self.focus = None;
-        modal.draft.apply(context).ok()
+        draft.apply(context).ok()
     }
 
     /// Retrieve only an editable field; choices and immutable catalog paths do not accept text.
@@ -423,59 +641,17 @@ impl Model {
             Field::Placement(index) => self.placement_modal.as_mut()?.editors.get_mut(index),
             Field::Configuration(index) => {
                 let modal = self.modal.as_mut()?;
-                let field = modal.draft.fields.get(index)?;
-                if field.read_only || !field.choices.is_empty() {
+                if let ModalDraft::Configuration(draft) = &modal.draft {
+                    let field = draft.fields.get(index)?;
+                    if field.read_only || !field.choices.is_empty() {
+                        return None;
+                    }
+                } else if !modal.source_fields().contains(&index) {
                     return None;
                 }
                 modal.editors.get_mut(index)
             }
         }
-    }
-
-    /// Trim pasted credentials while leaving ordinary user-entered field values exact.
-    #[cfg(target_os = "macos")]
-    fn is_secret(&self, field: Field) -> bool {
-        match field {
-            Field::Search | Field::Placement(_) => false,
-            Field::Configuration(index) => self
-                .modal
-                .as_ref()
-                .and_then(|modal| modal.draft.fields.get(index))
-                .is_some_and(|field| field.secret),
-        }
-    }
-
-    /// Cycle keyboard focus through editable modal fields without leaking input to the catalog.
-    fn focus_next(&mut self) {
-        if self.placement_modal.is_some() {
-            self.focus = Some(Field::Placement(match self.focus {
-                Some(Field::Placement(index)) => (index + 1) % 3,
-                _ => 0,
-            }));
-            return;
-        }
-        let Some(modal) = &self.modal else {
-            return;
-        };
-        let fields: Vec<_> = modal
-            .draft
-            .fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| !field.read_only && field.choices.is_empty())
-            .map(|(index, _)| index)
-            .collect();
-        if fields.is_empty() {
-            return;
-        }
-        let next = match self.focus {
-            Some(Field::Configuration(index)) => fields
-                .iter()
-                .position(|candidate| *candidate == index)
-                .map_or(0, |current| (current + 1) % fields.len()),
-            _ => 0,
-        };
-        self.focus = Some(Field::Configuration(fields[next]));
     }
 
     /// Exact content extent includes the inter-row gaps, with no trailing gap.
@@ -535,7 +711,7 @@ fn scrollbar(
     mut model: ResMut<Model>,
     tracks: Query<
         (
-            &Interaction,
+            Has<Pressed>,
             &bevy::ui::RelativeCursorPosition,
             &ComputedNode,
         ),
@@ -558,7 +734,7 @@ fn scrollbar(
         }
         let pointer = (position.y + 0.5) * track_height;
         let (top, height) = model.thumb_geometry(track_height);
-        if *interaction == Interaction::Pressed && !model.dragging {
+        if interaction && !model.dragging {
             model.dragging = true;
             model.drag_offset = if (top..=top + height).contains(&pointer) {
                 pointer - top
@@ -594,15 +770,16 @@ fn scroll_thumb(
 }
 
 /// Apply subtle feedback to interactive paper surfaces without triggering layout churn.
-fn hover(
-    mut widgets: Query<(&Interaction, &HoverColors, &mut BackgroundColor), Changed<Interaction>>,
-) {
-    for (interaction, colors, mut background) in &mut widgets {
-        background.0 = if *interaction == Interaction::None {
-            colors.resting
-        } else {
+fn hover(mut widgets: Query<(&Hovered, Has<Pressed>, &HoverColors, &mut BackgroundColor)>) {
+    for (hovered, pressed, colors, mut background) in &mut widgets {
+        let color = if hovered.get() || pressed {
             colors.hovered
+        } else {
+            colors.resting
         };
+        if background.0 != color {
+            background.0 = color;
+        }
     }
 }
 
@@ -660,23 +837,37 @@ struct PanelCamera(Entity);
 pub struct PanelPlugin;
 impl Plugin for PanelPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Model>()
+        app.add_plugins(TabNavigationPlugin)
+            .add_observer(input::activate)
+            .add_observer(input::keyboard)
+            .init_resource::<input::PendingActions>()
+            .init_resource::<input::OrderedKeyboard>()
+            .init_resource::<Model>()
             .init_resource::<Icons>()
             .init_resource::<Fonts>()
             .add_systems(Startup, setup)
             .add_systems(
+                PreUpdate,
+                input::dispatch_keyboard
+                    .after(bevy::input::InputSystems)
+                    .before(bevy::input_focus::InputFocusSystems::Dispatch),
+            )
+            .add_systems(
                 Update,
-                (
-                    buttons,
-                    text_input,
-                    scroll,
-                    scrollbar,
-                    scroll_thumb,
-                    hover,
-                    terminal,
-                )
+                (scroll, scrollbar, scroll_thumb, hover, terminal)
                     .chain()
                     .before(crate::app::actions),
+            )
+            .add_systems(
+                PostUpdate,
+                (
+                    input::synchronize,
+                    buttons,
+                    input::focus_style,
+                    input::request_redraw,
+                )
+                    .chain()
+                    .after(EditableTextSystems),
             )
             .add_systems(
                 Update,
@@ -713,7 +904,6 @@ fn setup(
     commands.insert_resource(PanelCamera(camera));
     let preferences = crate::preferences::Preferences::load();
     model.query.text = preferences.query;
-    model.query.cursor = model.query.text.len();
     if let Some(index) = runtime.display {
         controls.0.push(crate::overlay::Control::Display(index));
     }
@@ -796,22 +986,16 @@ impl Model {
 /// Dispatch one pointer press; rebuilding widgets must not repeat a held click.
 fn buttons(
     mut model: ResMut<Model>,
-    buttons: Query<(&Interaction, &UiAction), Changed<Interaction>>,
+    mut pending: ResMut<input::PendingActions>,
+    mut focus: ResMut<InputFocus>,
     mut actions: ResMut<Actions>,
     mut network: ResMut<crate::network_app::NetworkState>,
     runtime: Res<Runtime>,
     monitors: Query<(Entity, &bevy::window::Monitor)>,
-    mouse: Option<Res<ButtonInput<MouseButton>>>,
 ) {
-    if mouse
-        .as_ref()
-        .is_some_and(|mouse| !mouse.just_pressed(MouseButton::Left))
-    {
-        return;
-    }
     model.sync_placements(PlacementScope::current(&runtime, &network));
-    for (interaction, action) in &buttons {
-        if *interaction != Interaction::Pressed || !model.allows(action) {
+    for action in &std::mem::take(&mut pending.0) {
+        if !model.allows(action) {
             continue;
         }
         model.revision = model.revision.wrapping_add(1);
@@ -848,9 +1032,11 @@ fn buttons(
                 model.dropdown = None;
                 actions.0.push_back(action.clone());
             }
-            UiAction::Focus(field) => {
-                model.focus = Some(*field);
-                model.dropdown = None;
+            UiAction::Dropdown(Dropdown::From) => {
+                if network.listen_address.is_empty() && network.discovered_listener.is_none() {
+                    network.discover_listener();
+                }
+                model.open_sources(network.listener_endpoint());
             }
             UiAction::Dropdown(menu) => {
                 model.dropdown = if model.dropdown == Some(*menu) {
@@ -861,13 +1047,18 @@ fn buttons(
                 model.focus = None;
             }
             UiAction::Configure(provider) => {
-                let context = Model::configuration_context(&runtime, &network, &monitors);
+                let mut context = Model::configuration_context(&runtime, &network, &monitors);
+                if *provider == Provider::Host(HostProvider::TailscaleListener) {
+                    context.current_endpoint.clone_from(&network.listen_address);
+                }
                 model.open(*provider, &context);
             }
             UiAction::Cancel => model.close(),
             UiAction::Cycle(index) => {
-                if let Some(modal) = &mut model.modal {
-                    let field = &modal.draft.fields[*index];
+                if let Some(modal) = &mut model.modal
+                    && let ModalDraft::Configuration(draft) = &modal.draft
+                {
+                    let field = &draft.fields[*index];
                     let editor = &mut modal.editors[*index];
                     if !field.choices.is_empty() {
                         let selected = field
@@ -878,24 +1069,31 @@ fn buttons(
                         editor.text = field.choices[(selected + 1) % field.choices.len()]
                             .value
                             .clone();
-                        editor.cursor = editor.text.len();
                     }
                 }
             }
             UiAction::Apply => {
+                if runtime.destination == Destination::Remote
+                    && let Some(modal) = &mut model.modal
+                    && matches!(modal.provider(), Some(Provider::Catalog(_)))
+                {
+                    modal.error = Some("Catalog is supplied by the remote host. Choose To → This Mac before changing local catalog sources.".into());
+                    continue;
+                }
                 if runtime.mode == Mode::Controller
                     && let Some(modal) = &mut model.modal
                 {
-                    let restriction = match modal.draft.provider {
-                        Provider::Host(HostProvider::Native | HostProvider::TailscaleListener) => {
-                            Some(
-                                "This launch is controller-only. Restart Durop in local mode to play or share this Mac.",
-                            )
-                        }
-                        Provider::Catalog(_) => Some(
+                    let restriction = match modal.provider() {
+                        Some(Provider::Host(HostProvider::Native)) => Some(
+                            "This launch is controller-only. Restart Durop in local mode to play on this Mac.",
+                        ),
+                        Some(Provider::Catalog(_)) => Some(
                             "Catalog is supplied by the remote host. Restart Durop in local mode to use local catalog sources.",
                         ),
-                        Provider::Host(HostProvider::Tailscale) => None,
+                        Some(Provider::Host(
+                            HostProvider::Tailscale | HostProvider::TailscaleListener,
+                        ))
+                        | None => None,
                     };
                     if let Some(message) = restriction {
                         modal.error = Some(message.into());
@@ -927,21 +1125,19 @@ fn buttons(
                                 .push_back(Action::Destination(Destination::Remote));
                         }
                         ConfigurationIntent::TailscaleListener { endpoint } => {
-                            network.address = endpoint.to_string();
+                            network.listen_address = endpoint.to_string();
                             network
                                 .actions
                                 .push_back(crate::network_app::NetworkAction::EnableHost);
-                            model.open(Provider::Host(HostProvider::Native), &context);
+                            model.open_sources(network.listener_endpoint());
                         }
                         ConfigurationIntent::Bundled { path }
                         | ConfigurationIntent::LocalDirectory { path } => {
-                            actions.0.push_back(Action::Destination(Destination::Local));
                             actions
                                 .0
                                 .push_back(Action::LoadPack(path.to_string_lossy().into_owned()));
                         }
                         ConfigurationIntent::GitHttps { .. } => {
-                            actions.0.push_back(Action::Destination(Destination::Local));
                             actions.0.push_back(Action::LoadPack(
                                 source.expect("catalog intent has a source"),
                             ));
@@ -949,10 +1145,111 @@ fn buttons(
                     }
                 }
             }
-            UiAction::RevokeHost => {
+            UiAction::SelectSource(selection) => {
+                if let Some(modal) = &mut model.modal {
+                    modal.select_source(selection.clone());
+                }
+                model.focus = None;
+            }
+            UiAction::CancelSource => {
+                if let Some(modal) = &mut model.modal {
+                    modal.cancel_source();
+                }
+                model.focus = None;
+            }
+            UiAction::SourceDetails(details) => {
+                if let Some(modal) = &mut model.modal {
+                    modal.show_source_details(*details);
+                }
+                model.focus = None;
+            }
+            UiAction::Network(action) => network.actions.push_back(action.clone()),
+            UiAction::EnableListener => {
+                let Some(modal) = &mut model.modal else {
+                    continue;
+                };
+                if !modal.source_fields().contains(&2) {
+                    continue;
+                }
+                let mut context = Model::configuration_context(&runtime, &network, &monitors);
+                context.current_endpoint.clone_from(&modal.editors[2].text);
+                let draft = ConfigurationDraft::new(
+                    Provider::Host(HostProvider::TailscaleListener),
+                    &context,
+                );
+                match draft.apply(&context) {
+                    Ok(ConfigurationIntent::TailscaleListener { endpoint }) => {
+                        network.listen_address = endpoint.to_string();
+                        network
+                            .actions
+                            .push_back(crate::network_app::NetworkAction::EnableHost);
+                        modal.error = None;
+                    }
+                    Err(error) => modal.error = Some(error.message.into()),
+                    _ => unreachable!("listener schema returns a listener intent"),
+                }
+            }
+            UiAction::AddController => {
+                let Some(modal) = &mut model.modal else {
+                    continue;
+                };
+                let ModalDraft::Sources(sources) = &mut modal.draft else {
+                    continue;
+                };
+                if sources.selection != SourceSelection::NewRemote || sources.pending.is_some() {
+                    continue;
+                }
+                if network.controllers.len() >= 16 {
+                    modal.error = Some("At most 16 remote sources are supported. Revoke a source before adding another.".into());
+                    continue;
+                }
+                let name = modal.editors[0].text.trim();
+                if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
+                    modal.error = Some(
+                        "Give this controller a name of 1–80 bytes without control characters."
+                            .into(),
+                    );
+                    continue;
+                }
+                sources.pending = Some(PendingSource {
+                    name: name.to_owned(),
+                    known_ids: network
+                        .controllers
+                        .iter()
+                        .map(|source| source.id.clone())
+                        .collect(),
+                });
                 network
                     .actions
-                    .push_back(crate::network_app::NetworkAction::DisableHost);
+                    .push_back(crate::network_app::NetworkAction::AddController {
+                        name: name.to_owned(),
+                    });
+                modal.editors[0] = Editor::default();
+                modal.error = None;
+                model.focus = None;
+            }
+            UiAction::SaveAdminSecret => {
+                let Some(modal) = &mut model.modal else {
+                    continue;
+                };
+                if !modal.source_fields().contains(&1) {
+                    continue;
+                }
+                let secret = modal.editors[1].text.trim();
+                if secret.is_empty() || secret.len() > 4096 || secret.chars().any(char::is_control)
+                {
+                    modal.error =
+                        Some("Enter a Tailscale API key without control characters.".into());
+                    continue;
+                }
+                network
+                    .actions
+                    .push_back(crate::network_app::NetworkAction::SaveAdminSecret {
+                        secret: secret.to_owned(),
+                    });
+                modal.editors[1] = Editor::default();
+                modal.error = None;
+                model.focus = None;
             }
             UiAction::Disconnect => {
                 network
@@ -960,206 +1257,13 @@ fn buttons(
                     .push_back(crate::network_app::NetworkAction::Disconnect);
             }
         }
-    }
-}
 
-/// Retain raw-window modifier ordering alongside translated key events.
-enum OrderedInput {
-    /// Native command/control flags at this point in the event sequence.
-    Modifiers(u8),
-    /// Keyboard message paired with the flags active at its position.
-    Keyboard(KeyboardInput),
-}
-
-/// Merge keyboard events with raw modifier changes in their original event order.
-fn ordered_keyboard(
-    events: impl IntoIterator<Item = OrderedInput>,
-    modifiers: &mut u8,
-) -> Vec<(KeyboardInput, bool)> {
-    let mut keys = Vec::new();
-    for event in events {
-        match event {
-            OrderedInput::Modifiers(value) => *modifiers = value,
-            OrderedInput::Keyboard(key) => keys.push((key, *modifiers != 0)),
-        }
-    }
-    keys
-}
-
-/// Route keyboard, clipboard and IME input to the focused editor before shortcuts.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The editor combines ordered raw modifier flags, Bevy IME and window state"
-)]
-fn text_input(
-    mut keys: MessageReader<KeyboardInput>,
-    mut ime: MessageReader<Ime>,
-    primary: Single<(Entity, &mut Window), With<PrimaryWindow>>,
-    mut model: ResMut<Model>,
-    runtime: Res<Runtime>,
-    mut actions: ResMut<Actions>,
-    _main: bevy::ecs::system::NonSendMarker,
-    mut raw: MessageReader<bevy::winit::RawWinitWindowEvent>,
-    native: Option<NonSend<bevy::winit::WinitWindows>>,
-) {
-    let (entity, mut window) = primary.into_inner();
-    window.ime_enabled = model.focus.is_some();
-    if !window.focused {
-        model.modifiers = 0;
-        model.raw_modifiers = 0;
-        keys.clear();
-        ime.clear();
-        raw.clear();
-        return;
-    }
-    let mut committed = false;
-    for event in ime.read() {
-        model.revision = model.revision.wrapping_add(1);
-        let Some(field) = model.focus else {
-            continue;
-        };
-        let Some(edit) = model.editor(field) else {
-            continue;
-        };
-        match event {
-            Ime::Preedit { window, value, .. } if *window == entity => edit.preedit = value.clone(),
-            Ime::Commit { window, value } if *window == entity => {
-                edit.preedit.clear();
-                edit.insert(value);
-                committed = true;
-                if field == Field::Search {
-                    model.scroll = 0.;
-                }
-            }
-            Ime::Disabled { window } if *window == entity => edit.preedit.clear(),
-            _ => (),
-        }
-    }
-    let native_id = native
-        .as_ref()
-        .and_then(|windows| windows.entity_to_winit.get(&entity))
-        .copied();
-    let mut raw_steps = Vec::new();
-    for event in raw.read() {
-        if Some(event.window_id) != native_id {
-            continue;
-        }
-        match &event.event {
-            winit::event::WindowEvent::ModifiersChanged(modifiers) => {
-                let flags = modifiers.state();
-                raw_steps.push(OrderedInput::Modifiers(
-                    u8::from(flags.super_key()) | u8::from(flags.control_key()) << 2,
-                ));
-            }
-            winit::event::WindowEvent::KeyboardInput { event, .. } => {
-                raw_steps.push(OrderedInput::Keyboard(
-                    bevy::winit::converters::convert_keyboard_input(event, entity),
-                ))
-            }
-            winit::event::WindowEvent::Focused(false) => raw_steps.push(OrderedInput::Modifiers(0)),
-            _ => (),
-        }
-    }
-    let ordered = ordered_keyboard(raw_steps, &mut model.raw_modifiers);
-    let input: Vec<_> = if ordered.is_empty() {
-        keys.read().cloned().map(|key| (key, None)).collect()
-    } else {
-        keys.clear();
-        ordered
-            .into_iter()
-            .map(|(key, modified)| (key, Some(modified)))
-            .collect()
-    };
-    for (key, raw_modified) in input {
-        if key.window != entity {
-            continue;
-        }
-        let modifier = match key.key_code {
-            KeyCode::SuperLeft => 1,
-            KeyCode::SuperRight => 2,
-            KeyCode::ControlLeft => 4,
-            KeyCode::ControlRight => 8,
-            _ => 0,
-        };
-        if modifier != 0 {
-            if key.state == ButtonState::Pressed {
-                model.modifiers |= modifier;
-            } else {
-                model.modifiers &= !modifier;
-            }
-        }
-        if key.state != ButtonState::Pressed {
-            continue;
-        }
-        model.revision = model.revision.wrapping_add(1);
-        if key.logical_key == Key::Escape && (model.has_modal() || model.dropdown.is_some()) {
-            model.close();
-            continue;
-        }
-        if key.logical_key == Key::Tab && model.has_modal() {
-            model.focus_next();
-            continue;
-        }
         if let Some(field) = model.focus {
-            // Preserve modifier ordering even if key-down and key-up arrive in
-            // one update, when ButtonInput already contains the final state.
-            let modified = raw_modified.unwrap_or(model.modifiers != 0);
-            #[cfg(target_os = "macos")]
-            let secret = model.is_secret(field);
-            let Some(edit) = model.editor(field) else {
-                continue;
-            };
-            if key.logical_key == Key::Escape {
-                edit.preedit.clear();
-                model.focus = None;
-                continue;
+            if let Some(entity) = model.editor(field).and_then(|editor| editor.entity) {
+                focus.set(entity, FocusCause::Pressed);
             }
-            if !edit.preedit.is_empty() {
-                continue;
-            }
-            match key.logical_key {
-                Key::Backspace => edit.backspace(),
-                Key::ArrowLeft => edit.left(),
-                Key::ArrowRight => edit.right(),
-                Key::Home => edit.cursor = 0,
-                Key::End => edit.cursor = edit.text.len(),
-                Key::Enter => {
-                    model.focus = None;
-                }
-                _ if modified && key.key_code == KeyCode::KeyA => edit.select_all = true,
-                #[cfg(target_os = "macos")]
-                _ if modified && key.key_code == KeyCode::KeyV => {
-                    if let Some(text) = crate::app_macos::paste_text() {
-                        edit.insert(if secret { text.trim() } else { &text });
-                    }
-                }
-                _ if !modified && !committed => {
-                    if let Some(text) = &key.text {
-                        edit.insert(text);
-                    }
-                }
-                _ => (),
-            }
-            if field == Field::Search {
-                model.scroll = 0.;
-            }
-        } else if !key.repeat && !raw_modified.unwrap_or(model.modifiers != 0) {
-            match key.logical_key {
-                Key::Escape => actions.0.push_back(Action::StopAll),
-                Key::Space
-                    if runtime.destination == Destination::Local
-                        && !model.has_modal()
-                        && model.dropdown.is_none() =>
-                {
-                    if let Some(index) = model.visible(&runtime.catalog.clips).first() {
-                        let scope = PlacementScope::from_snapshot(false, &runtime.snapshot);
-                        let clip_id = runtime.catalog.clips[*index].identity.clone();
-                        model.sync_placements(Some(scope));
-                        actions.0.push_back(model.play_action(&clip_id));
-                    }
-                }
-                _ => (),
-            }
+        } else {
+            focus.clear();
         }
     }
 }

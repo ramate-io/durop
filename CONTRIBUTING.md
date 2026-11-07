@@ -12,6 +12,10 @@ cargo build --workspace --locked
 python3 -m unittest discover -s scripts/tests -v
 ```
 
+Bevy 0.20.1 requires Rust 1.97.1; `rust-toolchain.toml` and the pinned Nix
+Rust overlay provide that minimum toolchain. CI and native packaging read the
+same channel from the toolchain file.
+
 CI runs the Rust checks on macOS and Linux. Keep Cargo.lock and flake.lock committed when dependencies change. Shell entry does not install hooks or change Git configuration; there is no required hook setup.
 
 The first runtime target is Apple Silicon macOS. One executable assembles separate protocol, catalog, host, media and transport crates. Follow the [dependency boundaries](docs/architecture.md); application/UI dependencies stay out of those libraries. Linux CI checks portable code and does not validate native AppKit/AVFoundation behavior. Audio/video controls and system codecs are qualified on macOS; GIF and state/transport logic have portable tests.
@@ -83,4 +87,4 @@ The pinned nixpkgs and rust-overlay revisions, Rust toolchain file, crate bounda
 
 ## Infrastructure checks
 
-Use `nix develop .#infrastructure` for the smaller infrastructure-only shell, then follow the dependency sync, binding generation, pure tests, synthesis and validation commands in [the Tailscale runbook](infra/cdktn/tailscale/README.md). The default shell has the same locked tools. Commit `uv.lock`, `package-lock.json`, generated `imports/` and `.terraform.lock.hcl` when upgrading infrastructure dependencies; the existing `flake.lock` fixes Python, uv, Node and OpenTofu. Infrastructure CI runs on both supported platforms with no deployment credentials and no plan/apply. Configuration, state, plans and credentials are private operator data and must stay outside Git. Live policy import, apply and two-Mac network acceptance require a separately reviewed operator action.
+Use `nix develop` for Rust and infrastructure tools, then follow the uv sync, binding generation, pure tests, synthesis and validation commands in [the Tailscale runbook](infra/cdktn/tailscale/README.md). Commit `uv.lock`, `package-lock.json`, generated `imports/` and `.terraform.lock.hcl` when upgrading infrastructure dependencies; the existing `flake.lock` fixes Python, uv, Node and OpenTofu. Infrastructure CI runs on both supported platforms with no deployment credentials or plan/apply. Configuration, state, plans and credentials are private operator data and must stay outside Git. Live policy import, apply and two-Mac network acceptance require a separately reviewed operator action.
