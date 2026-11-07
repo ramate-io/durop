@@ -9,10 +9,10 @@ desktop; do not infer fullscreen-game support from desktop compositing.
 ## Local playback
 
 1. Launch Durop. The bundled reaction catalog provides GIFs, sound bites and
-   video clips. Select **Host → Native**, choose a display and **Apply** to
-   start local playback authority.
+   video clips. Enable local controls in **From**, then select a local display
+   in **To** and choose **Apply** to start local playback authority.
 2. Search titles/tags/categories, then click a clip. Its state/readiness and any
-   individual failure appear in the panel. Change displays in the Native modal.
+   individual failure appear in the panel. Change displays through **To**.
    Folder names supply initial categories; identity is independent of folder moves.
 3. Use per-instance Stop or **STOP ALL**. Escape first cancels an open modal or
    closes a menu, then exits a focused field, and otherwise stops all. Do not rely on a
@@ -41,30 +41,47 @@ remote Git LFS materialization are supported. See [pack format](packs.md).
 
 ## Host and remote controller
 
-Start with the [Tailnet quickstart](tailnet-quickstart.md) for the Tailscale admin
-console, CDK Terrain policy setup and the complete Durop pairing flow.
+Start with the [Tailnet quickstart](tailnet-quickstart.md) for OAuth, `uv run
+python main.py ensure`, the Tailscale macOS app and the complete Durop pairing flow.
 
-Install and authorize Tailscale separately on both Macs. Durop uses its CLI for bounded read-only verification and discovers the
-standard installed macOS app executable even from Finder. Follow [the Tailscale runbook](https://github.com/ramate-io/durop/blob/main/infra/cdktn/tailscale/README.md),
-including its standalone macOS setup. Verify the configured identity/tags
-and narrow ACL policy. Durop does not enroll machines or apply tailnet policy.
-Do not expose the listener on a wildcard/LAN interface or through public
-forwarding.
+Install and authorize Tailscale separately on both Macs. Keep each device owned
+by its user. Guests can stay in their own tailnets and accept a share of the
+playback device; same-tailnet users with existing policy access need no share.
+Durop discovers the standard installed macOS app executable even from Finder.
+See the [infrastructure reference](../infra/cdktn/tailscale/README.md) for the
+Nix CLI's macOS daemon caveat. Durop does not enroll machines or apply policy.
+Do not expose its listener through a wildcard/LAN address or public forwarding.
 
-On the playback Mac, select **Host → Native**, load the intended pack and start its
-local host. Open **Share this Mac…** in the Native modal, enter that Mac's explicit
-Tailscale IP and port (for example `100.x.y.z:48732`), then **Apply**.
-The listener verifies that the address belongs to the authenticated local
-Tailscale node. The private pairing secret is displayed for this session; share
-it privately with the intended controller and keep it out of recordings/logs.
+On the playback Mac, choose its local display in **To** and load the intended
+pack in **Catalog**. In **From**, choose **+ → Tailscale controller**, enter a name,
+and **Add controller**. Select that source and open **Listener settings**, enter
+this Mac's Tailscale IP and port (for example `100.x.y.z:48732`), and choose
+**Enable remote listener**. The listener
+verifies that the address belongs to the authenticated local Tailscale node.
+Local controls and multiple remote controller sources can remain enabled together.
 
-On the controller Mac, choose **Host → Tailscale**, enter the host's address and the
-Durop pairing token, then **Apply**. This is the host-generated session credential,
-not a Tailscale API or enrollment key. The secret field is masked and cleared after
-submission. Remote catalog metadata and icons are supplied by the host; media
-stays on the host. Commands target that host's current session/revision and
-receive acknowledgements/state updates. A stale catalog/session is rejected.
-Disconnected commands are not replayed after reconnect.
+Buttons across the top of **From** select one source's form without changing
+which sources are enabled. Use **+** to add more sources; each receives a separate
+runtime credential. If the recipient needs access to this device, configure
+**Invitation credentials**, then choose **Create network invitation** in their form;
+this uses the host's user-owned `TAILSCALE_API_KEY` from its environment or secure
+UI storage. The invitation shares this one device and does not enroll the user
+in the host's tailnet. Network policy must admit shared guests on TCP 48732,
+such as the sample's narrow `autogroup:shared` grant. See the official
+[sharing guide](https://tailscale.com/docs/features/sharing).
+
+Choose **Copy invitation link + pairing details**, or **Copy Durop pairing
+details** when no new share is needed. Send these privately to that controller;
+keep the clipboard and pairing panel out of recordings. Infrastructure OAuth
+credentials and the host API key never belong in these pairing details.
+
+On the controller Mac, accept the optional device share while signed into the
+recipient's own account. In Durop's **To**, choose the remote host, enter its
+address and that controller's Durop pairing token, then **Apply**. The masked
+secret is cleared after submission. The remote host supplies catalog metadata,
+icons and playback state; media stays on the host. Commands target its current
+session/revision and receive acknowledgements/state updates. Stale sessions are
+rejected; disconnected commands are not replayed after reconnect.
 
 Optional launch configuration, with the app closed first:
 
@@ -73,16 +90,26 @@ Optional launch configuration, with the app closed first:
 /Applications/Durop.app/Contents/MacOS/durop --mode controller --connect ws://100.x.y.z:48732/control
 ```
 
-The controller launch only prefills the destination; open **Host → Tailscale**,
-enter its secret and choose **Apply** explicitly. Controller mode starts without a local pack. Host mode
-uses the same app/window with playback authority; hiding its panel does not
-terminate the process. Pairing material is never placed in command arguments.
+For development, launch a controller with:
 
-Use **Revoke remote** to stop listener access and invalidate its session
-credential. **STOP ALL** is the immediate playback safety action; stop hosting,
-Disconnect and Quit when the recording session ends. Quit requests playback
-teardown and disables networking. Ending Durop does not remove Tailscale
-enrollment or modify tailnet policy.
+```sh
+nix develop --command cargo run -p durop --bin durop --locked -- --mode controller
+```
+
+Controller launch prefills the destination; open **To**, enter its token and
+choose **Apply** explicitly. Controller mode starts without a local pack. Host
+mode uses the same app/window with playback authority; hiding its panel does
+not terminate the process. Pairing material never belongs in command arguments.
+
+On an individual controller card, **Disable** suspends permission and preserves
+its token for re-enabling; **Revoke controller** removes that source and its
+credential. Revoke and add it again to rotate its token. Restarting the host app
+also discards runtime controller credentials. **Disable remote listener** closes
+all remote access while retaining individual tokens for re-enabling during this
+app run. Durop revocation does not remove an accepted Tailscale share; remove
+that separately in Tailscale administration. **STOP ALL** stops playback
+immediately. Disconnect and quit when the recording ends; quitting tears down
+playback and networking without changing Tailscale enrollment or policy.
 
 ## Record and qualify
 

@@ -548,7 +548,7 @@ fn controller_catalog_apply_preserves_remote_destination_and_draft() {
             .modal
             .as_ref()
             .expect("blocked apply retains the draft");
-        assert_eq!(modal.draft.provider, Provider::Catalog(provider));
+        assert_eq!(modal.provider(), Some(Provider::Catalog(provider)));
         assert!(modal.error.as_ref().unwrap().contains("remote host"));
     }
 }
@@ -556,48 +556,69 @@ fn controller_catalog_apply_preserves_remote_destination_and_draft() {
 /// Scrolling a short form reaches its bounded body without moving the clip collection.
 #[test]
 fn modal_wheel_scroll_is_clamped_and_does_not_move_catalog_rows() {
-    let mut app = App::new();
-    let mut model = Model {
-        scroll: 903.,
-        matches: 10_000,
-        ..default()
-    };
-    model.open(
-        Provider::Catalog(CatalogProvider::GitHttps),
-        &provider_context(),
-    );
-    app.insert_resource(model)
-        .add_message::<MouseWheel>()
-        .add_systems(Update, scroll);
-    let window = app
-        .world_mut()
-        .spawn((PrimaryWindow, Window::default()))
-        .id();
-    let body = app
-        .world_mut()
-        .spawn((
-            ModalBody,
-            ComputedNode {
-                size: Vec2::new(500., 100.),
-                content_size: Vec2::new(500., 500.),
-                inverse_scale_factor: 1.,
-                ..default()
-            },
-            ScrollPosition::default(),
-        ))
-        .id();
-    app.world_mut().write_message(MouseWheel {
-        unit: bevy::input::mouse::MouseScrollUnit::Pixel,
-        phase: bevy::input::touch::TouchPhase::Moved,
-        x: 0.,
-        y: -800.,
-        window,
-    });
-    app.update();
-    assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 400.);
-    let model = app.world().resource::<Model>();
-    assert_eq!(model.scroll, 903.);
-    assert_eq!(model.modal.as_ref().unwrap().scroll, 400.);
+    for source_controls in [false, true] {
+        let mut app = App::new();
+        let mut model = Model {
+            scroll: 903.,
+            matches: 10_000,
+            ..default()
+        };
+        if source_controls {
+            model.open_sources("100.101.102.103:7010");
+        } else {
+            model.open(
+                Provider::Catalog(CatalogProvider::GitHttps),
+                &provider_context(),
+            );
+        }
+        app.insert_resource(model)
+            .add_message::<MouseWheel>()
+            .add_systems(Update, scroll);
+        let window = app
+            .world_mut()
+            .spawn((PrimaryWindow, Window::default()))
+            .id();
+        let body = app
+            .world_mut()
+            .spawn((
+                ModalBody,
+                ComputedNode {
+                    size: Vec2::new(500., 100.),
+                    content_size: Vec2::new(500., 500.),
+                    inverse_scale_factor: 1.,
+                    ..default()
+                },
+                ScrollPosition::default(),
+            ))
+            .id();
+        app.world_mut().write_message(MouseWheel {
+            unit: bevy::input::mouse::MouseScrollUnit::Pixel,
+            phase: bevy::input::touch::TouchPhase::Moved,
+            x: 0.,
+            y: -800.,
+            window,
+        });
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 400.);
+        {
+            let model = app.world().resource::<Model>();
+            assert_eq!(model.scroll, 903.);
+            assert_eq!(model.modal.as_ref().unwrap().scroll, 400.);
+        }
+        // Rebuilding source controls after asynchronous updates must retain the user's position.
+        app.world_mut().resource_mut::<Model>().revision += 1;
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 400.);
+        // A source removal or viewport resize shrinks content and clamps stale travel.
+        app.world_mut()
+            .get_mut::<ComputedNode>(body)
+            .unwrap()
+            .content_size
+            .y = 150.;
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(body).unwrap().y, 50.);
+        assert_eq!(app.world().resource::<Model>().scroll, 903.);
+    }
 }
 
 /// A complete compact card retains its two-line title and action row below the preview.
@@ -898,4 +919,392 @@ fn scrollbar_grab_preserves_offset_and_tracks_fractional_motion() {
     let moved = app.world().get::<ScrollPosition>(body).unwrap().y;
     assert!(moved > grabbed);
     assert!(moved.fract() > 0.);
+}
+
+/// Sources summarize simultaneous permission instead of presenting an exclusive selector.
+#[test]
+fn from_summary_includes_local_and_multiple_controllers() {
+    assert_eq!(Model::source_summary(true, 2), "Local + 2 controllers");
+    assert_eq!(Model::source_summary(true, 0), "Local + 0 controllers");
+    assert_eq!(Model::source_summary(false, 1), "1 controller");
+}
+
+/// Source forms use ephemeral editor state and never produce a provider destination intent.
+#[test]
+fn from_drafts_cancel_secrets_and_keep_to_selection_independent() {
+    let mut model = Model::default();
+    model.open_sources("100.101.102.103:7010");
+    let modal = model.modal.as_mut().unwrap();
+    modal.select_source(SourceSelection::Remote("alice".into()));
+    modal.show_source_details(SourceDetails::Credentials);
+    model
+        .editor(Field::Configuration(1))
+        .unwrap()
+        .insert("private-admin-key");
+    assert!(model.apply(&provider_context()).is_none());
+    assert!(model.modal.is_some());
+    assert!(!model.allows(&UiAction::Runtime(Action::Play("pack/clip".into()))));
+    assert!(model.allows(&UiAction::Runtime(Action::StopAll)));
+    model.close();
+    model.open_sources("100.101.102.103:7010");
+    assert!(model.modal.as_ref().unwrap().editors[1].text.is_empty());
+    assert_eq!(
+        model.modal.as_ref().unwrap().editors[2].text,
+        "100.101.102.103:7010"
+    );
+}
+
+/// Exercise source buttons without dispatching the independently owned network executor.
+fn sources_app() -> App {
+    let runtime = Runtime::new(&config()).unwrap();
+    let mut network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    network.controllers = ["alice", "bob"]
+        .into_iter()
+        .map(|id| crate::network_app::ControllerSource {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            pairing_secret: None,
+            invitation_url: None,
+            invitation_status: "No invitation".into(),
+        })
+        .collect();
+    let mut model = Model::default();
+    model.open_sources("100.101.102.103:7010");
+    let mut app = App::new();
+    app.insert_resource(runtime)
+        .insert_resource(network)
+        .insert_resource(model)
+        .init_resource::<Actions>()
+        .add_systems(Update, buttons);
+    app
+}
+
+/// Disabling one controller never emits a destination change or revokes its peers/local source.
+#[test]
+fn source_buttons_enqueue_independent_permissions_without_changing_to() {
+    use crate::network_app::NetworkAction;
+    let mut app = sources_app();
+    app.world_mut().spawn((
+        Interaction::Pressed,
+        UiAction::Network(NetworkAction::SetControllerEnabled {
+            id: "alice".into(),
+            enabled: false,
+        }),
+    ));
+    app.world_mut().spawn((
+        Interaction::Pressed,
+        UiAction::Network(NetworkAction::SetControllerEnabled {
+            id: "bob".into(),
+            enabled: true,
+        }),
+    ));
+    app.update();
+    let actions = &app
+        .world()
+        .resource::<crate::network_app::NetworkState>()
+        .actions;
+    assert_eq!(actions.len(), 2);
+    assert!(actions.iter().any(|action| matches!(action, NetworkAction::SetControllerEnabled {id, enabled: false} if id == "alice")));
+    assert!(actions.iter().any(|action| matches!(action, NetworkAction::SetControllerEnabled {id, enabled: true} if id == "bob")));
+    assert!(app.world().resource::<Actions>().0.is_empty());
+    assert_eq!(
+        app.world().resource::<Runtime>().destination,
+        Destination::Remote
+    );
+}
+
+/// Explicit save transfers a key once and clears the masked draft before asynchronous storage.
+#[test]
+fn secure_save_consumes_only_the_admin_secret_draft() {
+    use crate::network_app::NetworkAction;
+    let mut app = sources_app();
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        let modal = model.modal.as_mut().unwrap();
+        modal.select_source(SourceSelection::Remote("alice".into()));
+        modal.show_source_details(SourceDetails::Credentials);
+    }
+    app.world_mut()
+        .resource_mut::<Model>()
+        .modal
+        .as_mut()
+        .unwrap()
+        .editors[1]
+        .insert("  secret-key  ");
+    app.world_mut()
+        .spawn((Interaction::Pressed, UiAction::SaveAdminSecret));
+    app.update();
+    assert!(
+        matches!(app.world().resource::<crate::network_app::NetworkState>().actions.front(), Some(NetworkAction::SaveAdminSecret {secret}) if secret == "secret-key")
+    );
+    assert!(
+        app.world()
+            .resource::<Model>()
+            .modal
+            .as_ref()
+            .unwrap()
+            .editors[1]
+            .text
+            .is_empty()
+    );
+    assert!(app.world().resource::<Actions>().0.is_empty());
+}
+
+/// Inbound listener editing must never replace the independent outbound host endpoint.
+#[test]
+fn listener_apply_keeps_outbound_to_address() {
+    use crate::network_app::NetworkAction;
+    let mut app = sources_app();
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        let modal = model.modal.as_mut().unwrap();
+        modal.select_source(SourceSelection::Remote("alice".into()));
+        modal.show_source_details(SourceDetails::Listener);
+    }
+    app.world_mut()
+        .resource_mut::<crate::network_app::NetworkState>()
+        .address = "ws://100.111.112.113:7010/control".into();
+    app.world_mut()
+        .spawn((Interaction::Pressed, UiAction::EnableListener));
+    app.update();
+    let network = app.world().resource::<crate::network_app::NetworkState>();
+    assert_eq!(network.address, "ws://100.111.112.113:7010/control");
+    assert_eq!(network.listen_address, "100.101.102.103:7010");
+    assert!(matches!(
+        network.actions.front(),
+        Some(NetworkAction::EnableHost)
+    ));
+    assert!(app.world().resource::<Actions>().0.is_empty());
+}
+
+#[test]
+fn listener_accepts_tailnet_ip_without_an_explicit_port() {
+    let mut app = sources_app();
+    {
+        let mut model = app.world_mut().resource_mut::<Model>();
+        let modal = model.modal.as_mut().unwrap();
+        modal.select_source(SourceSelection::Remote("alice".into()));
+        modal.show_source_details(SourceDetails::Listener);
+        modal.editors[2].text = "100.101.102.103".into();
+        modal.editors[2].cursor = modal.editors[2].text.len();
+    }
+    app.world_mut()
+        .spawn((Interaction::Pressed, UiAction::EnableListener));
+    app.update();
+    let network = app.world().resource::<crate::network_app::NetworkState>();
+    assert_eq!(network.listen_address, "100.101.102.103:48732");
+    assert!(matches!(
+        network.actions.front(),
+        Some(crate::network_app::NetworkAction::EnableHost)
+    ));
+}
+
+/// Press one transient source-navigation button without leaving stale synthetic interactions.
+fn source_press(app: &mut App, action: UiAction) {
+    let button = app.world_mut().spawn((Interaction::Pressed, action)).id();
+    app.update();
+    app.world_mut().despawn(button);
+}
+
+/// Selecting source forms leaves all independent permissions and the destination untouched.
+#[test]
+fn selecting_configured_sources_never_changes_permissions_or_to() {
+    let mut app = sources_app();
+    for selection in [
+        SourceSelection::Remote("alice".into()),
+        SourceSelection::Remote("bob".into()),
+        SourceSelection::Local,
+    ] {
+        source_press(&mut app, UiAction::SelectSource(selection.clone()));
+        let model = app.world().resource::<Model>();
+        let ModalDraft::Sources(sources) = &model.modal.as_ref().unwrap().draft else {
+            panic!("source form");
+        };
+        assert!(sources.selection == selection);
+        let network = app.world().resource::<crate::network_app::NetworkState>();
+        assert!(network.local_enabled);
+        assert!(network.controllers.iter().all(|source| source.enabled));
+        assert!(network.actions.is_empty());
+        assert!(app.world().resource::<Actions>().0.is_empty());
+        assert_eq!(
+            app.world().resource::<Runtime>().destination,
+            Destination::Remote
+        );
+    }
+}
+
+/// Plus and provider selection are reversible drafts; Cancel restores the configured source.
+#[test]
+fn plus_type_switch_and_cancel_create_no_controller() {
+    let mut app = sources_app();
+    source_press(
+        &mut app,
+        UiAction::SelectSource(SourceSelection::Remote("bob".into())),
+    );
+    source_press(
+        &mut app,
+        UiAction::SelectSource(SourceSelection::ChooseType),
+    );
+    source_press(&mut app, UiAction::SelectSource(SourceSelection::NewRemote));
+    app.world_mut()
+        .resource_mut::<Model>()
+        .editor(Field::Configuration(0))
+        .unwrap()
+        .insert("Uncommitted controller");
+    source_press(
+        &mut app,
+        UiAction::SelectSource(SourceSelection::ChooseType),
+    );
+    source_press(&mut app, UiAction::SelectSource(SourceSelection::NewRemote));
+    assert!(
+        app.world()
+            .resource::<Model>()
+            .modal
+            .as_ref()
+            .unwrap()
+            .editors[0]
+            .text
+            .is_empty()
+    );
+    source_press(&mut app, UiAction::CancelSource);
+    let model = app.world().resource::<Model>();
+    let ModalDraft::Sources(sources) = &model.modal.as_ref().unwrap().draft else {
+        panic!("source form");
+    };
+    assert!(sources.selection == SourceSelection::Remote("bob".into()));
+    let network = app.world().resource::<crate::network_app::NetworkState>();
+    assert_eq!(network.controllers.len(), 2);
+    assert!(network.actions.is_empty());
+}
+
+/// Hidden credentials are discarded on Back and source selection without saving or leaking focus.
+#[test]
+fn leaving_invitation_credentials_discards_secret_and_hidden_input_focus() {
+    let mut app = sources_app();
+    source_press(
+        &mut app,
+        UiAction::SelectSource(SourceSelection::Remote("alice".into())),
+    );
+    source_press(
+        &mut app,
+        UiAction::SourceDetails(SourceDetails::Credentials),
+    );
+    app.world_mut()
+        .resource_mut::<Model>()
+        .editor(Field::Configuration(1))
+        .unwrap()
+        .insert("private-admin-key");
+    source_press(
+        &mut app,
+        UiAction::SourceDetails(SourceDetails::Credentials),
+    );
+    assert!(
+        app.world_mut()
+            .resource_mut::<Model>()
+            .editor(Field::Configuration(1))
+            .is_none()
+    );
+    source_press(
+        &mut app,
+        UiAction::SourceDetails(SourceDetails::Credentials),
+    );
+    assert!(
+        app.world()
+            .resource::<Model>()
+            .modal
+            .as_ref()
+            .unwrap()
+            .editors[1]
+            .text
+            .is_empty()
+    );
+    app.world_mut()
+        .resource_mut::<Model>()
+        .editor(Field::Configuration(1))
+        .unwrap()
+        .insert("second-key");
+    source_press(&mut app, UiAction::SelectSource(SourceSelection::Local));
+    let model = app.world().resource::<Model>();
+    assert!(model.focus.is_none());
+    assert!(model.modal.as_ref().unwrap().editors[1].text.is_empty());
+    assert!(
+        app.world()
+            .resource::<crate::network_app::NetworkState>()
+            .actions
+            .is_empty()
+    );
+}
+
+/// An explicit Add selects its returned identity even if an older source has the same name.
+#[test]
+fn add_selects_only_new_controller_after_runtime_result() {
+    use crate::network_app::{ControllerSource, NetworkAction, NetworkState};
+    let mut app = sources_app();
+    source_press(
+        &mut app,
+        UiAction::SelectSource(SourceSelection::ChooseType),
+    );
+    source_press(&mut app, UiAction::SelectSource(SourceSelection::NewRemote));
+    app.world_mut()
+        .resource_mut::<Model>()
+        .editor(Field::Configuration(0))
+        .unwrap()
+        .insert("alice");
+    source_press(&mut app, UiAction::AddController);
+    {
+        let network = app.world().resource::<NetworkState>();
+        assert_eq!(network.controllers.len(), 2);
+        assert!(
+            matches!(network.actions.front(), Some(NetworkAction::AddController {name}) if name == "alice")
+        );
+    }
+    app.world_mut()
+        .resource_mut::<NetworkState>()
+        .controllers
+        .push(ControllerSource {
+            id: "new-alice".into(),
+            name: "alice".into(),
+            enabled: true,
+            pairing_secret: None,
+            invitation_url: None,
+            invitation_status: "Ready".into(),
+        });
+    app.world_mut()
+        .resource_scope(|world, mut model: Mut<Model>| {
+            model.reconcile_sources(world.resource::<NetworkState>());
+        });
+    let model = app.world().resource::<Model>();
+    let ModalDraft::Sources(sources) = &model.modal.as_ref().unwrap().draft else {
+        panic!("source form");
+    };
+    assert!(sources.selection == SourceSelection::Remote("new-alice".into()));
+    assert!(sources.pending.is_none());
+    assert_eq!(
+        app.world().resource::<Runtime>().destination,
+        Destination::Remote
+    );
+}
+
+/// Controller-only launches can configure an inbound listener for remote-to-remote routing.
+#[test]
+fn controller_launch_listener_provider_apply_preserves_remote_destination() {
+    let mut app = sources_app();
+    app.world_mut().resource_mut::<Model>().open(
+        Provider::Host(HostProvider::TailscaleListener),
+        &provider_context(),
+    );
+    source_press(&mut app, UiAction::Apply);
+    assert!(matches!(
+        app.world()
+            .resource::<crate::network_app::NetworkState>()
+            .actions
+            .front(),
+        Some(crate::network_app::NetworkAction::EnableHost)
+    ));
+    assert!(app.world().resource::<Actions>().0.is_empty());
+    assert_eq!(
+        app.world().resource::<Runtime>().destination,
+        Destination::Remote
+    );
 }

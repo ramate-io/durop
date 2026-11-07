@@ -93,3 +93,21 @@ pub fn paste_text() -> Option<String> {
         (text.length() <= 4096).then(|| text.to_string())
     }
 }
+
+/// Write private connection details only after the host explicitly chooses Copy.
+pub fn copy_text(text: &str) -> bool {
+    unsafe {
+        let Some(class) = AnyClass::get(c"NSPasteboard") else {
+            return false;
+        };
+        let board: *mut AnyObject = msg_send![class, generalPasteboard];
+        if board.is_null() {
+            return false;
+        }
+        let _: isize = msg_send![board, clearContents];
+        let kind = objc2_foundation::NSString::from_str("public.utf8-plain-text");
+        let text = objc2_foundation::NSString::from_str(text);
+        let copied: objc2::runtime::Bool = msg_send![board, setString: &*text, forType: &*kind];
+        copied.as_bool()
+    }
+}

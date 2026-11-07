@@ -18,13 +18,20 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 
 mod controller;
+
+mod sources;
+
+#[cfg(test)]
+mod routing_tests;
+
+pub use sources::ControllerSource;
 
 use controller::{
     Connected, Connecting, ControllerAdmissionError, ControllerBackend, ControllerMailbox,
@@ -38,11 +45,33 @@ pub struct NetworkConfig {
     pub address: Option<String>,
     /// Start remote hosting only when the user explicitly requested a listener.
     pub enable_host: bool,
+    /// Independent listener address; outbound connection settings never overwrite it.
+    pub listen_address: Option<String>,
 }
 
 /// UI intentions consumed once; disconnected button presses are discarded.
 #[derive(Clone)]
 pub enum NetworkAction {
+    /// Independently admit or reject locally generated playback commands.
+    SetLocalEnabled(bool),
+    /// Issue a separate session credential for a named input source.
+    AddController { name: String },
+    /// Change one source's permission without affecting other sources.
+    SetControllerEnabled { id: String, enabled: bool },
+    /// Permanently revoke one source's session credential.
+    RevokeController { id: String },
+    /// Create a host-device sharing invitation using host-owned administration credentials.
+    CreateInvitation { id: String },
+    /// Revoke a pending Tailscale invitation independently of Durop pairing.
+    RevokeInvitation { id: String },
+    /// Reconcile pending and accepted invitations with Tailscale.
+    RefreshInvitations,
+    /// Explicitly save a masked UI input through the platform secret store.
+    SaveAdminSecret { secret: String },
+    /// Remove the saved administrative credential; environment overrides remain explicit.
+    RemoveAdminSecret,
+    /// Copy the selected controller's private connection instructions to the clipboard.
+    CopyControllerHandoff { id: String },
     /// Verify this Mac's selected tailnet address and enable a new credential.
     EnableHost,
     /// Revoke the current listener and all controller access.
@@ -108,6 +137,8 @@ impl RemoteCatalogView {
 
 /// Background results carry a generation so an ended session cannot update a new one.
 enum Update {
+    // Secret-store and Tailscale API results are processed only on the application thread.
+    Sources(sources::SourceUpdate),
     // A live transport request still needs the shared host ingress guard and policy.
     Remote(RemoteCommand),
     // Ownership arrives only after catalog projection, address verification, and binding.
@@ -116,12 +147,16 @@ enum Update {
     HostEnded(u64),
     // Report only the current enable attempt; stale generations are ignored by dispatch.
     HostFailed(u64, String),
+    // One-shot OS/CLI lookup of this Mac's assigned tailnet listener address.
+    ListenerDiscovered(Option<String>),
     // The authenticated initial snapshot authorizes the Connecting -> Connected transition.
     Connected(u64, HostSnapshot, RemoteCatalogView),
     // Complete remote state supersedes any previously displayed event-derived state.
     Snapshot(u64, HostSnapshot),
     // Bounded bytes fetched for an exact ID from the validated remote catalog.
     Icon(u64, String, Vec<u8>),
+    // Every preview has been fetched or explicitly reported unavailable.
+    CatalogReady(u64),
     // Admission/host outcome, distinct from backend Started or physical output.
     Outcome(u64, CommandOutcome),
     // Clear controller state and pending UI intentions for this generation only.
@@ -134,6 +169,32 @@ type GuardedRequest = Arc<Mutex<Option<RemoteCommand>>>;
 /// UI-facing state plus the sole Tokio runtime and private controller lifecycle owners.
 #[derive(Resource)]
 pub struct NetworkState {
+    /// Local commands are an independent source, never an alternative to remote sources.
+    pub local_enabled: bool,
+    // Toggle-off cancels native work admitted earlier in the same UI frame.
+    local_permission: Arc<std::sync::atomic::AtomicBool>,
+    /// Address to receive commands on, independent of the selected destination.
+    pub listen_address: String,
+    /// Assigned tailnet listener discovered from this Mac's Tailscale status, if any.
+    pub discovered_listener: Option<String>,
+    // True after the one-shot OS/CLI lookup finishes, including failure.
+    listener_lookup_done: bool,
+    /// Independently authorized controller inputs for the current application session.
+    pub controllers: Vec<ControllerSource>,
+    /// Redacted administrative capability and secure-storage status.
+    pub admin_status: String,
+    /// Whether a validated host-side API credential is available for invitations.
+    pub admin_secret_available: bool,
+    // Shared authentication leases invalidate already queued commands on revocation.
+    sources: transport::SourceAccessRegistry,
+    // Host-side secrets and asynchronous invitation ownership stay out of UI models.
+    administration: sources::Administration,
+    // Track selected routing independently of connection availability; never fall back locally.
+    destination: crate::app::Destination,
+    // Preserve the explicit From listener choice while switching To sessions.
+    receive_requested: bool,
+    // A relay's immutable catalog is published only after all available previews arrive.
+    remote_catalog_ready: bool,
     /// Selected explicit host address, retained as editable UI input.
     pub address: String,
     /// Explicit pairing input only. Taken and cleared when Connect is pressed.
@@ -150,8 +211,6 @@ pub struct NetworkState {
     pub connected: bool,
     /// Whether an enabled local listener currently grants controller access.
     pub hosting: bool,
-    /// Host-only pairing display value, cleared on revocation and never persisted.
-    pub pairing_secret: Option<String>,
     /// One-shot UI intentions; each update processes at most 64 and discards excess.
     pub actions: VecDeque<NetworkAction>,
     // One long-lived executor for sockets/CLI work; never created by a button handler.
@@ -198,7 +257,42 @@ impl NetworkState {
     #[cfg(test)]
     /// Construct the same bounded orchestration without a native window event loop.
     pub(crate) fn for_ui_test(snapshot: HostSnapshot) -> Self {
-        NetworkState::new(snapshot, &NetworkConfig::default(), Arc::new(|| {}))
+        let mut network = NetworkState::new(snapshot, &NetworkConfig::default(), Arc::new(|| {}));
+        network.listener_lookup_done = true;
+        network
+    }
+
+    /// Listener field value: explicit address, else the discovered tailnet IP:port.
+    pub fn listener_endpoint(&self) -> &str {
+        if !self.listen_address.is_empty() {
+            &self.listen_address
+        } else {
+            self.discovered_listener.as_deref().unwrap_or("")
+        }
+    }
+
+    /// Explain the discovered or required listener address without repeating user input.
+    pub fn listener_hint(&self) -> String {
+        if let Some(address) = &self.discovered_listener {
+            format!("Detected {address}. MagicDNS names are not accepted.")
+        } else if self.listener_lookup_done {
+            "Tailscale did not report this Mac's address. Enter the 100.x IP and port 48732 from the Tailscale app.".into()
+        } else {
+            "Looking up this Mac's Tailscale address…".into()
+        }
+    }
+
+    /// Read-only status/CLI lookup; never enrolls a device or changes tailnet policy.
+    pub fn discover_listener(&self) {
+        let updates = self.update_tx.clone();
+        let wake = self.wake.clone();
+        self.runtime.spawn(async move {
+            let found = transport::local_listener_address()
+                .await
+                .ok()
+                .map(|address| address.to_string());
+            notify(&updates, &wake, Update::ListenerDiscovered(found)).await;
+        });
     }
 
     #[cfg(test)]
@@ -210,6 +304,21 @@ impl NetworkState {
 
     /// Admit through the native ControllerBackend; success means queued, not started.
     pub fn queue_local(&mut self, envelope: Envelope) -> Result<(), QueueError> {
+        if !self.local_enabled {
+            return Err(QueueError::Closed);
+        }
+        let live = self.local_permission.clone();
+        self.local.submit_guarded(
+            envelope.clone(),
+            0,
+            Arc::new(move || live.load(std::sync::atomic::Ordering::Acquire)),
+        )?;
+        crate::diagnostics::submitted(&envelope, crate::diagnostics::Origin::Local);
+        Ok(())
+    }
+
+    /// Application cleanup can stop local media even when local controls are disabled.
+    pub(crate) fn queue_system(&mut self, envelope: Envelope) -> Result<(), QueueError> {
         self.local
             .submit(envelope.clone())
             .map_err(|error| match error {
@@ -224,6 +333,9 @@ impl NetworkState {
 
     /// Publish state before events and revoke a listener whose host session changed.
     pub fn publish_local(&mut self, snapshot: HostSnapshot, events: &[HostEvent]) {
+        if self.destination != crate::app::Destination::Local {
+            return;
+        }
         if self
             .session
             .as_ref()
@@ -252,7 +364,6 @@ impl NetworkState {
             session.revoke();
         }
         self.hosting = false;
-        self.pairing_secret = None;
     }
 
     /// Consume ready/connecting states and cancel the socket before clearing the UI view.
@@ -269,14 +380,24 @@ impl NetworkState {
         self.snapshot = None;
         self.remote_catalog = None;
         self.remote_icons.clear();
+        self.remote_catalog_ready = false;
+        if self.destination == crate::app::Destination::Remote {
+            self.disable_host();
+        }
         self.actions
             .retain(|action| !matches!(action, NetworkAction::RemoteCommand(_)));
     }
 
     /// Build the trusted metadata projection off the UI thread, then verify and bind.
     fn enable_host(&mut self, catalog: Arc<Catalog>) {
+        if self.destination == crate::app::Destination::Remote && !self.remote_catalog_ready {
+            self.status =
+                "Waiting for the To destination's catalog before enabling remote inputs".into();
+            return;
+        }
         self.disable_host();
-        let Ok(address) = NetworkConfig::parse_address(&self.address) else {
+        let Ok(address) = NetworkConfig::parse_address(&self.listen_address) else {
+            self.receive_requested = false;
             self.status = "Choose this Mac's Tailscale IP and port".into();
             return;
         };
@@ -284,18 +405,40 @@ impl NetworkState {
         let bridge = self.bridge.clone();
         let updates = self.update_tx.clone();
         let wake = self.wake.clone();
+        let registry = self.sources.clone();
+        let remote_catalog = if self.destination == crate::app::Destination::Remote {
+            let Some(view) = self.remote_catalog.as_ref() else {
+                self.status = "Connect the To destination before sharing controls".into();
+                return;
+            };
+            match RemoteCatalog::new(
+                serde_json::to_value(view).expect("validated catalog is serializable"),
+                self.remote_icons.clone(),
+            ) {
+                Ok(catalog) => Some(catalog),
+                Err(_) => {
+                    self.status = "Wait for destination catalog previews before sharing".into();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         self.status = "Verifying local Tailscale address…".into();
         self.host_job = Some(self.runtime.spawn(async move {
-            let result =
-                tokio::task::spawn_blocking(move || RemoteCatalogView::project(&catalog)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                remote_catalog.map_or_else(|| RemoteCatalogView::project(&catalog), Ok)
+            })
+            .await;
             let result = match result {
-                Ok(Ok(catalog)) => transport::enable(
+                Ok(Ok(catalog)) => transport::enable_with_registry(
                     SessionConfig {
                         address,
                         allowed_origins: vec![],
                     },
                     bridge,
                     catalog,
+                    registry,
                 )
                 .await
                 .map_err(|error| error.to_string()),
@@ -314,6 +457,17 @@ impl NetworkState {
 
     /// Create a non-admitting connecting typestate for one explicit protected attempt.
     fn connect(&mut self) {
+        if let Ok(target) = NetworkConfig::parse_address(&self.address)
+            && (self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.address == target)
+                || NetworkConfig::parse_address(&self.listen_address).ok() == Some(target))
+        {
+            self.secret.clear();
+            self.status = "To cannot point back to this Mac's From listener".into();
+            return;
+        }
         self.disconnect();
         let secret = std::mem::take(&mut self.secret);
         let (Ok(address), Ok(credential)) = (
@@ -338,6 +492,16 @@ impl NetworkState {
     /// Preserve the transport lease and reply ticket through the native shared ingress.
     fn admit_remote(&mut self, request: RemoteCommand) {
         if !request.is_active() {
+            return;
+        }
+        if self.destination == crate::app::Destination::Remote {
+            if let Some(controller) = self.controller.as_mut() {
+                controller.forward(request);
+            } else {
+                let _ = request.reply.send(CommandOutcome::Rejected {
+                    reason: Rejection::Busy,
+                });
+            }
             return;
         }
         self.ticket = self
@@ -381,7 +545,7 @@ impl NetworkState {
         let mut local = Vec::new();
         for receipt in self.inbox.drain(host) {
             crate::diagnostics::acknowledged(session, &receipt.command_id, &receipt.outcome);
-            if let Some(ticket) = receipt.ticket {
+            if let Some(ticket) = receipt.ticket.filter(|ticket| *ticket != 0) {
                 if let Some(request) = self
                     .pending
                     .remove(&ticket)
@@ -438,7 +602,9 @@ fn setup(
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
     });
-    commands.insert_resource(NetworkState::new(runtime.host.snapshot(), &config, wake));
+    let network = NetworkState::new(runtime.host.snapshot(), &config, wake);
+    network.discover_listener();
+    commands.insert_resource(network);
 }
 
 impl NetworkState {
@@ -493,6 +659,19 @@ impl NetworkState {
             }
         });
         NetworkState {
+            local_enabled: true,
+            local_permission: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            listen_address: config.listen_address.clone().unwrap_or_default(),
+            discovered_listener: None,
+            listener_lookup_done: false,
+            controllers: Vec::new(),
+            admin_status: "Configure an API token to create invitations".into(),
+            admin_secret_available: false,
+            sources: transport::SourceAccessRegistry::default(),
+            administration: sources::Administration::default(),
+            destination: crate::app::Destination::Local,
+            receive_requested: config.enable_host,
+            remote_catalog_ready: false,
             address: config.address.clone().unwrap_or_default(),
             secret: String::new(),
             status: "Remote access disabled".into(),
@@ -501,7 +680,6 @@ impl NetworkState {
             remote_icons: BTreeMap::new(),
             connected: false,
             hosting: false,
-            pairing_secret: None,
             actions: if config.enable_host {
                 VecDeque::from([NetworkAction::EnableHost])
             } else {
@@ -537,9 +715,24 @@ impl NetworkState {
 
 /// Admit bounded UI intentions, apply generation-checked results, then pump host policy.
 fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
-    if !runtime.enabled
+    network.initialize_administration();
+    if network.destination != runtime.destination {
+        network.disable_host();
+        network.destination = runtime.destination;
+    }
+    let expected_session = if runtime.destination == crate::app::Destination::Remote {
+        network
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.session_id.clone())
+    } else if runtime.enabled {
+        Some(runtime.snapshot.session_id.clone())
+    } else {
+        None
+    };
+    if expected_session.is_none()
         || network.session.as_ref().is_some_and(|session| {
-            !session.is_active() || session.session_id != runtime.snapshot.session_id
+            !session.is_active() || Some(&session.session_id) != expected_session.as_ref()
         })
     {
         if network.hosting {
@@ -553,14 +746,21 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
         };
         match action {
             NetworkAction::EnableHost => {
-                if runtime.enabled {
-                    network.snapshots.send_replace(runtime.host.snapshot());
+                network.receive_requested = true;
+                let selected = if runtime.destination == crate::app::Destination::Remote {
+                    network.snapshot.clone()
+                } else {
+                    runtime.enabled.then(|| runtime.host.snapshot())
+                };
+                if let Some(snapshot) = selected {
+                    network.snapshots.send_replace(snapshot);
                     network.enable_host(runtime.catalog.clone());
                 } else {
                     network.status = "Start the local host first".into();
                 }
             }
             NetworkAction::DisableHost => {
+                network.receive_requested = false;
                 network.disable_host();
                 network.status = "Remote access disabled".into();
             }
@@ -570,6 +770,10 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
                 network.status = "Controller disconnected".into();
             }
             NetworkAction::RemoteCommand(command) => {
+                if !network.local_enabled {
+                    network.status = "Local controls are disabled in From".into();
+                    continue;
+                }
                 if !network.connected {
                     network.status = "Remote unavailable; command not sent".into();
                     continue;
@@ -582,6 +786,7 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
                     network.status = "Remote busy or disconnected; command not queued".into();
                 }
             }
+            action => network.source_action(action),
         }
     }
     if !network.actions.is_empty() {
@@ -594,12 +799,12 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
         };
         match update {
             Update::Remote(request) => network.admit_remote(request),
+            Update::Sources(update) => network.source_update(update),
             Update::HostEnabled(generation, session)
                 if generation == network.host_generation
-                    && runtime.enabled
-                    && session.session_id == runtime.snapshot.session_id =>
+                    && Some(&session.session_id) == expected_session.as_ref() =>
             {
-                network.pairing_secret = Some(session.credential.bearer().into());
+                network.host_job = None;
                 let session = Arc::new(session);
                 let monitored = session.clone();
                 let updates = network.update_tx.clone();
@@ -612,33 +817,58 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
                 }));
                 network.session = Some(session);
                 network.hosting = true;
-                network.status =
-                    "Remote hosting enabled; share pairing credential privately".into();
+                network.status = "Remote inputs enabled; add controllers in From".into();
             }
             Update::HostFailed(generation, error) if generation == network.host_generation => {
+                network.host_job = None;
+                network.receive_requested = false;
                 network.status = format!("Remote host unavailable: {error}")
             }
+            Update::ListenerDiscovered(found) => {
+                network.listener_lookup_done = true;
+                if let Some(address) = found {
+                    network.discovered_listener = Some(address.clone());
+                    if network.listen_address.is_empty() {
+                        network.listen_address = address;
+                    }
+                }
+            }
             Update::HostEnded(generation) if generation == network.host_generation => {
+                network.receive_requested = false;
                 network.disable_host();
                 network.status = "Remote hosting ended; Tailscale address unavailable".into();
             }
             Update::Connected(generation, snapshot, catalog)
                 if generation == network.client_generation =>
             {
+                if snapshot.session_id == runtime.snapshot.session_id {
+                    network.disconnect();
+                    network.status = "Cannot route controls back into this host".into();
+                    continue;
+                }
                 let Some(connecting) = network.connecting.take() else {
                     continue;
                 };
                 network.controller = Some(connecting.connected(&snapshot));
+                if runtime.destination == crate::app::Destination::Remote {
+                    network.snapshots.send_replace(snapshot.clone());
+                }
                 network.snapshot = Some(snapshot);
                 network.remote_catalog = Some(catalog);
                 network.connected = true;
                 network.status = "Remote host connected".into();
             }
             Update::Snapshot(generation, snapshot) if generation == network.client_generation => {
+                if runtime.destination == crate::app::Destination::Remote {
+                    network.snapshots.send_replace(snapshot.clone());
+                }
                 network.snapshot = Some(snapshot)
             }
             Update::Icon(generation, id, png) if generation == network.client_generation => {
                 network.remote_icons.insert(id, png);
+            }
+            Update::CatalogReady(generation) if generation == network.client_generation => {
+                network.remote_catalog_ready = true;
             }
             Update::Outcome(generation, outcome) if generation == network.client_generation => {
                 network.status = match outcome {
@@ -657,6 +887,20 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
             _ => {}
         }
     }
+    if network.receive_requested && !network.hosting && network.host_job.is_none() {
+        let selected = if runtime.destination == crate::app::Destination::Remote {
+            network
+                .remote_catalog_ready
+                .then(|| network.snapshot.clone())
+                .flatten()
+        } else {
+            runtime.enabled.then(|| runtime.host.snapshot())
+        };
+        if let Some(snapshot) = selected {
+            network.snapshots.send_replace(snapshot);
+            network.enable_host(runtime.catalog.clone());
+        }
+    }
     let session_id = runtime.snapshot.session_id.clone();
     for outcome in network.accept_pending(&mut runtime.host, &session_id) {
         if let CommandOutcome::Rejected { reason } = outcome {
@@ -673,7 +917,13 @@ impl NetworkConfig {
         } else {
             address
         };
-        address.parse().map_err(|_| ())
+        if let Ok(endpoint) = address.parse() {
+            return Ok(endpoint);
+        }
+        address
+            .parse::<IpAddr>()
+            .map(|ip| SocketAddr::new(ip, crate::transport::DEFAULT_LISTEN_PORT))
+            .map_err(|_| ())
     }
 }
 
@@ -703,10 +953,24 @@ impl RemoteCatalogView {
             });
             let mut png = Vec::new();
             std::fs::File::open(&clip.icon_path)
-                .map_err(|_| "Catalog icon unavailable")?
-                .take(32 * 1024 + 1)
+                .map_err(|_| format!("Catalog icon unavailable for {}", clip.identity))?
+                .take((crate::transport::MAX_ICON_PNG + 1) as u64)
                 .read_to_end(&mut png)
-                .map_err(|_| "Catalog icon unavailable")?;
+                .map_err(|_| format!("Catalog icon unavailable for {}", clip.identity))?;
+            if png.len() > crate::transport::MAX_ICON_PNG {
+                return Err(format!(
+                    "Clip {} icon is {} KiB; remote sharing allows at most {} KiB",
+                    clip.identity,
+                    png.len().div_ceil(1024),
+                    crate::transport::MAX_ICON_PNG / 1024
+                ));
+            }
+            if !crate::transport::valid_icon_png(&png) {
+                return Err(format!(
+                    "Clip {} icon is not a bounded PNG preview",
+                    clip.identity
+                ));
+            }
             icons.insert(clip.identity.clone(), png);
         }
         let view = RemoteCatalogView {
@@ -812,6 +1076,7 @@ async fn controller_connected(
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut refresh = false;
+    let mut catalog_ready = false;
     let mut cutoff = 0;
     loop {
         let command = tokio::select! {
@@ -846,17 +1111,25 @@ async fn controller_connected(
                         Err(transport::ControllerError::UnknownIcon) => {},
                         Err(error) => return Err(error.to_string()),
                     }
+                } else if !catalog_ready {
+                    catalog_ready = true;
+                    if !notify(updates, wake, Update::CatalogReady(generation)).await {
+                        break;
+                    }
                 }
                 continue;
             }
         };
-        let Some(request) = command else {
+        let Some(mut request) = command else {
             break;
         };
         if !request.is_active() {
             continue;
         }
         if request.epoch < cutoff {
+            request.reply(CommandOutcome::Rejected {
+                reason: Rejection::Superseded,
+            });
             if !notify(
                 updates,
                 wake,
@@ -874,9 +1147,12 @@ async fn controller_connected(
             continue;
         }
         let stop = matches!(request.envelope.command, PlaybackCommand::StopAll);
-        let outcome = client.submit_envelope(request.envelope).await;
+        let outcome = client
+            .submit_guarded_envelope(request.envelope.clone(), &|| request.is_active())
+            .await;
         match outcome {
-            Ok(outcome) => {
+            Ok(Some(outcome)) => {
+                request.reply(outcome.clone());
                 if stop && matches!(outcome, CommandOutcome::Accepted { .. }) {
                     cutoff = cutoff.max(request.epoch);
                 }
@@ -885,7 +1161,11 @@ async fn controller_connected(
                     break;
                 }
             }
+            Ok(None) => continue,
             Err(transport::ControllerError::Busy) => {
+                request.reply(CommandOutcome::Rejected {
+                    reason: Rejection::Busy,
+                });
                 if !notify(
                     updates,
                     wake,
@@ -1221,5 +1501,18 @@ mod tests {
         let mut duplicates = view.clone();
         duplicates.clips.push(view.clips[0].clone());
         assert!(!duplicates.validate());
+        assert_eq!(
+            NetworkConfig::parse_address("100.75.38.86").unwrap(),
+            "100.75.38.86:48732".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn bundled_reactions_project_within_remote_icon_bounds() {
+        let catalog = crate::catalog::load_local(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sample-packs/reactions"),
+        )
+        .unwrap();
+        RemoteCatalogView::project(&catalog).unwrap();
     }
 }

@@ -118,7 +118,6 @@ pub(crate) struct TailscaleControllerBackend<State> {
 }
 
 /// One online request and its emergency-stop ordering epoch.
-#[derive(Debug)]
 pub(super) struct ControllerRequest {
     /// The exact canonical identity and policy request to send over the socket.
     pub(super) envelope: Envelope,
@@ -126,12 +125,25 @@ pub(super) struct ControllerRequest {
     pub(super) epoch: u64,
     // Checked again by the socket actor so dropping a backend revokes already queued work.
     live: Arc<AtomicBool>,
+    // Original source permission and reply survive a relay hop until destination admission.
+    forwarded: Option<crate::transport::RemoteCommand>,
 }
 
 impl ControllerRequest {
     /// Check immediately before handing queued work to the authenticated socket.
     pub(super) fn is_active(&self) -> bool {
         self.live.load(Ordering::Acquire)
+            && self
+                .forwarded
+                .as_ref()
+                .is_none_or(|request| request.is_active())
+    }
+
+    /// Deliver the destination's actual outcome to the source of a relayed command.
+    pub(super) fn reply(&mut self, outcome: crate::commands::CommandOutcome) {
+        if let Some(request) = self.forwarded.take() {
+            let _ = request.reply.send(outcome);
+        }
     }
 }
 
@@ -195,6 +207,21 @@ impl TailscaleControllerBackend<Connecting> {
 }
 
 impl TailscaleControllerBackend<Connected> {
+    /// Preserve authenticated source permission, identity, and outcome across one relay.
+    pub(super) fn forward(&mut self, request: crate::transport::RemoteCommand) {
+        let envelope = request.envelope.clone();
+        let mut forwarded = Some(request);
+        if self.admit(envelope, &mut forwarded).is_err()
+            && let Some(request) = forwarded
+        {
+            let _ = request
+                .reply
+                .send(crate::commands::CommandOutcome::Rejected {
+                    reason: crate::commands::Rejection::Busy,
+                });
+        }
+    }
+
     /// Create a fresh online command identity and admit it through the shared trait.
     pub(super) fn submit_command(
         &mut self,
@@ -226,6 +253,17 @@ impl TailscaleControllerBackend<Connected> {
 
 impl ControllerBackend for TailscaleControllerBackend<Connected> {
     fn submit(&mut self, envelope: Envelope) -> Result<(), ControllerAdmissionError> {
+        self.admit(envelope, &mut None)
+    }
+}
+
+impl TailscaleControllerBackend<Connected> {
+    // Both local and forwarded commands share backpressure and emergency ordering.
+    fn admit(
+        &mut self,
+        envelope: Envelope,
+        forwarded: &mut Option<crate::transport::RemoteCommand>,
+    ) -> Result<(), ControllerAdmissionError> {
         if !self.state.channels.live.load(Ordering::Acquire)
             || self.state.channels.normal.is_closed()
             || self.state.channels.priority.is_closed()
@@ -251,16 +289,16 @@ impl ControllerBackend for TailscaleControllerBackend<Connected> {
         } else {
             &self.state.channels.normal
         };
-        sender
-            .try_send(ControllerRequest {
-                envelope,
-                epoch,
-                live: self.state.channels.live.clone(),
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ControllerAdmissionError::Busy,
-                mpsc::error::TrySendError::Closed(_) => ControllerAdmissionError::Unavailable,
-            })?;
+        let permit = sender.try_reserve().map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ControllerAdmissionError::Busy,
+            mpsc::error::TrySendError::Closed(_) => ControllerAdmissionError::Unavailable,
+        })?;
+        permit.send(ControllerRequest {
+            envelope,
+            epoch,
+            live: self.state.channels.live.clone(),
+            forwarded: forwarded.take(),
+        });
         if stop {
             self.state.epoch = epoch;
         }

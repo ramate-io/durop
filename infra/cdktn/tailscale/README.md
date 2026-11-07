@@ -1,90 +1,189 @@
-# Tailscale infrastructure
+# Tailscale infrastructure reference
 
-Python CDK Terrain is the authoritative deployment source. It manages the complete policy of an **existing** tailnet, plus MagicDNS only when `magic_dns` is explicitly configured. OpenTofu owns state and deployment. No cloud playback server is created.
+Start with the role-based [Tailnet quickstart](../../../docs/tailnet-quickstart.md).
+`python main.py` is the infrastructure CLI under uv, matching other Terrain
+stacks. Typed CDK Terrain constructs manage the complete policy of an
+**existing** tailnet, plus MagicDNS only when explicitly configured. OpenTofu
+deploys with persistent local state. Nothing here creates a cloud playback
+server, enrolls a Mac, invites users or generates Durop session pairing
+credentials.
 
-For the end-to-end operator flow through the Tailscale admin console, device enrollment, reviewed deployment and Durop's Native/Tailscale UI, start with the [Tailnet quickstart](../../../docs/tailnet-quickstart.md). This document is the detailed policy/state/rollback reference.
+## Toolchain and commands
 
-## Toolchain and offline checks
-
-From the repository root, `nix develop .#infrastructure` enters a smaller shell; the default shell includes the same tools. The existing `flake.lock` pins Python **3.12.13**, Node **24.15.0**, uv **0.11.16**, and OpenTofu **1.11.8**. `uv.lock` pins CDK Terrain **0.25.0**, constructs **10.6.0**, and transitive Python dependencies. `package-lock.json` pins genuine `cdktn-cli` **0.25.0** and its dependencies; its Node requirement is >=22.23.4. The official provider is **tailscale/tailscale 0.29.2**, with signed checksums for Linux x86_64 and Apple Silicon. No archived CDKTF package is used.
+From `nix develop`:
 
 ```sh
 cd infra/cdktn/tailscale
 uv sync --locked
-npm ci --ignore-scripts
-TERRAFORM_BINARY_NAME=tofu npm exec -- cdktn get
+uv run --locked --no-sync python main.py setup --no-env
+python -m unittest discover -s ../../../scripts/tests -v
 uv run --locked --no-sync python -m unittest discover -s tests -v
-uv run --locked --no-sync python main.py synth --config network.config.example.json
-uv run --locked --no-sync python main.py validate durop-network --config network.config.example.json
+uv run --locked --no-sync python main.py synth --no-env --config network.config.example.json
+uv run --locked --no-sync python main.py validate --no-env --config network.config.example.json
 ```
 
-Bindings in `imports/` were generated with these tools; regenerate on provider/tool upgrades, review the diff, and commit them. Generation uses OpenTofu's registry and executable (`TERRAFORM_BINARY_NAME=tofu`), not Terraform. Synthesis after setup is deterministic and offline, requires no credentials and makes no Tailscale API calls. Validation initializes the locked provider (a download on a cold cache), then validates its schema without provider authentication. The CLI defaults to synthesis. `cdktf.json` is the filename required by Terrain.
+Defaults resolve against this directory; explicitly supplied relative paths
+resolve against the caller's working directory. `setup` syncs locked Python/npm
+dependencies and regenerates bindings; it may download dependencies, but
+performs no Tailscale operations. Runtime commands use `uv run --locked --no-sync`.
 
-Linux qualification passed dependency sync, binding generation, eleven pure tests, synthesis, and generated OpenTofu validation. Native Apple Silicon qualification on macOS 27.0.1 passed the same documented sequence on 2026-11-04 with the versions above, without deployment credentials. Binding regeneration left the committed bindings and provider lockfile unchanged; the tests verified deterministic synthesis and preservation of the complete supplied policy. [Infrastructure CI](https://github.com/ramate-io/durop/actions/runs/41780246089) also passed on macos-14 and ubuntu-24.04 at `b13f670`. No live policy read, import, plan, apply or enrollment was performed; live acceptance remains pending.
+| Command | Effect |
+| --- | --- |
+| `setup` | Install locked dependencies and regenerate provider bindings. |
+| `synth` | Generate deterministic OpenTofu JSON, with no API calls. |
+| `validate` | Initialize locked provider/backend and validate schema; no deployment. |
+| `import` | Adopt existing policy, and DNS only when configured; skip addresses already in state. |
+| `plan` | Save a plan and fingerprints; invalidate any previous review first. |
+| `show` | Verify fingerprints and display the exact saved plan. |
+| `apply` | Consume the saved review and apply only that plan. |
+| `status` | Show backend location, tracked addresses and saved-plan presence. |
+| `ensure` | Fetch the live ACL, merge Durop grants when `--host` is passed, import, plan and show. |
 
-The qualification Mac had neither the Tailscale CLI nor the app in `/Applications`, and its process environment had no deployment credentials or explicit tailnet target; no private network configuration was present. These checks establish tooling readiness only. Deployment still requires an administrator's complete policy export/backup, private configuration and scoped credentials, durable state, and enrollment of both Macs before the reviewed live steps and two-network TCP 48732 acceptance below.
+`import`, `plan`, `apply` and `ensure` are live operator actions and require explicit OAuth
+credentials and tailnet. No test or shell entry runs them against Tailscale.
+`validate`, `show` and `status` initialize OpenTofu and may download the locked
+provider; status inspects local ownership, not live connectivity or policy drift.
+The CLI has no destroy command.
 
-OpenTofu 1.11.8 does not expose all newer schema features to Terrain; this provider's policy/DNS resources use none of the omitted ephemeral/write-only/identity features. In the managed Linux qualification environment only, jsii's cache trust check required `JSII_RUNTIME_PACKAGE_CACHE=disabled` because `/home` belonged to another UID; the native Mac qualification and CI did not need that workaround.
+The committed `flake.lock` pins Python 3.12.13, Node 24.15.0, uv 0.11.16 and
+OpenTofu 1.11.8. Both Nix shells also include the open-source Tailscale CLI.
+`uv.lock` pins CDK Terrain 0.25.0 and constructs 10.6.0; `package-lock.json`
+pins `cdktn-cli` 0.25.0. The official provider is `tailscale/tailscale` 0.29.2,
+with signed checksums for Linux x86_64 and Apple Silicon. No archived CDKTF
+package is used; `cdktf.json` is Terrain's required filename. Regeneration uses
+`TERRAFORM_BINARY_NAME=tofu`; review and commit changes to `imports/`, provider
+lock and Python/npm locks together. Preserve `flake.lock` on toolchain changes.
 
-## Prepare the whole policy before deployment
+CI runs setup, pure tests, deterministic synthesis and schema validation on Linux
+and macOS, without deployment credentials or plan/apply. These checks do not
+establish enrollment, policy deployment or two-Mac acceptance. Earlier tooling
+qualification passed on both platforms; no live plan/apply was performed.
 
-`network.config.example.json` is for a dedicated test tailnet only. **Never use it to replace an existing tailnet policy.** The `tailscale_acl` resource owns the entire policy. This code preserves every supplied policy section, including unrelated grants, legacy ACLs, SSH, tests, tags and posture rules. It does not fetch or merge the live policy during synthesis.
+## Complete policy and optional DNS ownership
 
-Before any import or apply, an administrator must export the complete current policy from the Tailscale admin console's Access controls editor and save the original HuJSON in a private backup outside Git. Save a normalized JSON copy as well (using the editor's JSON export/formatting capability or a reviewed HuJSON parser; `json.loads` cannot parse comments). Create ignored `network.config.json` containing `{"policy": <the complete exported JSON object>}`. Retain all existing sections. Add only reviewed durop groups/host/grants and policy tests; replace example email identities and address with enrolled devices. Keep personal laptops owned by their users. A narrow TCP 48732 grant does not negate any existing broader allow.
+`ensure --host` downloads the live ACL as ordinary JSON (`Accept: application/json`),
+writes a private `fetched-acl.json` next to state, names `durop-host`, grants
+`autogroup:shared` TCP 48732, and saves ignored `network.config.json`. Repeatable
+`--member` emails are optional same-tailnet users; device-share guests are not
+listed. Optional `--deny` adds a reject test. Synthesis still never fetches or
+merges; only this operator command talks to the ACL API before generating
+OpenTofu JSON. Unrelated grants, ACLs, SSH rules, tests, tags and posture rules
+are preserved. A conflicting `durop-host` address is refused. An existing local
+config that differs from the merge is refused unless `--replace-config` is set.
+The example configuration is suitable only for a dedicated test tailnet;
+replacing a real policy with it would remove unrelated access. Existing broad
+grants remain effective. Skip `ensure`/`apply` when you do not want CDKTN to own
+policy and TCP 48732 already works.
 
-The sample has authorized-controller accept and unauthorized-identity deny tests. Replace both identities with real test users and retain those tests in the full policy. Review other rules that could permit the unauthorized identity. The local validator checks settings shapes, group identities, host IP/CIDR addresses, grant selectors and port ranges; the Tailscale policy engine remains responsible for semantic policy validation during plan/apply.
+The dedicated sample includes both a same-tailnet member group and a narrow
+`autogroup:shared` → `durop-host` / `tcp:48732` grant. The latter covers users who
+accepted a share of this device; the group alone does not admit shared guests.
+It grants only the Durop port on the named host and does not share additional
+devices. Review any broader rules in both tailnets and test with a real recipient.
+See Tailscale's [sharing/access-control guidance](https://tailscale.com/docs/features/sharing).
 
-Leave `magic_dns` absent unless this stack has explicitly taken ownership. Setting it to `true` or `false` owns that whole preference and requires import/review of the existing setting too. Otherwise use an existing DNS name or the device's Tailscale IP.
+The `tailscale_acl` resource owns the whole policy. Synthesis preserves every
+supplied policy section; it never fetches or merges the live document. Local
+validation checks shapes, identities, IP/CIDR addresses, selectors and ports;
+Tailscale's policy engine performs semantic validation during live operations.
 
-## Credentials and persistent state
+Leave `magic_dns` absent unless taking ownership of that complete preference.
+Either `true` or `false` enables ownership and requires import of the existing
+setting. Use the host's existing DNS name or Tailscale IP otherwise. Import uses
+`tailscale_acl.policy` with provider ID `acl`, and, only when configured,
+`tailscale_dns_preferences.dns` with ID `dns_preferences`; those IDs are arbitrary
+per the pinned provider's import contract. Existing addresses are skipped;
+failed state inspection aborts rather than assuming a resource is unmanaged.
+`overwrite_existing_content=false` requires policy adoption before replacement;
+`prevent_destroy=true` and `reset_acl_on_destroy=false` guard accidental removal.
 
-An administrator creates a dedicated OAuth trust credential separately. For policy reads/validation use `policy_file:read`; for modification use `policy_file`. Policy-read scope dependencies are `devices:posture_attributes:read` and `devices:core:read`; policy modification requires `devices:posture_attributes` and `devices:core:read`. Add `dns:read` for DNS reads or `dns` for DNS modifications only when MagicDNS is owned. Confirm the current scope dependencies in [Tailscale's trust credential reference](https://tailscale.com/docs/reference/trust-credentials#scopes). Device enrollment/auth-key administration is a separate credential. Federated identity is supported through the provider's documented environment variables when configured separately; PR CI does not receive deployment credentials or OIDC permissions.
+## Credentials and dotenv
 
-Supply `TAILSCALE_OAUTH_CLIENT_ID`, `TAILSCALE_OAUTH_CLIENT_SECRET`, and explicit `TAILSCALE_TAILNET` using your secret manager/environment. Do not put their values in source, command history, generated JSON, or durop session tokens. Plan and apply require an explicit tailnet target. Do not use `TAILSCALE_BASE_URL` for normal deployments.
+Create a dedicated administrator OAuth trust credential for the provisioner:
+`TAILSCALE_OAUTH_CLIENT_ID`, `TAILSCALE_OAUTH_CLIENT_SECRET` and explicit
+`TAILSCALE_TAILNET`. For modification use `policy_file`,
+`devices:posture_attributes` and `devices:core:read`; read-only policy scopes are
+`policy_file:read`, `devices:posture_attributes:read` and `devices:core:read`.
+Add DNS permission only when owning DNS. Verify current dependencies in the
+[trust credential reference](https://tailscale.com/docs/reference/trust-credentials#scopes).
+This manager uses OAuth client credentials; it does not provision trust credentials
+or depend on host API tokens. Do not use `TAILSCALE_BASE_URL` for ordinary deployments.
 
-The default state directory is `${XDG_STATE_HOME:-$HOME/.local/state}/durop/tailscale`. Use a different private, persistent absolute `--state-dir` for each tailnet. The wrapper creates it with mode 700 and uses umask 077 for files. State, backups, the saved plan and metadata remain there when `cdktf.out` is removed. The backend stores an absolute state path. Put this directory on durable encrypted storage with independent backups. Do not put it inside the checkout or generated output; the wrapper rejects those paths. Local file locks protect one operator on one machine. Multiple operators must first implement and migrate to a shared locking backend; do not share/copy this local backend between active operators. Keep the same state path when changing checkouts.
+The root `.env` is loaded automatically as data; the invoking environment wins,
+even when its value is empty. `--env-file /private/path.env` requires that file;
+`--no-env` disables loading. The parser accepts optional `export`, blank/comment
+lines and single-line quoted or unquoted `NAME=value` assignments. It performs
+no command substitution, variable expansion, escape decoding or shell evaluation.
+Malformed files fail without echoing their contents. Copy `.env.example` as a
+starting point and keep secret files outside Git. Avoid secrets in arguments,
+recorded terminal input or generated policy JSON.
 
-## Import, review, and apply
+The host's user-owned `TAILSCALE_API_KEY` is solely for its device-share invitation UI, supplied
+through the host's environment or secure UI storage. The manager removes it
+before invoking dependencies or the provider to avoid conflicting authentication.
+It never substitutes that token for OAuth credentials. Device enrollment uses
+Tailscale login; Durop pairing uses a separate runtime credential per named
+controller. Disabling a source or the listener retains that token until revoked
+or the host app exits. Neither is produced by infrastructure provisioning.
 
-The following commands are **explicit live operator actions**, not part of tests, shell entry, or session startup. Set up the private config/credentials and choose the persistent state directory first. Take exclusive operational ownership; do not run raw OpenTofu commands concurrently with the wrapper.
+## Persistent state, review and apply
+
+The default backend is `${XDG_STATE_HOME:-$HOME/.local/state}/durop/tailscale`.
+Use `--state-dir /private/persistent/path` consistently and a separate directory
+per tailnet. State and plans must live outside the checkout and generated output;
+the manager rejects unsafe paths. It creates state directories with mode 700,
+requires private existing directories and uses umask 077. The backend path is
+absolute; deleting `cdktf.out` never deletes state or plans. Use durable encrypted
+storage and independent private backups.
+
+One nonblocking file lock serializes all backend operations, including imports
+and reads, on one machine. Do not run raw OpenTofu concurrently. Multiple
+operators need a separately implemented shared locking backend and migration;
+do not copy/share this local backend between active operators.
+
+Before a live change, retain `fetched-acl.json`, the authored configuration and
+state, including OpenTofu `.backup` files. Then run the quickstart's
+ensure/apply sequence (or import/plan/show/apply on an existing file).
+Review the full diff, deletions, policy tests, resource addresses, target tailnet
+and backend path. A final plan after apply should show no changes; verify intended
+TCP 48732 access and rejection on real devices separately.
+
+Apply accepts only the saved plan. Metadata binds its bytes to the manager and
+lifecycle code, authored policy configuration, generated configuration, provider,
+Python/npm/Nix locks, generated bindings, backend path and provider target.
+Missing, changed or corrupted review inputs fail before OpenTofu runs. `show`
+checks the same fingerprint. A new plan or import invalidates the old review;
+an attempted apply consumes review metadata even if OpenTofu fails or is
+interrupted. OpenTofu also rejects stale state. After a change/failure, create,
+show and review a new plan. Never edit review files or bypass this with raw apply.
+
+## Recovery and macOS diagnostics
+
+To roll back policy, restore the backed-up **complete configuration**, retain
+current state/ownership, then plan, show, review and apply. Restoring old state
+does not restore remote policy. If access is lost, an administrator restores the
+policy in the admin console, then reconciles configuration through a fresh plan.
+If generated output is lost, regenerate against the same durable backend without
+re-importing. If state is lost, stop deployment and restore its latest backup;
+without a valid backup, export the live policy again and carefully adopt it into
+a new backend. Never delete state to hide a diff. Retirement requires a separate
+reviewed policy change; ending a recording never destroys infrastructure.
+
+The Nix CLI does not install a macOS network extension or enroll the machine.
+Tailscale's [GUI variants and open-source daemon](https://tailscale.com/docs/concepts/macos-variants)
+are distinct installations. A Nix `tailscale` can look for the open-source
+`tailscaled` socket rather than the running app's daemon. For a GUI enrollment,
+use its bundled CLI explicitly rather than starting a competing daemon:
 
 ```sh
-# Initialize and validate the synthesized stack with its durable local backend.
-uv run --locked --no-sync python main.py validate durop-network
-# Import records existing ownership in state; it does not authorize policy replacement.
-tofu -chdir=cdktf.out/stacks/durop-network import tailscale_acl.policy acl
-# Only when magic_dns is explicitly present/owned:
-# tofu -chdir=cdktf.out/stacks/durop-network import tailscale_dns_preferences.dns dns_preferences
-uv run --locked --no-sync python main.py plan durop-network
-# Inspect the exact saved plan; it may contain private policy data.
-tofu -chdir=cdktf.out/stacks/durop-network show "$HOME/.local/state/durop/tailscale/reviewed.tfplan"
-# Only after whole-tailnet review:
-uv run --locked --no-sync python main.py apply durop-network
-uv run --locked --no-sync python main.py plan durop-network
+TAILSCALE_BE_CLI=1 /Applications/Tailscale.app/Contents/MacOS/Tailscale status
+TAILSCALE_BE_CLI=1 /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4
+TAILSCALE_BE_CLI=1 /Applications/Tailscale.app/Contents/MacOS/Tailscale ping HOST_TAILSCALE_IP
 ```
 
-If XDG_STATE_HOME or `--state-dir` is used, adjust the `show` path accordingly and use the same CLI state/config/output options for each invocation. Both imported resource IDs above are arbitrary per the pinned provider's documentation. `overwrite_existing_content=false` requires importing an existing policy before managing it. `prevent_destroy=true` and `reset_acl_on_destroy=false` protect against accidental resource removal/reset; the wrapper has no destroy command.
-
-Review the complete policy diff, deletions, tests, resource addresses, tailnet and state path. The final plan after apply should report no changes. No plan/apply was run during development of this change, so a clean second live plan is an operator acceptance step. Verify authorized TCP 48732 reachability and unauthorized rejection on the actual tailnet.
-
-Apply uses only the saved plan. Metadata hashes source and generated configuration, complete private config, provider/Python/npm locks, generated bindings, backend path and provider target environment, plus the plan bytes. Missing or changed inputs cause refusal before OpenTofu runs. A failed plan invalidates the earlier plan; an attempted apply consumes its review metadata even on failure. OpenTofu additionally rejects plans whose state changed. Run and review a new plan after any change/failure. Never edit the saved plan or metadata, or run a fresh direct `tofu apply` to bypass this check.
-
-## Rollback and recovery
-
-Before each live change, privately back up the current exported policy and persistent state (including OpenTofu's `.backup` files) with a timestamp. Restrict backup permissions like state. To reverse policy changes, restore the backed-up **complete policy** into private configuration, retaining resource ownership and the current state, then synthesize, plan, review and apply a new saved plan. Do not restore old state as a policy rollback: state does not restore remote resources. If access is lost, a tailnet administrator uses the admin console to restore the policy backup; then refresh through a new plan and reconcile configuration before applying again.
-
-If generated output is lost, regenerate and initialize against the same durable backend; do not re-import resources already present in state. If state is lost, stop deployment, restore the latest state backup, and reconcile with a plan. If no valid state backup exists, export the live complete policy again and carefully import into a new backend before proposing changes. Never delete state to make a diff disappear. Retiring infrastructure is a separate reviewed whole-tailnet change, requiring explicit removal of lifecycle protection and a separately reviewed destruction plan; ending a recording never destroys policy or logs devices out.
-
-## Laptop enrollment and sessions
-
-Install the supported Tailscale macOS app and authorize its privileged network integration separately on both Macs. Each intended user logs into the existing tailnet interactively; use persistent user-owned enrollment. The Nix tools do not install the network extension or enroll laptops. Diagnose from each enrolled Mac:
-
-```sh
-tailscale up
-tailscale ip -4
-tailscale status --json
-tailscale ping recording-mac
-tailscale netcheck
-```
-
-Treat status output as private. Confirm both networks and the host TCP port, then use Durop's **Host → Native → Share this Mac…** flow on the playback Mac and **Host → Tailscale** on the controller. The [Tailnet quickstart](../../../docs/tailnet-quickstart.md#4-pair-through-durops-native-ui) covers the actual fields and session credential; Durop has no hosted web portal. Each recording uses existing infrastructure; it needs no apply. Ending a durop session revokes application access and closes its listener, while Tailscale enrollment persists. Ephemeral CI node enrollment is out of scope and requires its own narrowly scoped credentials and cleanup.
+See the official [CLI reference](https://tailscale.com/docs/reference/tailscale-cli)
+for installation-specific paths and socket options. Keep status output private.
+A ping alone does not prove TCP reachability or Durop authentication. Use the
+quickstart's **From**, **To** and **Catalog** flows for sessions; no infrastructure
+apply is required per recording. Actual desktop, audio, recording and two-network
+acceptance remain operator checks in the [session runbook](../../../docs/session-runbook.md).
