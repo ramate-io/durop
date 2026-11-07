@@ -38,7 +38,7 @@ use configuration::{
     CatalogProvider, ConfigurationContext, ConfigurationDraft, ConfigurationIntent, DisplayChoice,
     HostProvider, Provider,
 };
-use placement::{PlacementModal, PlacementScope};
+use placement::{PlacementModal, PlacementPreset, PlacementScope};
 use std::{
     collections::BTreeMap,
     io::Read,
@@ -122,6 +122,8 @@ enum UiAction {
     EditPlacement(String),
     /// Reset the draft to catalog values without applying it.
     ResetPlacement,
+    /// Set a common display position in the draft without applying or sending it.
+    PresetPlacement(PlacementPreset),
     /// Nudge one visual percentage by one point for pointer-only adjustment.
     StepPlacement(usize, i16),
     /// Apply placement to active occurrences, optionally sending another play.
@@ -420,6 +422,7 @@ impl Model {
                 UiAction::Apply
                     | UiAction::ApplyPlacement(_)
                     | UiAction::ResetPlacement
+                    | UiAction::PresetPlacement(_)
                     | UiAction::StepPlacement(_, _)
                     | UiAction::Cancel
                     | UiAction::Cycle(_)
@@ -1008,6 +1011,12 @@ fn buttons(
             UiAction::ResetPlacement => {
                 if let Some(modal) = &mut model.placement_modal {
                     modal.reset();
+                }
+                model.focus = None;
+            }
+            UiAction::PresetPlacement(preset) => {
+                if let Some(modal) = &mut model.placement_modal {
+                    preset.apply(modal);
                 }
                 model.focus = None;
             }

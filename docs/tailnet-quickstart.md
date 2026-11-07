@@ -73,7 +73,9 @@ nix develop --command cargo run -p durop --bin durop --locked
    make them a member of the host's tailnet. The host needs its own user-owned
    `TAILSCALE_API_KEY` from its process environment or the UI's secure credential
    storage. Root `.env` is read by the infrastructure manager only; it does not
-   export variables into Durop.
+   export variables into Durop. Protected storage is first accessed when you add
+   a controller or enable its listener; ordinary startup and local playback do not
+   request Keychain access.
 4. Choose **Copy invitation link + pairing details**, or **Copy Durop pairing
    details** when no invitation is needed. Send these privately to that controller.
    Each named controller has a separate Durop token.

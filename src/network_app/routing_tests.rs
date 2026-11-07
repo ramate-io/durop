@@ -25,6 +25,7 @@ impl RoutingHost {
         let host = crate::host::Host::new(identity.into(), catalog.clone());
         let mut network =
             NetworkState::new(host.snapshot(), &NetworkConfig::default(), Arc::new(|| {}));
+        network.administration = sources::Administration::for_test();
         if let Some(snapshot) = advertised {
             network.destination = crate::app::Destination::Remote;
             network.snapshots.send_replace(snapshot.clone());

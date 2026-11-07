@@ -997,6 +997,254 @@ fn placement_percentages_are_finite_bounded_and_exact() {
     }
 }
 
+/// Corner helpers preserve unfinished width text, while Fullscreen replaces all three percentages.
+#[test]
+fn placement_presets_set_exact_bounds_and_preserve_corner_width() {
+    let defaults = VisualPlacement {
+        width_bps: 2345,
+        x_bps: 4567,
+        y_bps: 6789,
+    };
+    for (preset, x_bps, y_bps) in [
+        (PlacementPreset::TopLeft, 0, 0),
+        (PlacementPreset::TopRight, 10000, 0),
+        (PlacementPreset::BottomLeft, 0, 10000),
+        (PlacementPreset::BottomRight, 10000, 10000),
+    ] {
+        let mut modal = PlacementModal::new("test/clip".into(), "Clip".into(), defaults, defaults);
+        modal.error = Some("Previous invalid draft".into());
+        modal.reset = true;
+        preset.apply(&mut modal);
+        assert_eq!(
+            modal.placement().unwrap(),
+            VisualPlacement {
+                width_bps: 2345,
+                x_bps,
+                y_bps
+            }
+        );
+        assert!(!modal.reset);
+        assert!(modal.error.is_none());
+        modal.editors[0].text = "unfinished-width".into();
+        preset.apply(&mut modal);
+        assert_eq!(modal.editors[0].text, "unfinished-width");
+        assert!(
+            modal.placement().is_err(),
+            "a corner must not silently replace invalid width"
+        );
+        PlacementPreset::Fullscreen.apply(&mut modal);
+        assert_eq!(
+            modal.placement().unwrap(),
+            VisualPlacement {
+                width_bps: 10000,
+                x_bps: 5000,
+                y_bps: 5000
+            }
+        );
+    }
+}
+
+/// Presets remain transactional: Cancel retains prior values, Reset clears them only after Apply.
+#[test]
+fn placement_preset_cancel_reset_and_apply_preserve_transaction_contract() {
+    use crate::commands::{InstanceSnapshot, InstanceState};
+    let mut runtime = placement_runtime();
+    let clip = visual_clip(&runtime).clone();
+    let defaults = crate::host::Host::default_placement(&clip).unwrap();
+    let saved = VisualPlacement {
+        width_bps: 2345,
+        x_bps: 1234,
+        y_bps: 4321,
+    };
+    runtime.snapshot.instances.push(InstanceSnapshot {
+        instance_id: "live".into(),
+        clip_id: clip.identity.clone(),
+        generation: 1,
+        state: InstanceState::Playing,
+        placement: Some(saved),
+    });
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut model = Model::default();
+    model.sync_placements(PlacementScope::current(&runtime, &network));
+    model.placements.insert(clip.identity.clone(), saved);
+    model.open_placement(&clip.identity, &runtime, &network);
+    PlacementPreset::Fullscreen.apply(model.placement_modal.as_mut().unwrap());
+    assert_eq!(model.placements[&clip.identity], saved);
+    assert_eq!(runtime.snapshot.instances[0].placement, Some(saved));
+    model.close();
+    assert!(
+        matches!(model.play_action(&clip.identity), Action::PlayVisual { placement, .. } if placement == saved)
+    );
+
+    model.open_placement(&clip.identity, &runtime, &network);
+    PlacementPreset::Fullscreen.apply(model.placement_modal.as_mut().unwrap());
+    model.placement_modal.as_mut().unwrap().reset();
+    assert_eq!(
+        model.placement_modal.as_ref().unwrap().placement().unwrap(),
+        defaults
+    );
+    assert_eq!(model.placements[&clip.identity], saved);
+    assert!(matches!(
+        model.apply_placement(&runtime.snapshot, false).as_slice(),
+        [Action::SetVisual {
+            placement: None,
+            ..
+        }]
+    ));
+    assert!(model.placements.is_empty());
+
+    // The subsequent authoritative snapshot acknowledges the committed reset.
+    runtime.snapshot.instances[0].placement = None;
+    model.open_placement(&clip.identity, &runtime, &network);
+    PlacementPreset::BottomRight.apply(model.placement_modal.as_mut().unwrap());
+    let corner = VisualPlacement {
+        width_bps: defaults.width_bps,
+        x_bps: 10000,
+        y_bps: 10000,
+    };
+    assert!(
+        matches!(model.apply_placement(&runtime.snapshot, true).as_slice(),
+        [Action::SetVisual { placement: Some(updated), .. }, Action::PlayVisual { placement: sent, .. }]
+            if *updated == corner && *sent == corner)
+    );
+}
+
+/// Trigger a rendered helper through the same engine activation contract as a pointer press.
+fn activate_placement_preset(app: &mut App, preset: PlacementPreset) {
+    let entity = app
+        .world_mut()
+        .query::<(Entity, &UiAction)>()
+        .iter(app.world())
+        .find_map(|(entity, action)| {
+            matches!(action, UiAction::PresetPlacement(value) if *value == preset).then_some(entity)
+        })
+        .expect("every placement helper has a rendered button");
+    app.world_mut().trigger(Activate { entity });
+}
+
+/// Preset clicks consume the last native edit, refresh only changed fields, and retain modal Tab order.
+#[test]
+fn placement_presets_sync_native_editors_without_playing_or_breaking_tab() {
+    let (mut app, window) = input_app();
+    enable_headless_layout(&mut app, 720, 520);
+    let runtime = placement_runtime();
+    let clip_id = visual_clip(&runtime).identity.clone();
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    app.insert_resource(runtime).insert_resource(network);
+    app.world_mut()
+        .resource_scope(|world, mut model: Mut<Model>| {
+            let runtime = world.resource::<Runtime>();
+            let network = world.resource::<crate::network_app::NetworkState>();
+            model.sync_placements(PlacementScope::current(runtime, network));
+            model.open_placement(&clip_id, runtime, network);
+        });
+    for _ in 0..3 {
+        app.update();
+    }
+    let original = app
+        .world()
+        .resource::<Model>()
+        .placement_modal
+        .as_ref()
+        .unwrap()
+        .editors
+        .iter()
+        .map(|editor| editor.entity.unwrap())
+        .collect::<Vec<_>>();
+    {
+        let mut width = app
+            .world_mut()
+            .get_mut::<EditableText>(original[0])
+            .unwrap();
+        width.queue_edit(bevy::text::TextEdit::SelectAll);
+        width.queue_edit(bevy::text::TextEdit::Insert("33.33".into()));
+    }
+    activate_placement_preset(&mut app, PlacementPreset::BottomLeft);
+    app.update();
+    assert!(app.world().resource::<Actions>().0.is_empty());
+    assert!(app.world().resource::<Model>().placements.is_empty());
+    assert_eq!(
+        app.world()
+            .resource::<Model>()
+            .placement_modal
+            .as_ref()
+            .unwrap()
+            .placement()
+            .unwrap(),
+        VisualPlacement {
+            width_bps: 3333,
+            x_bps: 0,
+            y_bps: 10000
+        }
+    );
+    app.update();
+    let corners = app
+        .world()
+        .resource::<Model>()
+        .placement_modal
+        .as_ref()
+        .unwrap()
+        .editors
+        .iter()
+        .map(|editor| editor.entity.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        corners[0], original[0],
+        "corners must preserve the live width editor"
+    );
+    assert_ne!(corners[1], original[1]);
+    assert!(app.world().get_entity(original[1]).is_err());
+    for (entity, value) in corners.iter().zip(["33.33", "0.00", "100.00"]) {
+        assert_eq!(
+            app.world().get::<EditableText>(*entity).unwrap().value(),
+            value
+        );
+        assert!(
+            app.world()
+                .get::<bevy::ui::ComputedUiTargetCamera>(*entity)
+                .unwrap()
+                .get()
+                .is_some()
+        );
+    }
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(corners[1]));
+    key(&mut app, window, Key::Tab, KeyCode::Tab, None);
+    app.update();
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(corners[2]));
+
+    activate_placement_preset(&mut app, PlacementPreset::Fullscreen);
+    app.update();
+    app.update();
+    let fullscreen = app
+        .world()
+        .resource::<Model>()
+        .placement_modal
+        .as_ref()
+        .unwrap()
+        .editors
+        .iter()
+        .map(|editor| editor.entity.unwrap())
+        .collect::<Vec<_>>();
+    for (entity, value) in fullscreen.iter().zip(["100.00", "50.00", "50.00"]) {
+        assert_eq!(
+            app.world().get::<EditableText>(*entity).unwrap().value(),
+            value
+        );
+    }
+    assert!(app.world().get_entity(original[0]).is_err());
+    assert_eq!(
+        app.world().resource::<InputFocus>().get(),
+        Some(fullscreen[0])
+    );
+    assert!(app.world().resource::<Actions>().0.is_empty());
+    key(&mut app, window, Key::Escape, KeyCode::Escape, None);
+    app.update();
+    app.update();
+    assert!(app.world().resource::<Model>().placement_modal.is_none());
+    assert!(app.world().resource::<Model>().placements.is_empty());
+    assert!(app.world().resource::<Actions>().0.is_empty());
+}
+
 /// Apply changes all live copies of a clip, excludes stopping/history, and remembers future plays.
 #[test]
 fn placement_apply_updates_live_occurrences_without_playing_another_copy() {
@@ -3132,11 +3380,43 @@ fn measured_compact_placement_form_keeps_footer_and_last_content_visible() {
             .unwrap();
         let body_node = app.world().get::<ComputedNode>(body).unwrap();
         assert!(body_node.size().y > 0.);
+        let body_content_box = body_node.content_box();
+        let body_transform = app.world().get::<UiGlobalTransform>(body).unwrap();
+        let body_left = body_transform
+            .affine()
+            .transform_point2(body_content_box.min)
+            .x;
+        let body_right = body_transform
+            .affine()
+            .transform_point2(body_content_box.max)
+            .x;
+        let presets = app
+            .world_mut()
+            .query::<(&UiAction, &ComputedNode, &UiGlobalTransform)>()
+            .iter(app.world())
+            .filter(|(action, _, _)| matches!(action, UiAction::PresetPlacement(_)))
+            .map(|(_, node, transform)| {
+                (
+                    transform.translation.x - node.size().x * 0.5,
+                    transform.translation.x + node.size().x * 0.5,
+                    node.size().y,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(presets.len(), 5);
+        assert!(
+            presets
+                .iter()
+                .all(|(left, right, height)| *left >= body_left - 1.
+                    && *right <= body_right + 1.
+                    && *height > 0.),
+            "placement helper row did not wrap inside the form"
+        );
         if after_scroll {
             let body_transform = app.world().get::<UiGlobalTransform>(body).unwrap();
             let content_bottom = body_transform
                 .affine()
-                .transform_point2(body_node.content_box().max)
+                .transform_point2(body_content_box.max)
                 .y;
             let hint = app
                 .world_mut()

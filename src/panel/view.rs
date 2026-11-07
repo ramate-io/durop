@@ -1045,6 +1045,20 @@ impl View<'_> {
                         row_gap: px(14), flex_shrink: 0., ..default()
                     }).with_children(|fields| {
                         self.label(fields, "Percentages use the host display. Position keeps media on screen.", 11., MUTED);
+                        fields.spawn(Node {
+                            width: percent(100), column_gap: px(8), row_gap: px(8),
+                            flex_wrap: FlexWrap::Wrap, ..default()
+                        }).with_children(|presets| {
+                            for (label, preset) in [
+                                ("Fullscreen", PlacementPreset::Fullscreen),
+                                ("Top left", PlacementPreset::TopLeft),
+                                ("Top right", PlacementPreset::TopRight),
+                                ("Bottom left", PlacementPreset::BottomLeft),
+                                ("Bottom right", PlacementPreset::BottomRight),
+                            ] {
+                                self.button(presets, label, UiAction::PresetPlacement(preset), false);
+                            }
+                        });
                         for (index, label) in ["Scale (% of host width)", "Horizontal (% left → right)", "Vertical (% top → bottom)"].into_iter().enumerate() {
                             self.label(fields, label, 11., MUTED);
                             fields.spawn(Node {

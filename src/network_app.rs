@@ -268,6 +268,7 @@ impl NetworkState {
     pub(crate) fn for_ui_test(snapshot: HostSnapshot) -> Self {
         let mut network = NetworkState::new(snapshot, &NetworkConfig::default(), Arc::new(|| {}));
         network.listener_lookup_done = true;
+        network.administration = sources::Administration::for_test();
         network
     }
 
@@ -433,6 +434,7 @@ impl NetworkState {
         } else {
             None
         };
+        self.initialize_administration();
         self.status = "Verifying local Tailscale address…".into();
         self.host_job = Some(self.runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -730,7 +732,6 @@ impl NetworkState {
 
 /// Admit bounded UI intentions, apply generation-checked results, then pump host policy.
 fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
-    network.initialize_administration();
     if network.destination != runtime.destination {
         network.disable_host();
         network.destination = runtime.destination;

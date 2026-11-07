@@ -865,17 +865,16 @@ impl Playback {
         }
     }
 
-    /// Retain exact catalog sizing when no override is active, sharing the box with crop math.
+    /// Scale explicit overrides against both display dimensions; reset retains catalog sizing.
     fn fit_target(clip: &Clip, placement: Option<VisualPlacement>, viewport: Vec2) -> Vec2 {
-        let fraction = placement.map_or_else(
-            || {
-                clip.metadata
-                    .visual
-                    .as_ref()
-                    .map_or(0.3, |visual| visual.width_fraction as f32)
-            },
-            |placement| f32::from(placement.width_bps) / 10_000.0,
-        );
+        if let Some(placement) = placement {
+            return viewport * (f32::from(placement.width_bps) / 10_000.0);
+        }
+        let fraction = clip
+            .metadata
+            .visual
+            .as_ref()
+            .map_or(0.3, |visual| visual.width_fraction as f32);
         Vec2::splat((viewport.x * fraction).min(viewport.y))
     }
 
@@ -1103,6 +1102,44 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn fullscreen_uses_the_display_shape_and_reset_keeps_catalog_geometry() {
+        let catalog =
+            crate::catalog::load_local(&resource_root().join("sample-packs/podcast-pack")).unwrap();
+        let mut clip = catalog
+            .clips
+            .iter()
+            .find(|clip| clip.metadata.visual.is_some())
+            .unwrap()
+            .clone();
+        clip.metadata.visual.as_mut().unwrap().width_fraction = 0.25;
+        let fullscreen = Some(VisualPlacement {
+            width_bps: 10_000,
+            x_bps: 5000,
+            y_bps: 5000,
+        });
+        for viewport in [Vec2::new(1920., 1080.), Vec2::new(1080., 1920.)] {
+            assert_eq!(Playback::fit_target(&clip, fullscreen, viewport), viewport);
+            assert_eq!(
+                Playback::fit_target(&clip, None, viewport),
+                Vec2::splat(viewport.x * 0.25)
+            );
+            clip.metadata.visual.as_mut().unwrap().fit = Fit::Contain;
+            let (size, position) = Playback::placement(&clip, fullscreen, viewport, viewport);
+            assert_eq!(size, viewport);
+            assert_eq!(position, Vec2::ZERO);
+            let (size, _) = Playback::placement(&clip, fullscreen, Vec2::splat(256.), viewport);
+            assert_eq!(size, Vec2::splat(viewport.min_element()));
+            clip.metadata.visual.as_mut().unwrap().fit = Fit::Cover;
+            let frame = Vec2::new(640., 480.);
+            let (size, position) = Playback::placement(&clip, fullscreen, frame, viewport);
+            assert_eq!(size, viewport);
+            assert_eq!(position, Vec2::ZERO);
+            let crop = Playback::frame_crop(&clip, fullscreen, frame, viewport).unwrap();
+            assert!((crop.width() / crop.height() - viewport.x / viewport.y).abs() < 0.0001);
         }
     }
 

@@ -42,6 +42,43 @@ impl PlacementScope {
     }
 }
 
+/// Common host-display positions applied only to the isolated placement draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlacementPreset {
+    /// Use the full host width, centered, preserving the catalog's contain/cover policy.
+    Fullscreen,
+    /// Keep the current width and align to the upper-left display edge.
+    TopLeft,
+    /// Keep the current width and align to the upper-right display edge.
+    TopRight,
+    /// Keep the current width and align to the lower-left display edge.
+    BottomLeft,
+    /// Keep the current width and align to the lower-right display edge.
+    BottomRight,
+}
+
+impl PlacementPreset {
+    /// Replace the preset's native editor values without committing playback or session overrides.
+    /// Corners preserve the width editor exactly, including an unfinished or invalid width draft.
+    pub(super) fn apply(self, modal: &mut PlacementModal) {
+        let (x_bps, y_bps) = match self {
+            Self::Fullscreen => {
+                modal.editors[0] = PlacementModal::percentage_editor(10_000);
+                (5_000, 5_000)
+            }
+            Self::TopLeft => (0, 0),
+            Self::TopRight => (10_000, 0),
+            Self::BottomLeft => (0, 10_000),
+            Self::BottomRight => (10_000, 10_000),
+        };
+        // Replacing an editor retires its old native entity during the next region refresh.
+        modal.editors[1] = PlacementModal::percentage_editor(x_bps);
+        modal.editors[2] = PlacementModal::percentage_editor(y_bps);
+        modal.reset = false;
+        modal.error = None;
+    }
+}
+
 /// Isolated editable percentages; canceling drops every draft change, including reset.
 pub(super) struct PlacementModal {
     /// Exact clip selected by the Edit control.
@@ -81,10 +118,15 @@ impl PlacementModal {
 
     /// Display basis points as exact percentages without floating point drift.
     pub(super) fn editors(value: VisualPlacement) -> [Editor; 3] {
-        [value.width_bps, value.x_bps, value.y_bps].map(|bps| {
-            let text = format!("{}.{:02}", bps / 100, bps % 100);
-            Editor { text, ..default() }
-        })
+        [value.width_bps, value.x_bps, value.y_bps].map(Self::percentage_editor)
+    }
+
+    /// Construct one exact percentage and let the native input lifecycle create its editor entity.
+    fn percentage_editor(bps: u16) -> Editor {
+        Editor {
+            text: format!("{}.{:02}", bps / 100, bps % 100),
+            ..default()
+        }
     }
 
     /// Restore catalog values in the draft only; Apply or Send commits this reset.
@@ -105,8 +147,7 @@ impl PlacementModal {
         };
         let value = (i32::from(current) + i32::from(direction) * 100)
             .clamp(if index == 0 { 1 } else { 0 }, 10_000) as u16;
-        let text = format!("{}.{:02}", value / 100, value % 100);
-        *editor = Editor { text, ..default() };
+        *editor = Self::percentage_editor(value);
         self.reset = false;
         self.error = None;
     }
