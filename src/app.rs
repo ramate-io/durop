@@ -869,7 +869,7 @@ impl Playback {
         }
     }
 
-    /// Scale explicit overrides against both display dimensions; reset retains catalog sizing.
+    /// Fullscreen cover uses the display rectangle for catalog defaults and live overrides.
     fn fit_target(clip: &Clip, placement: Option<VisualPlacement>, viewport: Vec2) -> Vec2 {
         if let Some(placement) = placement {
             return viewport * (f32::from(placement.width_bps) / 10_000.0);
@@ -879,6 +879,11 @@ impl Playback {
             .visual
             .as_ref()
             .map_or(0.3, |visual| visual.width_fraction as f32);
+        // A full-width transition must cover both axes, including on portrait and
+        // ultrawide displays. Smaller catalog cards retain their authored square box.
+        if fraction == 1.0 && Self::cover_fit(clip, None) {
+            return viewport;
+        }
         Vec2::splat((viewport.x * fraction).min(viewport.y))
     }
 
@@ -1051,6 +1056,58 @@ mod tests {
             .unwrap();
         assert_eq!(crop.min, Vec2::new(50., 0.));
         assert_eq!(crop.max, Vec2::new(150., 100.));
+    }
+
+    #[test]
+    fn fullscreen_catalog_cover_fills_every_monitor_shape_for_gif_and_video()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let catalog =
+            crate::catalog::load_local(&resource_root().join("sample-packs/podcast-pack"))?;
+        for extension in ["gif", "mov", "mp4"] {
+            let mut clip = catalog
+                .clips
+                .iter()
+                .find(|clip| {
+                    clip.asset_path
+                        .extension()
+                        .is_some_and(|value| value == extension)
+                })
+                .ok_or("missing visual fixture")?
+                .clone();
+            let visual = clip
+                .metadata
+                .visual
+                .as_mut()
+                .ok_or("missing visual metadata")?;
+            visual.width_fraction = 1.0;
+            visual.anchor = Anchor::Center;
+            visual.fit = Fit::Cover;
+            for viewport in [
+                Vec2::new(1920., 1080.),
+                Vec2::new(1080., 1920.),
+                Vec2::new(5120., 1440.),
+            ] {
+                for frame in [
+                    Vec2::new(3840., 2160.),
+                    Vec2::new(256., 256.),
+                    Vec2::new(480., 960.),
+                ] {
+                    assert_eq!(Playback::fit_target(&clip, None, viewport), viewport);
+                    let (size, position) = Playback::placement(&clip, None, frame, viewport);
+                    assert_eq!(size, viewport);
+                    assert_eq!(position, Vec2::ZERO);
+                    let crop = Playback::frame_crop(&clip, None, frame, viewport)
+                        .ok_or("cover requires a source crop")?;
+                    let scale = (viewport / frame).max_element();
+                    // Uniform scaling covers both axes; cropping only removes overflow.
+                    assert!((frame * scale).cmpge(viewport - Vec2::splat(0.001)).all());
+                    assert!(crop.min.cmpge(Vec2::splat(-0.001)).all());
+                    assert!(crop.max.cmple(frame + Vec2::splat(0.001)).all());
+                    assert!((crop.size() * scale - size).abs().max_element() < 0.001);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
