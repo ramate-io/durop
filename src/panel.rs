@@ -399,6 +399,41 @@ struct HoverColors {
     hovered: Color,
 }
 
+/// Card-level feedback follows confirmed playback and descendant pointer hover.
+#[derive(Component)]
+struct CardFeedback {
+    /// True while at least one occurrence is actually playing at the selected destination.
+    playing: bool,
+}
+
+impl CardFeedback {
+    /// Choose a warm surface independently of pointer position so playback stays visible.
+    fn background(&self) -> Color {
+        if self.playing {
+            theme::PLAYING_PAPER
+        } else {
+            theme::PAPER
+        }
+    }
+
+    /// Shadows change paint only; no size or position changes can disturb scrolling or text.
+    fn shadow(&self, hovered: bool) -> BoxShadow {
+        if self.playing {
+            BoxShadow::new(
+                theme::PLAYING_GLOW,
+                px(0),
+                px(0),
+                px(1),
+                px(if hovered { 12 } else { 8 }),
+            )
+        } else if hovered {
+            BoxShadow::new(theme::HOVER_SHADOW, px(0), px(3), px(0), px(10))
+        } else {
+            BoxShadow::default()
+        }
+    }
+}
+
 impl Model {
     /// Whether either isolated form owns input and scrolling.
     fn has_modal(&self) -> bool {
@@ -786,6 +821,16 @@ fn hover(mut widgets: Query<(&Hovered, Has<Pressed>, &HoverColors, &mut Backgrou
     }
 }
 
+/// Paint whole-card hover feedback, including previews, selectable titles and controls.
+fn card_feedback(model: Res<Model>, mut cards: Query<(&Hovered, &CardFeedback, &mut BoxShadow)>) {
+    for (hovered, feedback, mut shadow) in &mut cards {
+        let desired = feedback.shadow(hovered.get() && !model.has_modal());
+        if *shadow != desired {
+            *shadow = desired;
+        }
+    }
+}
+
 /// Cache decoded thumbnail handles and failed loads by clip identity.
 #[derive(Resource, Default)]
 struct Icons(BTreeMap<String, Option<Handle<Image>>>);
@@ -857,7 +902,14 @@ impl Plugin for PanelPlugin {
             )
             .add_systems(
                 Update,
-                (scroll, scrollbar, scroll_thumb, hover, terminal)
+                (
+                    scroll,
+                    scrollbar,
+                    scroll_thumb,
+                    hover,
+                    card_feedback,
+                    terminal,
+                )
                     .chain()
                     .before(crate::app::actions),
             )

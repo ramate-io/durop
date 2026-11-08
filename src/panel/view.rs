@@ -395,8 +395,10 @@ impl View<'_> {
         layout: GridLayout,
         status: &str,
         stop: Option<&str>,
+        playing: bool,
         editable: bool,
     ) {
+        let feedback = CardFeedback { playing };
         parent
             .spawn((
                 Node {
@@ -410,12 +412,11 @@ impl View<'_> {
                     overflow: Overflow::clip(),
                     ..default()
                 },
-                BackgroundColor(PAPER),
-                BorderColor::all(RULE),
-                HoverColors {
-                    resting: PAPER,
-                    hovered: Color::srgb(0.969, 0.941, 0.871),
-                },
+                BackgroundColor(feedback.background()),
+                BorderColor::all(if playing { PLAYING_RULE } else { RULE }),
+                feedback.shadow(false),
+                feedback,
+                Hovered::default(),
             ))
             .with_children(|card| {
                 card.spawn((
@@ -2033,6 +2034,11 @@ pub(super) fn render(
                             model.layout,
                             status,
                             active.map(|instance| instance.instance_id.as_str()),
+                            (!remote || network.connected)
+                                && snapshot.instances.iter().any(|instance| {
+                                    instance.clip_id == clip.identity
+                                        && instance.state == crate::commands::InstanceState::Playing
+                                }),
                             if remote {
                                 network
                                     .remote_catalog

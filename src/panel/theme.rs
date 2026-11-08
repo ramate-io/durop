@@ -26,6 +26,18 @@ pub(super) const GREEN: Color = Color::srgb(0.239, 0.400, 0.322);
 /// Warm hover accent without adding another dominant color.
 pub(super) const YELLOW: Color = Color::srgb(0.925, 0.765, 0.408);
 
+/// Soft apricot paper marks confirmed playback without competing with the preview.
+pub(super) const PLAYING_PAPER: Color = Color::srgb(0.969, 0.859, 0.725);
+
+/// Muted terracotta edge ties the playing surface to the warm paper palette.
+pub(super) const PLAYING_RULE: Color = Color::srgb(0.776, 0.557, 0.365);
+
+/// Low-opacity warm ink lifts a hovered card without changing its geometry.
+pub(super) const HOVER_SHADOW: Color = Color::srgba(0.365, 0.341, 0.290, 0.16);
+
+/// A quiet orange halo reinforces the playing background.
+pub(super) const PLAYING_GLOW: Color = Color::srgba(0.831, 0.486, 0.235, 0.18);
+
 /// Bundled open-license display and monospaced interface font handles.
 #[derive(Resource, Default)]
 pub(super) struct Fonts {
