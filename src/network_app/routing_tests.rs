@@ -333,6 +333,7 @@ fn in_flight_relay_revocation_cancels_destination_queue_and_another_source_survi
         width_bps: 4200,
         x_bps: 1234,
         y_bps: 8765,
+        fit: durop_protocol::VisualFit::Catalog,
     };
     let visual = relay
         .catalog
@@ -462,11 +463,13 @@ fn relay_preserves_visual_overrides_and_reset_at_the_destination() {
         width_bps: 4200,
         x_bps: 1234,
         y_bps: 8765,
+        fit: durop_protocol::VisualFit::Catalog,
     };
     let changed = VisualPlacement {
         width_bps: 7000,
         x_bps: 8000,
         y_bps: 2000,
+        fit: durop_protocol::VisualFit::Cover,
     };
     let address = relay.session.address;
     let revision = relay.catalog.revision.clone();

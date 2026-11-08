@@ -1,7 +1,7 @@
 //! Application modes and the real host/media bridge. No decoder work runs in UI code.
 use crate::{
     catalog::{Catalog, CatalogCache, Clip, Fit, PackSource},
-    commands::{Envelope, PROTOCOL_VERSION, PlaybackCommand, VisualPlacement},
+    commands::{Envelope, PROTOCOL_VERSION, PlaybackCommand, VisualFit, VisualPlacement},
     host::{BackendEffect, BackendEvent, BackendEventKind, BackendToken, Host},
     media::{MediaEventKind, MediaSpec, MediaWorker},
     overlay::{OVERLAY_LAYER, OverlayWindow, PlaybackOverlay},
@@ -637,72 +637,6 @@ pub(crate) fn media_bridge(
                 event: kind,
             });
         }
-        if let Some(frame) = playback.worker.latest_frame() {
-            if frame.generation != playback.token.generation {
-                continue;
-            }
-            playback.dimensions = UVec2::new(frame.width, frame.height);
-            if let Some(handle) = &playback.image {
-                if let Some(mut existing) = images.get_mut(handle) {
-                    let size = Extent3d {
-                        width: frame.width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    };
-                    if existing.texture_descriptor.size != size {
-                        existing.resize(size);
-                    }
-                    let data = existing.data.get_or_insert_with(Vec::new);
-                    data.clear();
-                    data.extend_from_slice(&frame.rgba);
-                }
-            } else {
-                let handle = images.add(Playback::frame_image(&frame));
-                crate::diagnostics::first_frame_submitted(&playback.token.instance_id);
-                let (size, position) = Playback::placement(
-                    &playback.clip,
-                    playback.placement,
-                    Vec2::new(frame.width as f32, frame.height as f32),
-                    Vec2::new(window.width(), window.height()),
-                );
-                let mut sprite = Sprite::from_image(handle.clone());
-                sprite.custom_size = Some(size);
-                sprite.rect = Playback::frame_crop(
-                    &playback.clip,
-                    playback.placement,
-                    playback.dimensions.as_vec2(),
-                    Vec2::new(window.width(), window.height()),
-                );
-                playback.sprite = Some(
-                    commands
-                        .spawn((
-                            sprite,
-                            RenderLayers::layer(OVERLAY_LAYER),
-                            Transform::from_xyz(position.x, position.y, 0.0),
-                        ))
-                        .id(),
-                );
-                playback.image = Some(handle);
-            }
-        }
-        if let Some(entity) = playback.sprite
-            && let Ok((mut sprite, mut transform)) = sprites.get_mut(entity)
-        {
-            let (size, position) = Playback::placement(
-                &playback.clip,
-                playback.placement,
-                playback.dimensions.as_vec2(),
-                Vec2::new(window.width(), window.height()),
-            );
-            sprite.custom_size = Some(size);
-            sprite.rect = Playback::frame_crop(
-                &playback.clip,
-                playback.placement,
-                playback.dimensions.as_vec2(),
-                Vec2::new(window.width(), window.height()),
-            );
-            *transform = Transform::from_xyz(position.x, position.y, 0.0);
-        }
     }
     let callbacks_seen = !callbacks.is_empty();
     for callback in callbacks {
@@ -791,6 +725,76 @@ pub(crate) fn media_bridge(
                     }
                 }
             }
+        }
+    }
+    // Apply all queued placement/reset and stop decisions before uploading or
+    // presenting a frame; even a first sprite must use this update's host intent.
+    for playback in runtime.workers.values_mut() {
+        if let Some(frame) = playback.worker.latest_frame() {
+            if frame.generation != playback.token.generation {
+                continue;
+            }
+            playback.dimensions = UVec2::new(frame.width, frame.height);
+            if let Some(handle) = &playback.image {
+                if let Some(mut existing) = images.get_mut(handle) {
+                    let size = Extent3d {
+                        width: frame.width,
+                        height: frame.height,
+                        depth_or_array_layers: 1,
+                    };
+                    if existing.texture_descriptor.size != size {
+                        existing.resize(size);
+                    }
+                    let data = existing.data.get_or_insert_with(Vec::new);
+                    data.clear();
+                    data.extend_from_slice(&frame.rgba);
+                }
+            } else {
+                let handle = images.add(Playback::frame_image(&frame));
+                crate::diagnostics::first_frame_submitted(&playback.token.instance_id);
+                let (size, position) = Playback::placement(
+                    &playback.clip,
+                    playback.placement,
+                    Vec2::new(frame.width as f32, frame.height as f32),
+                    Vec2::new(window.width(), window.height()),
+                );
+                let mut sprite = Sprite::from_image(handle.clone());
+                sprite.custom_size = Some(size);
+                sprite.rect = Playback::frame_crop(
+                    &playback.clip,
+                    playback.placement,
+                    playback.dimensions.as_vec2(),
+                    Vec2::new(window.width(), window.height()),
+                );
+                playback.sprite = Some(
+                    commands
+                        .spawn((
+                            sprite,
+                            RenderLayers::layer(OVERLAY_LAYER),
+                            Transform::from_xyz(position.x, position.y, 0.0),
+                        ))
+                        .id(),
+                );
+                playback.image = Some(handle);
+            }
+        }
+        if let Some(entity) = playback.sprite
+            && let Ok((mut sprite, mut transform)) = sprites.get_mut(entity)
+        {
+            let (size, position) = Playback::placement(
+                &playback.clip,
+                playback.placement,
+                playback.dimensions.as_vec2(),
+                Vec2::new(window.width(), window.height()),
+            );
+            sprite.custom_size = Some(size);
+            sprite.rect = Playback::frame_crop(
+                &playback.clip,
+                playback.placement,
+                playback.dimensions.as_vec2(),
+                Vec2::new(window.width(), window.height()),
+            );
+            *transform = Transform::from_xyz(position.x, position.y, 0.0);
         }
     }
     let events = runtime.host.drain_events();
@@ -887,24 +891,30 @@ impl Playback {
     ) -> (Vec2, Vec2) {
         let target = Self::fit_target(clip, placement, viewport);
         let placement = placement.or_else(|| Host::default_placement(clip));
-        let fit = clip.metadata.visual.as_ref().map(|v| &v.fit);
+        let cover = Self::cover_fit(clip, placement);
         let ratios = target / frame;
-        let scale = if matches!(fit, Some(Fit::Cover)) {
+        let scale = if cover {
             ratios.max_element()
         } else {
             ratios.min_element()
         };
-        let size = if matches!(fit, Some(Fit::Cover)) {
-            target
-        } else {
-            frame * scale
-        };
+        let size = if cover { target } else { frame * scale };
         let travel = viewport - size;
         let normalized = placement.map_or(Vec2::splat(0.5), |p| {
             Vec2::new(f32::from(p.x_bps), f32::from(p.y_bps)) / 10_000.0
         });
         let position = travel * (normalized - Vec2::splat(0.5)) * Vec2::new(1.0, -1.0);
         (size, position)
+    }
+
+    /// Explicit cover fills the selected box; catalog fit preserves authored behavior.
+    fn cover_fit(clip: &Clip, placement: Option<VisualPlacement>) -> bool {
+        placement.is_some_and(|placement| placement.fit == VisualFit::Cover)
+            || clip
+                .metadata
+                .visual
+                .as_ref()
+                .is_some_and(|visual| matches!(visual.fit, Fit::Cover))
     }
 
     /// Compute a centered source rectangle using the same effective width as placement.
@@ -914,8 +924,7 @@ impl Playback {
         frame: Vec2,
         viewport: Vec2,
     ) -> Option<Rect> {
-        let visual = clip.metadata.visual.as_ref()?;
-        if !matches!(visual.fit, Fit::Cover) {
+        if !Self::cover_fit(clip, placement) {
             return None;
         }
         let target = Self::fit_target(clip, placement, viewport);
@@ -1074,6 +1083,7 @@ mod tests {
                                 width_bps,
                                 x_bps,
                                 y_bps,
+                                fit: VisualFit::Catalog,
                             });
                             let (size, center) =
                                 Playback::placement(&clip, placement, frame, viewport);
@@ -1120,6 +1130,7 @@ mod tests {
             width_bps: 10_000,
             x_bps: 5000,
             y_bps: 5000,
+            fit: VisualFit::Cover,
         });
         for viewport in [Vec2::new(1920., 1080.), Vec2::new(1080., 1920.)] {
             assert_eq!(Playback::fit_target(&clip, fullscreen, viewport), viewport);
@@ -1132,6 +1143,12 @@ mod tests {
             assert_eq!(size, viewport);
             assert_eq!(position, Vec2::ZERO);
             let (size, _) = Playback::placement(&clip, fullscreen, Vec2::splat(256.), viewport);
+            assert_eq!(size, viewport);
+            let catalog_fit = fullscreen.map(|placement| VisualPlacement {
+                fit: VisualFit::Catalog,
+                ..placement
+            });
+            let (size, _) = Playback::placement(&clip, catalog_fit, Vec2::splat(256.), viewport);
             assert_eq!(size, Vec2::splat(viewport.min_element()));
             clip.metadata.visual.as_mut().unwrap().fit = Fit::Cover;
             let frame = Vec2::new(640., 480.);
@@ -1141,6 +1158,258 @@ mod tests {
             let crop = Playback::frame_crop(&clip, fullscreen, frame, viewport).unwrap();
             assert!((crop.width() / crop.height() - viewport.x / viewport.y).abs() < 0.0001);
         }
+    }
+
+    // Submit real host policy while keeping the headless bridge fixture free of UI/window plugins.
+    fn bridge_command(runtime: &mut Runtime, id: &str, command: PlaybackCommand) -> String {
+        let outcome = runtime.host.accept(Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: runtime.host.session_id().into(),
+            command_id: id.into(),
+            catalog_revision: runtime.catalog.revision.clone(),
+            command,
+        });
+        match outcome {
+            crate::commands::CommandOutcome::Accepted {
+                instance_id: Some(id),
+            } => id,
+            other => panic!("bridge fixture command rejected: {other:?}"),
+        }
+    }
+
+    // Stage a real decoded GIF frame before the first bridge tick, with an old
+    // fullscreen override. This makes a queued reset race deterministic.
+    fn bridge_with_pending_frame() -> (App, String, VisualPlacement) {
+        let mut catalog =
+            crate::catalog::load_local(&resource_root().join("sample-packs/podcast-pack")).unwrap();
+        catalog.clips.retain(|clip| {
+            clip.asset_path
+                .extension()
+                .is_some_and(|extension| extension == "gif")
+        });
+        let visual = catalog.clips[0].metadata.visual.as_mut().unwrap();
+        visual.width_fraction = 0.25;
+        visual.fit = Fit::Contain;
+        visual.anchor = Anchor::BottomRight;
+        catalog.clips[0].metadata.playback.looping = true;
+        catalog.clips[0].metadata.playback.max_duration_ms = 60_000;
+        let catalog = Arc::new(catalog);
+        let mut runtime = Runtime::new(&Config {
+            mode: Mode::Controller,
+            pack: PathBuf::new(),
+            display: None,
+            connect: None,
+            listen: None,
+            diagnostics: None,
+        })
+        .unwrap();
+        runtime.catalog = catalog.clone();
+        runtime.host = Host::new("bridge-regression".into(), catalog.clone());
+        runtime.snapshot = runtime.host.snapshot();
+        let fullscreen = VisualPlacement {
+            width_bps: 10_000,
+            x_bps: 5000,
+            y_bps: 5000,
+            fit: VisualFit::Cover,
+        };
+        let instance_id = bridge_command(
+            &mut runtime,
+            "play",
+            PlaybackCommand::PlayVisual {
+                clip_id: catalog.clips[0].identity.clone(),
+                placement: fullscreen,
+            },
+        );
+        let BackendEffect::Prepare {
+            token,
+            clip,
+            placement,
+        } = runtime.host.drain_effects().pop().unwrap()
+        else {
+            panic!("expected one prepare effect");
+        };
+        let worker = MediaWorker::spawn();
+        worker
+            .prepare(MediaSpec {
+                path: clip.asset_path.clone(),
+                generation: token.generation,
+                max_duration: Duration::from_secs(60),
+                looping: true,
+                volume: 1.0,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let events = worker.drain_events();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event.kind, MediaEventKind::Failed { .. })),
+                "GIF preparation failed"
+            );
+            if events
+                .iter()
+                .any(|event| matches!(event.kind, MediaEventKind::Prepared { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GIF preparation timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        runtime.host.backend_event(BackendEvent {
+            token: token.clone(),
+            event: BackendEventKind::Prepared,
+        });
+        assert!(
+            matches!(runtime.host.drain_effects().as_slice(), [BackendEffect::Start { token: actual }] if actual == &token)
+        );
+        worker.start(token.generation).unwrap();
+        // Seeing a second clock update proves the first tick finished publishing
+        // its frame; leave that latest frame unread for the real bridge system.
+        let mut first_position = None;
+        loop {
+            let position = worker.position();
+            if first_position.is_some_and(|first| first != position) {
+                break;
+            }
+            if position > Duration::ZERO {
+                first_position = Some(position);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GIF first frame timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        runtime.workers.insert(
+            instance_id.clone(),
+            Playback {
+                token,
+                worker,
+                clip: *clip,
+                placement,
+                image: None,
+                sprite: None,
+                failure: None,
+                dimensions: UVec2::ZERO,
+            },
+        );
+        let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+        let mut app = App::new();
+        app.insert_resource(runtime)
+            .insert_resource(network)
+            .init_resource::<Assets<Image>>()
+            .init_resource::<PlaybackOverlay>()
+            .add_message::<AppExit>()
+            .add_systems(Update, media_bridge);
+        app.world_mut().spawn((
+            Window {
+                resolution: bevy::window::WindowResolution::new(800, 600),
+                ..default()
+            },
+            OverlayWindow,
+        ));
+        (app, instance_id, fullscreen)
+    }
+
+    #[test]
+    fn queued_reset_controls_the_first_visible_frame_and_live_geometry() {
+        let (mut app, instance_id, fullscreen) = bridge_with_pending_frame();
+        bridge_command(
+            &mut app.world_mut().resource_mut::<Runtime>(),
+            "reset-before-first-frame",
+            PlaybackCommand::SetVisual {
+                instance_id: instance_id.clone(),
+                placement: None,
+            },
+        );
+        app.update();
+        let playback = &app.world().resource::<Runtime>().workers[&instance_id];
+        let entity = playback
+            .sprite
+            .expect("first decoded frame must be presented");
+        let texture = playback.image.as_ref().unwrap().clone();
+        let generation = playback.token.generation;
+        let sprite = app.world().get::<Sprite>(entity).unwrap();
+        assert_eq!(sprite.custom_size, Some(Vec2::splat(200.)));
+        assert_eq!(sprite.rect, None);
+        assert_eq!(
+            app.world().get::<Transform>(entity).unwrap().translation,
+            Vec3::new(300., -200., 0.)
+        );
+        assert_eq!(playback.placement, None);
+
+        bridge_command(
+            &mut app.world_mut().resource_mut::<Runtime>(),
+            "fullscreen-live",
+            PlaybackCommand::SetVisual {
+                instance_id: instance_id.clone(),
+                placement: Some(fullscreen),
+            },
+        );
+        app.update();
+        let sprite = app.world().get::<Sprite>(entity).unwrap();
+        assert_eq!(sprite.custom_size, Some(Vec2::new(800., 600.)));
+        assert!(sprite.rect.is_some());
+        assert_eq!(
+            app.world().get::<Transform>(entity).unwrap().translation,
+            Vec3::ZERO
+        );
+        bridge_command(
+            &mut app.world_mut().resource_mut::<Runtime>(),
+            "reset-live",
+            PlaybackCommand::SetVisual {
+                instance_id: instance_id.clone(),
+                placement: None,
+            },
+        );
+        app.update();
+        let playback = &app.world().resource::<Runtime>().workers[&instance_id];
+        assert_eq!(playback.image.as_ref(), Some(&texture));
+        assert_eq!(playback.token.generation, generation);
+        let sprite = app.world().get::<Sprite>(entity).unwrap();
+        assert_eq!(sprite.custom_size, Some(Vec2::splat(200.)));
+        assert_eq!(sprite.rect, None);
+        assert_eq!(
+            app.world().get::<Transform>(entity).unwrap().translation,
+            Vec3::new(300., -200., 0.)
+        );
+
+        bridge_command(
+            &mut app.world_mut().resource_mut::<Runtime>(),
+            "stop",
+            PlaybackCommand::Stop { instance_id },
+        );
+        app.update();
+        assert!(app.world().get::<Sprite>(entity).is_none());
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(texture.id())
+                .is_none()
+        );
+        assert!(!app.world().resource::<PlaybackOverlay>().visible);
+    }
+
+    #[test]
+    fn queued_stop_discards_an_unpresented_frame_before_creating_resources() {
+        let (mut app, instance_id, _) = bridge_with_pending_frame();
+        bridge_command(
+            &mut app.world_mut().resource_mut::<Runtime>(),
+            "stop-before-first-frame",
+            PlaybackCommand::Stop {
+                instance_id: instance_id.clone(),
+            },
+        );
+        app.update();
+        let playback = &app.world().resource::<Runtime>().workers[&instance_id];
+        assert!(playback.sprite.is_none());
+        assert!(playback.image.is_none());
+        assert!(app.world().resource::<Assets<Image>>().is_empty());
+        assert!(!app.world().resource::<PlaybackOverlay>().visible);
     }
 
     #[test]
@@ -1172,6 +1441,7 @@ mod tests {
             width_bps: 4000,
             x_bps: 0,
             y_bps: 10_000,
+            fit: VisualFit::Catalog,
         };
         let mut stale = token.clone();
         stale.generation -= 1;

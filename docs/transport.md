@@ -196,7 +196,9 @@ Protocol version 2 adds `play_visual` and `set_visual`; see the
 [host contract](host.md) and [editor guide](panel.md#experimental-visual-placement).
 Catalog projections include validated default placement for GIF/video entries.
 Active snapshots and `visual_changed` events carry each occurrence's current
-explicit override. Updates use the normal bounded authenticated command channel
+explicit override, including its `fit` rule (`catalog` or `cover`). Omitted fit
+uses catalog policy. Fullscreen sends cover explicitly so the host fills its display
+even for a contain-fit clip. Updates use the normal bounded authenticated command channel
 and retain session/revision checks and StopAll priority. Both peers must run the
 version 2 build; version 1 peers fail negotiation rather than silently dropping
 placement settings.

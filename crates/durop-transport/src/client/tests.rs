@@ -180,6 +180,7 @@ async fn visual_commands_and_events_roundtrip_without_losing_reset() {
         width_bps: 3200,
         x_bps: 1000,
         y_bps: 9000,
+        fit: durop_protocol::VisualFit::Cover,
     };
     let commands = [
         PlaybackCommand::PlayVisual {
@@ -284,6 +285,7 @@ fn invalid_visual_snapshot_bounds_are_rejected_before_state_replacement() {
             width_bps: 1,
             x_bps: 10_001,
             y_bps: 0,
+            fit: durop_protocol::VisualFit::Catalog,
         }),
     });
     assert!(!Packet::Snapshot { snapshot }.has_valid_placement());

@@ -93,8 +93,9 @@ Audio cards have no placement controls.
 
 - **Scale** is the fitting area's width as a percentage of the host display
   width, greater than 0% and at most 100%. Explicit adjustments scale both
-  display dimensions together; the catalog's contain/cover rule controls aspect
-  ratio and crop. Reset restores the original catalog fitting area.
+  display dimensions together. Ordinary adjustments retain the catalog's fitting
+  rule; Fullscreen selects cover fitting. Reset restores the original catalog
+  fitting area and rule.
 - **Horizontal** runs from 0% at the left edge to 100% at the right edge.
 - **Vertical** runs from 0% at the top edge to 100% at the bottom edge.
 
@@ -103,16 +104,19 @@ media, keeping it on-screen: 50% centers it and 100% aligns its far edge. Values
 refer to the host's selected display, not the controller window, and accept two
 decimal places.
 
-**Fullscreen** sets scale to 100% and centers the media in the entire display.
-Contain preserves the whole image with empty space where needed; cover fills the
-display with cropping. **Top left**, **Top right**, **Bottom left** and **Bottom right**
-align the media to that corner while retaining the current scale. These shortcuts
+**Fullscreen** sets scale to 100%, centers the media and selects cover fitting,
+so the entire display is filled even when the catalog uses contain. The image
+keeps its aspect ratio; excess edges are cropped symmetrically. **Top left**,
+**Top right**, **Bottom left** and **Bottom right** align the media to that corner
+while retaining the current scale and fitting rule. These shortcuts
 only edit the draft until you choose Apply or Send.
 
 **Apply** remembers the adjustment for this controller session and updates active
 occurrences of this clip without restarting their decoder or soundtrack. **Send**
 applies the adjustment and requests playback. **Reset to defaults** restores the
-catalog's scale and anchor in the draft; Apply or Send commits that reset.
+catalog's scale, anchor and fitting rule in the draft; Apply or Send commits that
+reset. The renderer consumes placement changes before presenting frames, including
+the first frame of a preparing occurrence.
 **Cancel** discards the draft. New host sessions, destinations or catalog revisions
 clear remembered overrides; this experiment does not rewrite pack metadata or
 persist placement preferences to disk.

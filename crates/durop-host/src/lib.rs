@@ -173,6 +173,7 @@ impl Host {
                 width_bps: 3000,
                 x_bps: 5000,
                 y_bps: 5000,
+                fit: durop_protocol::VisualFit::Catalog,
             });
         };
         let (x_bps, y_bps) = match visual.anchor {
@@ -188,6 +189,7 @@ impl Host {
                 .clamp(1.0, 10_000.0) as u16,
             x_bps,
             y_bps,
+            fit: durop_protocol::VisualFit::Catalog,
         })
     }
 
@@ -1236,12 +1238,13 @@ mod tests {
         host
     }
 
-    /// Reusable asymmetric placement detects accidental centering or axis swaps.
+    /// Asymmetric explicit Cover detects loss of fitting intent as well as coordinate swaps.
     fn placement() -> VisualPlacement {
         VisualPlacement {
             width_bps: 4200,
             x_bps: 1250,
             y_bps: 8750,
+            fit: durop_protocol::VisualFit::Cover,
         }
     }
 
@@ -1277,7 +1280,8 @@ mod tests {
             Some(VisualPlacement {
                 width_bps: 3000,
                 x_bps: 5000,
-                y_bps: 5000
+                y_bps: 5000,
+                fit: durop_protocol::VisualFit::Catalog,
             })
         );
         for (anchor, x_bps, y_bps) in [
@@ -1297,7 +1301,8 @@ mod tests {
                 Some(VisualPlacement {
                     width_bps: 4567,
                     x_bps,
-                    y_bps
+                    y_bps,
+                    fit: durop_protocol::VisualFit::Catalog,
                 })
             );
         }

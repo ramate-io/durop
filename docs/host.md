@@ -2,13 +2,15 @@
 
 `durop-protocol` owns the version 2 local/remote wire contract. `durop-host` owns policy decisions and a catalog snapshot pinned with `Arc<Catalog>` for the session. Create a fresh session ID for every new host; ending a recording must stop all workers before retiring that host. A new catalog revision takes effect in a new session, never underneath active playback.
 
-An envelope contains `protocolVersion`, `sessionId`, `commandId`, `catalogRevision`, and `command`. Commands use a `type` tag: `play` with `clip_id`, `stop` with `instance_id`, or `stop_all`. Clip IDs are stable catalog identities such as `pack/clip`. Callers cannot override asset paths, playback limits, looping, or fitting policy. Unknown envelope/command fields fail deserialization.
+An envelope contains `protocolVersion`, `sessionId`, `commandId`, `catalogRevision`, and `command`. Commands use a `type` tag: `play` with `clip_id`, `stop` with `instance_id`, or `stop_all`. Clip IDs are stable catalog identities such as `pack/clip`. Callers cannot override asset paths, playback limits or looping. Unknown envelope/command fields fail deserialization.
 
 The experimental `play_visual` command includes `clip_id` and `placement`;
 `set_visual` includes `instance_id` and optional `placement` (null restores catalog
 defaults). Placement uses integer basis points: `widthBps` is 1–10000 and
-`xBps`/`yBps` are 0–10000, where 10000 means 100%. Width controls the existing
-fitting box relative to the host display; position interpolates between the
+`xBps`/`yBps` are 0–10000, where 10000 means 100%. `fit` is `catalog` (also the
+default when omitted) or `cover`; cover fills the fitting area with centered
+cropping while preserving aspect ratio. Explicit width scales a display-proportioned
+fitting box; position interpolates between the
 corresponding display edges while keeping the rendered media within them. These
 commands apply only to GIF/video clips. Active snapshots retain the explicit
 override, and `visual_changed` events carry live updates for remote recovery.
@@ -36,7 +38,9 @@ Drain `BackendEffect`s after command processing and callbacks. A `Prepare` carri
 application changes its rendering geometry without seeking, restarting or
 replacing the decoder. The host accepts it only for preparing/playing visual
 occurrences and coalesces pending placement effects. Stop and terminal cleanup
-remove those pending effects.
+remove those pending effects. The renderer processes callbacks and policy effects
+before updating or creating sprites, so a reset queued before a frame is presented
+cannot briefly display the previous geometry.
 
 `Prepared` proves only asset/backend readiness. It requests a separate `Start` effect when policy allows. A `Start` performs actual backend start; its later `Started` acknowledgement marks playing. `Stop` must cancel preparation, audio, decoder, texture/frame publishing and all occurrence effects together, then report `Stopped`. It must also acknowledge an unknown/not-yet-prepared token, because cancellation can supersede an unsent Prepare. `Finished` and `Failed` callbacks must mean the worker has released occurrence resources. Stop racing completion/failure produces one Stopped terminal result. Late callbacks with a stale generation or stopped/terminal ID are ignored.
 

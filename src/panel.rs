@@ -11,7 +11,7 @@ mod tests;
 mod theme;
 mod view;
 
-use crate::commands::VisualPlacement;
+use crate::commands::{VisualFit, VisualPlacement};
 use crate::{
     app::{Action, Actions, Destination, Mode, Runtime},
     catalog::Clip,

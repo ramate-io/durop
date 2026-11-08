@@ -1045,6 +1045,10 @@ impl View<'_> {
                         row_gap: px(14), flex_shrink: 0., ..default()
                     }).with_children(|fields| {
                         self.label(fields, "Percentages use the host display. Position keeps media on screen.", 11., MUTED);
+                        self.label(fields, match modal.fit {
+                            VisualFit::Catalog => "Fitting follows the catalog. Fullscreen fills the display with cropping.",
+                            VisualFit::Cover => "Cover fitting: fills the placement area with centered cropping. Reset restores catalog fitting.",
+                        }, 10., MUTED);
                         fields.spawn(Node {
                             width: percent(100), column_gap: px(8), row_gap: px(8),
                             flex_wrap: FlexWrap::Wrap, ..default()
@@ -1541,7 +1545,7 @@ impl RenderRegions {
         if let Some(modal) = &model.placement_modal {
             // Native editor identities change only when reset/step replaces a draft field.
             return format!(
-                "placement|{:?}|{:?}|{:?}|{:?}|{}",
+                "placement|{:?}|{:?}|{:?}|{:?}|{}|{:?}",
                 modal.clip_id,
                 modal.title,
                 modal
@@ -1550,7 +1554,8 @@ impl RenderRegions {
                     .map(|editor| editor.entity)
                     .collect::<Vec<_>>(),
                 modal.error,
-                modal.reset && modal.placement().ok() == Some(modal.defaults)
+                modal.reset && modal.placement().ok() == Some(modal.defaults),
+                modal.fit
             );
         }
         let Some(modal) = &model.modal else {

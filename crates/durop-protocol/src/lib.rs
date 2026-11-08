@@ -22,6 +22,19 @@ pub struct Envelope {
     pub command: PlaybackCommand,
 }
 
+/// Fitting policy for an occurrence-only visual placement override.
+/// Catalog delegates to immutable clip metadata; Cover explicitly fills the fitting area
+/// with centered cropping and never stretches the source image.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualFit {
+    /// Retain the catalog's contain/cover policy, including the default contain behavior.
+    #[default]
+    Catalog,
+    /// Fill the placement area with aspect-preserving centered cropping.
+    Cover,
+}
+
 /// Display-relative visual fit box and position, expressed in basis points.
 /// Width is a fraction of the host display width. Positions are fractions of the
 /// available horizontal/vertical travel, keeping the fitted visual on screen.
@@ -34,6 +47,9 @@ pub struct VisualPlacement {
     pub x_bps: u16,
     /// Vertical travel: 0 is the top edge and 10,000 is the bottom edge.
     pub y_bps: u16,
+    /// Explicit fitting intent; omitted fields from earlier version-2 payloads use catalog policy.
+    #[serde(default)]
+    pub fit: VisualFit,
 }
 
 impl VisualPlacement {
@@ -340,6 +356,7 @@ mod tests {
             width_bps: 4200,
             x_bps: 0,
             y_bps: 10_000,
+            fit: VisualFit::Cover,
         };
         for command in [
             PlaybackCommand::PlayVisual {
@@ -381,13 +398,34 @@ mod tests {
     }
 
     #[test]
+    fn visual_fit_defaults_for_earlier_payloads_and_accepts_only_explicit_known_policies() {
+        let legacy = serde_json::json!({"widthBps":10000,"xBps":5000,"yBps":5000});
+        let placement: VisualPlacement = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(placement.fit, VisualFit::Catalog);
+        let command =
+            serde_json::json!({"type":"play_visual","clip_id":"pack/clip","placement":legacy});
+        assert!(
+            matches!(serde_json::from_value::<PlaybackCommand>(command).unwrap(),
+            PlaybackCommand::PlayVisual { placement, .. } if placement.fit == VisualFit::Catalog)
+        );
+        let mut cover = serde_json::to_value(placement).unwrap();
+        cover["fit"] = serde_json::json!("cover");
+        let decoded: VisualPlacement = serde_json::from_value(cover.clone()).unwrap();
+        assert_eq!(decoded.fit, VisualFit::Cover);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), cover);
+        cover["fit"] = serde_json::json!("stretch");
+        assert!(serde_json::from_value::<VisualPlacement>(cover).is_err());
+    }
+
+    #[test]
     fn visual_bounds_and_unknown_fields_are_explicit() {
         for width_bps in [1, 10_000] {
             assert!(
                 VisualPlacement {
                     width_bps,
                     x_bps: 0,
-                    y_bps: 10_000
+                    y_bps: 10_000,
+                    fit: VisualFit::Catalog,
                 }
                 .is_valid()
             );
@@ -397,26 +435,30 @@ mod tests {
                 width_bps: 0,
                 x_bps: 0,
                 y_bps: 0,
+                fit: VisualFit::Catalog,
             },
             VisualPlacement {
                 width_bps: 10_001,
                 x_bps: 0,
                 y_bps: 0,
+                fit: VisualFit::Catalog,
             },
             VisualPlacement {
                 width_bps: 1,
                 x_bps: 10_001,
                 y_bps: 0,
+                fit: VisualFit::Catalog,
             },
             VisualPlacement {
                 width_bps: 1,
                 x_bps: 0,
                 y_bps: u16::MAX,
+                fit: VisualFit::Catalog,
             },
         ] {
             assert!(!placement.is_valid());
         }
-        let command = serde_json::json!({"type":"play_visual", "clip_id":"pack/clip", "placement":{"widthBps":3000,"xBps":5000,"yBps":5000,"fit":"cover"}});
+        let command = serde_json::json!({"type":"play_visual", "clip_id":"pack/clip", "placement":{"widthBps":3000,"xBps":5000,"yBps":5000,"crop":"cover"}});
         assert!(serde_json::from_value::<PlaybackCommand>(command).is_err());
         assert!(
             serde_json::from_value::<VisualPlacement>(

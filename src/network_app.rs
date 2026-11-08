@@ -1340,6 +1340,7 @@ mod tests {
             width_bps: 4200,
             x_bps: 1234,
             y_bps: 8765,
+            fit: durop_protocol::VisualFit::Cover,
         };
         let expected_defaults: BTreeMap<_, _> = catalog
             .clips
@@ -1645,6 +1646,7 @@ mod tests {
             width_bps: 3000,
             x_bps: 5000,
             y_bps: 5000,
+            fit: durop_protocol::VisualFit::Catalog,
         });
         assert!(visual.validate());
         let serialized = serde_json::to_value(&visual).unwrap();
@@ -1681,6 +1683,7 @@ mod tests {
             width_bps: 4200,
             x_bps: 1234,
             y_bps: 8765,
+            fit: durop_protocol::VisualFit::Cover,
         };
         let envelope = |id: &str, command| Envelope {
             protocol_version: crate::commands::PROTOCOL_VERSION,

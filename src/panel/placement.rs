@@ -1,7 +1,7 @@
 //! Session-only visual placement drafts and bounded controller overrides.
 
 use super::*;
-use crate::commands::{HostSnapshot, InstanceState, VisualPlacement};
+use crate::commands::{HostSnapshot, InstanceState, VisualFit, VisualPlacement};
 
 /// A destination/session/catalog boundary; overrides never cross this identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,7 +45,7 @@ impl PlacementScope {
 /// Common host-display positions applied only to the isolated placement draft.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlacementPreset {
-    /// Use the full host width, centered, preserving the catalog's contain/cover policy.
+    /// Fill the full host display with centered, aspect-preserving cropping.
     Fullscreen,
     /// Keep the current width and align to the upper-left display edge.
     TopLeft,
@@ -63,6 +63,7 @@ impl PlacementPreset {
     pub(super) fn apply(self, modal: &mut PlacementModal) {
         let (x_bps, y_bps) = match self {
             Self::Fullscreen => {
+                modal.fit = VisualFit::Cover;
                 modal.editors[0] = PlacementModal::percentage_editor(10_000);
                 (5_000, 5_000)
             }
@@ -87,6 +88,8 @@ pub(super) struct PlacementModal {
     pub(super) title: String,
     /// Immutable host/catalog default, retained for Reset.
     pub(super) defaults: VisualPlacement,
+    /// Authoritative fitting intent retained through ordinary percentage and corner edits.
+    pub(super) fit: VisualFit,
     /// Three ordinary Unicode editors: width, horizontal and vertical percentages.
     pub(super) editors: [Editor; 3],
     /// Validation feedback for the current attempted apply.
@@ -109,6 +112,7 @@ impl PlacementModal {
             clip_id,
             title,
             defaults,
+            fit: initial.fit,
             editors: Self::editors(initial),
             error: None,
             scroll: 0.,
@@ -131,6 +135,7 @@ impl PlacementModal {
 
     /// Restore catalog values in the draft only; Apply or Send commits this reset.
     pub(super) fn reset(&mut self) {
+        self.fit = self.defaults.fit;
         self.editors = Self::editors(self.defaults);
         self.reset = true;
         self.error = None;
@@ -192,6 +197,7 @@ impl PlacementModal {
             width_bps,
             x_bps,
             y_bps,
+            fit: self.fit,
         })
     }
 }

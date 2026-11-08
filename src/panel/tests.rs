@@ -1004,6 +1004,7 @@ fn placement_presets_set_exact_bounds_and_preserve_corner_width() {
         width_bps: 2345,
         x_bps: 4567,
         y_bps: 6789,
+        fit: durop_protocol::VisualFit::Catalog,
     };
     for (preset, x_bps, y_bps) in [
         (PlacementPreset::TopLeft, 0, 0),
@@ -1020,7 +1021,8 @@ fn placement_presets_set_exact_bounds_and_preserve_corner_width() {
             VisualPlacement {
                 width_bps: 2345,
                 x_bps,
-                y_bps
+                y_bps,
+                fit: durop_protocol::VisualFit::Catalog,
             }
         );
         assert!(!modal.reset);
@@ -1038,10 +1040,90 @@ fn placement_presets_set_exact_bounds_and_preserve_corner_width() {
             VisualPlacement {
                 width_bps: 10000,
                 x_bps: 5000,
-                y_bps: 5000
+                y_bps: 5000,
+                fit: VisualFit::Cover,
             }
         );
     }
+}
+
+/// Cover is explicit draft state: percentage edits/corners preserve it, reopening retains it, Reset/Cancel do not leak it.
+#[test]
+fn placement_cover_intent_survives_edits_and_authoritative_reopen_until_reset() {
+    use crate::commands::{InstanceSnapshot, InstanceState};
+    let mut runtime = placement_runtime();
+    let clip = visual_clip(&runtime).clone();
+    let defaults = crate::host::Host::default_placement(&clip).unwrap();
+    assert_eq!(defaults.fit, VisualFit::Catalog);
+    let network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
+    let mut model = Model::default();
+    model.sync_placements(PlacementScope::current(&runtime, &network));
+    model.open_placement(&clip.identity, &runtime, &network);
+    let modal = model.placement_modal.as_mut().unwrap();
+    PlacementPreset::Fullscreen.apply(modal);
+    modal.step(0, -1);
+    PlacementPreset::BottomRight.apply(modal);
+    assert_eq!(
+        modal.placement().unwrap(),
+        VisualPlacement {
+            width_bps: 9900,
+            x_bps: 10000,
+            y_bps: 10000,
+            fit: VisualFit::Cover,
+        }
+    );
+    model.close();
+    assert!(model.placements.is_empty());
+    assert!(matches!(model.play_action(&clip.identity), Action::Play(_)));
+
+    model.open_placement(&clip.identity, &runtime, &network);
+    PlacementPreset::Fullscreen.apply(model.placement_modal.as_mut().unwrap());
+    let fullscreen = model.placement_modal.as_ref().unwrap().placement().unwrap();
+    let sent = model.apply_placement(&runtime.snapshot, true);
+    assert!(
+        matches!(sent.as_slice(), [Action::PlayVisual { placement, .. }] if placement.fit == VisualFit::Cover)
+    );
+    runtime.snapshot.instances.push(InstanceSnapshot {
+        instance_id: "cover-live".into(),
+        clip_id: clip.identity.clone(),
+        generation: 1,
+        state: InstanceState::Playing,
+        placement: Some(fullscreen),
+    });
+    model.open_placement(&clip.identity, &runtime, &network);
+    assert_eq!(
+        model.placement_modal.as_ref().unwrap().fit,
+        VisualFit::Cover
+    );
+    model.placement_modal.as_mut().unwrap().editors[0].text = "75.00".into();
+    assert_eq!(
+        model
+            .placement_modal
+            .as_ref()
+            .unwrap()
+            .placement()
+            .unwrap()
+            .fit,
+        VisualFit::Cover
+    );
+    model.placement_modal.as_mut().unwrap().reset();
+    assert_eq!(
+        model.placement_modal.as_ref().unwrap().placement().unwrap(),
+        defaults
+    );
+    assert_eq!(
+        model.placements[&clip.identity].fit,
+        VisualFit::Cover,
+        "Reset remains draft-only"
+    );
+    assert!(matches!(
+        model.apply_placement(&runtime.snapshot, false).as_slice(),
+        [Action::SetVisual {
+            placement: None,
+            ..
+        }]
+    ));
+    assert!(model.placements.is_empty());
 }
 
 /// Presets remain transactional: Cancel retains prior values, Reset clears them only after Apply.
@@ -1055,6 +1137,7 @@ fn placement_preset_cancel_reset_and_apply_preserve_transaction_contract() {
         width_bps: 2345,
         x_bps: 1234,
         y_bps: 4321,
+        fit: durop_protocol::VisualFit::Catalog,
     };
     runtime.snapshot.instances.push(InstanceSnapshot {
         instance_id: "live".into(),
@@ -1101,6 +1184,7 @@ fn placement_preset_cancel_reset_and_apply_preserve_transaction_contract() {
         width_bps: defaults.width_bps,
         x_bps: 10000,
         y_bps: 10000,
+        fit: durop_protocol::VisualFit::Catalog,
     };
     assert!(
         matches!(model.apply_placement(&runtime.snapshot, true).as_slice(),
@@ -1174,7 +1258,8 @@ fn placement_presets_sync_native_editors_without_playing_or_breaking_tab() {
         VisualPlacement {
             width_bps: 3333,
             x_bps: 0,
-            y_bps: 10000
+            y_bps: 10000,
+            fit: durop_protocol::VisualFit::Catalog,
         }
     );
     app.update();
@@ -1225,6 +1310,15 @@ fn placement_presets_sync_native_editors_without_playing_or_breaking_tab() {
         .iter()
         .map(|editor| editor.entity.unwrap())
         .collect::<Vec<_>>();
+    assert_eq!(
+        app.world()
+            .resource::<Model>()
+            .placement_modal
+            .as_ref()
+            .unwrap()
+            .fit,
+        VisualFit::Cover
+    );
     for (entity, value) in fullscreen.iter().zip(["100.00", "50.00", "50.00"]) {
         assert_eq!(
             app.world().get::<EditableText>(*entity).unwrap().value(),
@@ -1478,6 +1572,7 @@ fn placement_remote_defaults_and_reset_come_from_the_host_projection() {
         width_bps: 4321,
         x_bps: 2345,
         y_bps: 6789,
+        fit: durop_protocol::VisualFit::Catalog,
     };
     let mut network = crate::network_app::NetworkState::for_ui_test(runtime.snapshot.clone());
     network.connected = true;
@@ -1520,6 +1615,7 @@ fn placement_fields_route_keyboard_input_and_nudges_preserve_bounds() {
         width_bps: 1,
         x_bps: 0,
         y_bps: 10000,
+        fit: durop_protocol::VisualFit::Catalog,
     };
     {
         let mut model = app.world_mut().resource_mut::<Model>();
