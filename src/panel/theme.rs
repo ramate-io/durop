@@ -26,8 +26,14 @@ pub(super) const GREEN: Color = Color::srgb(0.239, 0.400, 0.322);
 /// Warm hover accent without adding another dominant color.
 pub(super) const YELLOW: Color = Color::srgb(0.925, 0.765, 0.408);
 
-/// Soft apricot paper marks confirmed playback without competing with the preview.
+/// Soft apricot paper marks queued and active playback without competing with the preview.
 pub(super) const PLAYING_PAPER: Color = Color::srgb(0.969, 0.859, 0.725);
+
+/// Warm paper darkens visibly on hover without changing layout.
+pub(super) const HOVER_PAPER: Color = Color::srgb(0.910, 0.882, 0.824);
+
+/// Hover keeps an active tile orange while deepening its surface.
+pub(super) const PLAYING_HOVER: Color = Color::srgb(0.941, 0.788, 0.608);
 
 /// Muted terracotta edge ties the playing surface to the warm paper palette.
 pub(super) const PLAYING_RULE: Color = Color::srgb(0.776, 0.557, 0.365);

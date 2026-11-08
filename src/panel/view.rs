@@ -146,6 +146,7 @@ impl View<'_> {
                 .commands()
                 .spawn((
                     TextInput,
+                    EntityCursor::System(SystemCursorIcon::Text),
                     EditableText {
                         visible_lines: None,
                         allow_newlines: true,
@@ -240,6 +241,7 @@ impl View<'_> {
             .spawn((
                 Button,
                 ActivateOnPress,
+                EntityCursor::System(SystemCursorIcon::Pointer),
                 Hovered::default(),
                 action,
                 Node {
@@ -283,6 +285,7 @@ impl View<'_> {
                     .spawn((
                         Button,
                         ActivateOnPress,
+                        EntityCursor::System(SystemCursorIcon::Pointer),
                         Hovered::default(),
                         UiAction::Dropdown(menu),
                         Node {
@@ -412,7 +415,7 @@ impl View<'_> {
                     overflow: Overflow::clip(),
                     ..default()
                 },
-                BackgroundColor(feedback.background()),
+                BackgroundColor(feedback.background(false)),
                 BorderColor::all(if playing { PLAYING_RULE } else { RULE }),
                 feedback.shadow(false),
                 feedback,
@@ -422,6 +425,7 @@ impl View<'_> {
                 card.spawn((
                     Button,
                     ActivateOnPress,
+                    EntityCursor::System(SystemCursorIcon::Pointer),
                     Hovered::default(),
                     UiAction::Play(clip.identity.clone()),
                     Node {
@@ -485,6 +489,7 @@ impl View<'_> {
                         row.spawn((
                             Button,
                             ActivateOnPress,
+                            EntityCursor::System(SystemCursorIcon::Pointer),
                             Hovered::default(),
                             UiAction::Runtime(Action::Stop(instance.to_owned())),
                             Node {
@@ -525,6 +530,7 @@ impl View<'_> {
             .spawn((
                 Button,
                 ActivateOnPress,
+                EntityCursor::System(SystemCursorIcon::Pointer),
                 Hovered::default(),
                 action,
                 Node {
@@ -596,6 +602,7 @@ impl View<'_> {
                         row.spawn((
                             Button,
                             ActivateOnPress,
+                            EntityCursor::System(SystemCursorIcon::Pointer),
                             Hovered::default(),
                             action,
                             node,
@@ -1023,7 +1030,8 @@ impl View<'_> {
             GlobalZIndex(100), Pickable::default(),
         )).with_children(|backdrop| {
             // The cancel target is a sibling, so editor and control events never cancel the form.
-            backdrop.spawn((Button, ActivateOnPress, UiAction::Cancel, Node {
+            backdrop.spawn((Button, ActivateOnPress,
+                EntityCursor::System(SystemCursorIcon::Pointer), UiAction::Cancel, Node {
                 position_type: PositionType::Absolute, width: percent(100), height: percent(100), ..default()
             }));
             backdrop.spawn((GlobalZIndex(101), TabGroup::modal(), Node {
@@ -1155,6 +1163,7 @@ impl View<'_> {
             backdrop.spawn((
                 Button,
                 ActivateOnPress,
+                EntityCursor::System(SystemCursorIcon::Pointer),
                 UiAction::Cancel,
                 Node { position_type: PositionType::Absolute, width: percent(100), height: percent(100), ..default() },
             ));
@@ -1746,7 +1755,11 @@ pub(super) fn render(
         runtime.loading,
         runtime.errors.keys().collect::<Vec<_>>()
     );
-    let collection_signature = format!("{collection_signature}|{remote}|{}", network.connected);
+    let collection_signature = format!(
+        "{collection_signature}|{remote}|{}|{:?}",
+        network.connected,
+        network.queued_remote_clips().collect::<Vec<_>>()
+    );
     let footer_signature = format!(
         "{remote}|{}|{}|{}",
         runtime.status, network.status, network.connected
@@ -2035,10 +2048,17 @@ pub(super) fn render(
                             status,
                             active.map(|instance| instance.instance_id.as_str()),
                             (!remote || network.connected)
-                                && snapshot.instances.iter().any(|instance| {
+                                && (snapshot.instances.iter().any(|instance| {
                                     instance.clip_id == clip.identity
-                                        && instance.state == crate::commands::InstanceState::Playing
-                                }),
+                                        && matches!(
+                                            instance.state,
+                                            crate::commands::InstanceState::Preparing
+                                                | crate::commands::InstanceState::Playing
+                                        )
+                                }) || (remote
+                                    && network
+                                        .queued_remote_clips()
+                                        .any(|id| id == clip.identity))),
                             if remote {
                                 network
                                     .remote_catalog

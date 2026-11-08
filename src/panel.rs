@@ -27,12 +27,15 @@ use bevy::{
         FocusCause, FocusedInput, InputFocus,
         tab_navigation::{TabGroup, TabIndex, TabNavigationPlugin},
     },
-    picking::hover::Hovered,
+    picking::{
+        cursor::{CursorIconPlugin, EntityCursor},
+        hover::Hovered,
+    },
     prelude::*,
     text::{EditableText, EditableTextFilter, EditableTextSystems, TextCursorStyle},
     ui::{InteractionDisabled, Pressed},
     ui_widgets::{Activate, ActivateOnPress, Button, TextInput},
-    window::{PrimaryWindow, WindowRef},
+    window::{PrimaryWindow, SystemCursorIcon, WindowRef},
 };
 use configuration::{
     CatalogProvider, ConfigurationContext, ConfigurationDraft, ConfigurationIntent, DisplayChoice,
@@ -399,20 +402,21 @@ struct HoverColors {
     hovered: Color,
 }
 
-/// Card-level feedback follows confirmed playback and descendant pointer hover.
+/// Card-level feedback follows queued/preparing playback and descendant pointer hover.
 #[derive(Component)]
 struct CardFeedback {
-    /// True while at least one occurrence is actually playing at the selected destination.
+    /// True while playback is queued, preparing or playing at the selected destination.
     playing: bool,
 }
 
 impl CardFeedback {
     /// Choose a warm surface independently of pointer position so playback stays visible.
-    fn background(&self) -> Color {
-        if self.playing {
-            theme::PLAYING_PAPER
-        } else {
-            theme::PAPER
+    fn background(&self, hovered: bool) -> Color {
+        match (self.playing, hovered) {
+            (true, true) => theme::PLAYING_HOVER,
+            (true, false) => theme::PLAYING_PAPER,
+            (false, true) => theme::HOVER_PAPER,
+            (false, false) => theme::PAPER,
         }
     }
 
@@ -822,9 +826,22 @@ fn hover(mut widgets: Query<(&Hovered, Has<Pressed>, &HoverColors, &mut Backgrou
 }
 
 /// Paint whole-card hover feedback, including previews, selectable titles and controls.
-fn card_feedback(model: Res<Model>, mut cards: Query<(&Hovered, &CardFeedback, &mut BoxShadow)>) {
-    for (hovered, feedback, mut shadow) in &mut cards {
-        let desired = feedback.shadow(hovered.get() && !model.has_modal());
+fn card_feedback(
+    model: Res<Model>,
+    mut cards: Query<(
+        &Hovered,
+        &CardFeedback,
+        &mut BoxShadow,
+        &mut BackgroundColor,
+    )>,
+) {
+    for (hovered, feedback, mut shadow, mut background) in &mut cards {
+        let hovered = hovered.get() && !model.has_modal();
+        let color = feedback.background(hovered);
+        if background.0 != color {
+            background.0 = color;
+        }
+        let desired = feedback.shadow(hovered);
         if *shadow != desired {
             *shadow = desired;
         }
@@ -885,7 +902,7 @@ struct PanelCamera(Entity);
 pub struct PanelPlugin;
 impl Plugin for PanelPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(TabNavigationPlugin)
+        app.add_plugins((TabNavigationPlugin, CursorIconPlugin))
             .add_observer(input::activate)
             .add_observer(input::keyboard)
             .init_resource::<input::PendingActions>()

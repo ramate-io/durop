@@ -8,10 +8,11 @@ contains 31 offline GIFs, sounds and videos with attribution and redistribution 
 
 The top row contains **From**, **To**, **Catalog** and search. At compact widths, search
 moves below the selectors. Cards show real PNG previews, titles, media kinds
-and playback controls. Hovering anywhere on a card adds a subtle shadow; a soft
-orange surface and halo indicate confirmed playback at the selected destination.
-The highlight stays while any copy is playing and clears on stop, completion or
-remote disconnection. The responsive grid renders only visible rows plus a partial
+and playback controls. Hovering anywhere on a card darkens its surface and adds a subtle shadow.
+Clickable controls use a pointer cursor; selectable text retains its text cursor.
+A soft orange surface and halo appear as soon as playback is queued, persist through
+preparation and playback, and clear on rejection, stop, completion or remote
+disconnection. The responsive grid renders only visible rows plus a partial
 row. Wheel/trackpad scrolling and the draggable scrollbar reach the whole collection.
 The desktop toolbar is 68 logical pixels tall; compact windows wrap complete control
 rows. Search and collection updates preserve the surrounding controls and their text

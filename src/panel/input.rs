@@ -42,6 +42,7 @@ fn prepare_editor(
     let height = if search { 24. } else { 46. };
     let mut input = commands.spawn((
         InputField(field),
+        EntityCursor::System(SystemCursorIcon::Text),
         Node {
             width: percent(100),
             min_width: px(0),
