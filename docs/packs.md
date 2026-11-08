@@ -19,6 +19,11 @@ with a 10000 ms duration limit. Retrigger values are `restart`, `ignore-if-playi
 `visual` is optional (including for audio); when present it requires `anchor`
 (`top-left`, `top-right`, `bottom-left`, `bottom-right`, `center`),
 `widthFraction` (> 0 and <= 1 of overlay width), and `fit` (`contain`, `cover`).
+For a fullscreen transition, use `anchor: center`, `widthFraction: 1`, and
+`fit: cover`. This fills the entire display rectangle on landscape, portrait,
+and ultrawide monitors, uniformly scaling and cropping overflow as needed.
+GIF and native video use the same placement rule. Smaller catalog cards retain
+their square fitting area; `contain` preserves the complete frame inside it.
 These are immutable playback defaults. The experimental controller
 [placement editor](panel.md#experimental-visual-placement) sends per-occurrence
 overrides without modifying this metadata.
