@@ -3618,3 +3618,39 @@ fn rendered_cards_highlight_preparation_and_expose_pointer_controls() {
             && *cursor == EntityCursor::System(SystemCursorIcon::Pointer)
     ));
 }
+
+/// Loading remains visible with an existing collection and clears without replacing its viewport.
+#[test]
+fn catalog_loading_indicators_survive_existing_tiles_and_clear_on_completion() {
+    let (mut app, _) = input_app();
+    {
+        let mut runtime = app.world_mut().resource_mut::<Runtime>();
+        runtime.destination = Destination::Local;
+        runtime.catalog = std::sync::Arc::new(
+            crate::catalog::load_local(&crate::app::resource_root().join("sample-packs/reactions"))
+                .unwrap(),
+        );
+    }
+    app.update();
+    let body = app
+        .world_mut()
+        .query_filtered::<Entity, With<CatalogBody>>()
+        .single(app.world())
+        .unwrap();
+    for loading in [true, false] {
+        app.world_mut().resource_mut::<Runtime>().loading = loading;
+        app.update();
+        let mut texts = app.world_mut().query::<&Text>();
+        for label in ["Loading…", "LOADING CATALOG…"] {
+            assert_eq!(texts.iter(app.world()).any(|text| text.0 == label), loading);
+        }
+        assert!(
+            app.world_mut()
+                .query::<&CardFeedback>()
+                .iter(app.world())
+                .count()
+                > 0
+        );
+        assert!(app.world().get::<CatalogBody>(body).is_some());
+    }
+}

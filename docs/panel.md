@@ -18,6 +18,10 @@ The desktop toolbar is 68 logical pixels tall; compact windows wrap complete con
 rows. Search and collection updates preserve the surrounding controls and their text
 selection. Form separators sit outside the scrolling viewport so the last action can
 scroll fully into view.
+While a catalog is loading, the Catalog selector shows **Loading…** and a warm
+**LOADING CATALOG…** badge appears above the tiles, including when the previous
+collection is still visible. Remote loading includes fetching previews. The indicators
+clear on completion or failure; errors appear in the status footer.
 The collection uses Bevy UI’s `ScrollPosition` and vertical scroll overflow.
 Trackpad movement updates a continuous logical-pixel offset, including fractional
 deltas and OS-provided momentum; there are no row thresholds or snapping. Mouse

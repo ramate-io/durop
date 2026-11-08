@@ -1650,6 +1650,11 @@ pub(super) fn render(
     model.reconcile_sources(&network);
 
     let remote = runtime.destination == Destination::Remote;
+    let catalog_loading = if remote {
+        network.catalog_loading()
+    } else {
+        runtime.loading
+    };
     let compact = primary.width() < 840.;
     // Three minimum-width selectors need another row below a 534-pixel window.
     let toolbar_height = GridLayout::toolbar_height(primary.width());
@@ -1721,7 +1726,7 @@ pub(super) fn render(
     let brand_signature = format!("{}", primary.width() >= 620.);
     let header_signature = |model: &Model| {
         format!(
-            "{:?}|{}|{}|{}|{}|{}|{:?}",
+            "{:?}|{}|{}|{}|{}|{}|{:?}|{catalog_loading}",
             model.dropdown,
             primary.width(),
             remote,
@@ -1738,7 +1743,7 @@ pub(super) fn render(
             model.query.entity
         )
     };
-    let section_signature = format!("{remote}|{}", model.matches);
+    let section_signature = format!("{remote}|{}|{catalog_loading}", model.matches);
     let collection_signature = format!(
         "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
         model.query.text,
@@ -1756,7 +1761,7 @@ pub(super) fn render(
         runtime.errors.keys().collect::<Vec<_>>()
     );
     let collection_signature = format!(
-        "{collection_signature}|{remote}|{}|{:?}",
+        "{collection_signature}|{remote}|{}|{:?}|{catalog_loading}",
         network.connected,
         network.queued_remote_clips().collect::<Vec<_>>()
     );
@@ -1874,7 +1879,9 @@ pub(super) fn render(
                 model.dropdown == Some(Dropdown::To),
                 if compact { provider_width } else { 170. },
             );
-            let catalog_label = if remote {
+            let catalog_label = if catalog_loading {
+                "Loading…"
+            } else if remote {
                 "Remote catalog"
             } else if runtime.pack_input.starts_with("https://") {
                 "Git repository"
@@ -1933,16 +1940,31 @@ pub(super) fn render(
         &mut focus,
         section_signature.clone(),
         |view, section| {
-            view.label(
-                section,
-                if remote {
-                    "REMOTE COLLECTION"
-                } else {
-                    "YOUR COLLECTION"
-                },
-                10.,
-                PURPLE,
-            );
+            if catalog_loading {
+                section
+                    .spawn((
+                        Node {
+                            height: px(22),
+                            padding: UiRect::horizontal(px(8)),
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(px(4)),
+                            ..default()
+                        },
+                        BackgroundColor(YELLOW.with_alpha(0.30)),
+                    ))
+                    .with_children(|badge| view.label(badge, "LOADING CATALOG…", 10., INK));
+            } else {
+                view.label(
+                    section,
+                    if remote {
+                        "REMOTE COLLECTION"
+                    } else {
+                        "YOUR COLLECTION"
+                    },
+                    10.,
+                    PURPLE,
+                );
+            }
             view.label(section, format!("{} REACTIONS", model.matches), 10., MUTED);
         },
     );
@@ -1967,7 +1989,7 @@ pub(super) fn render(
                 .with_children(|empty| {
                     view.title(
                         empty,
-                        if runtime.loading {
+                        if catalog_loading {
                             "Gathering your collection…"
                         } else if remote && !network.connected {
                             "Connect your host"
@@ -1979,7 +2001,9 @@ pub(super) fn render(
                     );
                     view.label(
                         empty,
-                        if remote && !network.connected {
+                        if catalog_loading {
+                            "Fetching media and previews. This may take a moment."
+                        } else if remote && !network.connected {
                             "Choose To → Remote host to enter its IP and Durop pairing token."
                         } else {
                             "Try another search or choose a catalog above."

@@ -267,6 +267,11 @@ pub struct NetworkState {
 }
 
 impl NetworkState {
+    /// Remote metadata and previews are still being fetched for the current connection.
+    pub(crate) fn catalog_loading(&self) -> bool {
+        self.connecting.is_some() || (self.connected && !self.remote_catalog_ready)
+    }
+
     /// Clip identities admitted to the online queue but not yet reconciled with host state.
     pub(crate) fn queued_remote_clips(&self) -> impl Iterator<Item = &str> {
         self.queued_plays.values().map(String::as_str)
