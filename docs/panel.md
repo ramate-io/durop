@@ -116,7 +116,9 @@ occurrences of this clip without restarting their decoder or soundtrack. **Send*
 applies the adjustment and requests playback. **Reset to defaults** restores the
 catalog's scale, anchor and fitting rule in the draft; Apply or Send commits that
 reset. The renderer consumes placement changes before presenting frames, including
-the first frame of a preparing occurrence.
+the first frame of a preparing occurrence. Between plays, the configured
+click-through overlay stays transparent and available to clear its last frame,
+avoiding a native hide/reveal of the previous drawable. Idle updates remain reactive.
 **Cancel** discards the draft. New host sessions, destinations or catalog revisions
 clear remembered overrides; this experiment does not rewrite pack metadata or
 persist placement preferences to disk.

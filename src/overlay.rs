@@ -27,7 +27,7 @@ pub(crate) const OVERLAY_LAYER: usize = 2;
 /// Summarize playback visibility and progress needs for the window adapter.
 #[derive(Resource, Default)]
 pub(crate) struct PlaybackOverlay {
-    /// Whether any playback sprite requires a visible overlay.
+    /// Whether playback has sprite content; the transparent native surface stays active when idle.
     pub visible: bool,
     /// Whether playback or native callbacks need continued update ticks.
     pub busy: bool,
@@ -379,9 +379,11 @@ pub(crate) fn sync_overlay(
         state.visible = false;
         state.animation = None;
     }
+    let mut display_ready = false;
     if let Some((_, monitor, _)) = selected {
         let bounds = display_bounds(monitor.physical_size(), monitor.scale_factor);
         if let Some((size, scale)) = bounds {
+            display_ready = true;
             let position = WindowPosition::At(monitor.physical_position);
             if window.0.position != position {
                 window.0.position = position;
@@ -409,13 +411,17 @@ pub(crate) fn sync_overlay(
     } else {
         fixture.1.scale = Vec3::ONE;
     }
-    let playback_visible = playback.as_ref().is_some_and(|p| p.visible);
     *fixture.2 = if state.visible {
         Visibility::Visible
     } else {
         Visibility::Hidden
     };
-    let visible = (state.visible || playback_visible) && selected.is_some() && window.1;
+    // Keep the configured, click-through surface transparent between drops.
+    // Turning its camera off on Stop retains the last drawable; showing the
+    // window again can expose that drawable before the next render is presented.
+    // An active camera instead clears removed sprites with Color::NONE, while
+    // reactive idle settings still avoid continuous rendering between inputs.
+    let visible = display_ready && window.1;
     if window.0.visible != visible {
         window.0.visible = visible;
     }
@@ -565,6 +571,152 @@ mod tests {
         assert_eq!(state.target, Some(remaining));
         assert!(!state.visible);
     }
+
+    #[test]
+    fn playback_stop_replay_keeps_a_transparent_surface_with_reactive_idle() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::asset::AssetPlugin {
+                file_path: crate::app::resource_root()
+                    .join("assets")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..default()
+            },
+            bevy::image::ImagePlugin::default(),
+        ))
+        .register_asset_loader(bevy::image::ImageLoader::new(
+            bevy::image::CompressedImageFormats::NONE,
+        ))
+        .init_resource::<OverlayState>()
+        .init_resource::<PlaybackOverlay>()
+        .insert_resource(idle_settings())
+        .add_systems(Update, sync_overlay);
+        let monitor = app
+            .world_mut()
+            .spawn((
+                Monitor {
+                    name: None,
+                    physical_width: 1920,
+                    physical_height: 1080,
+                    physical_position: IVec2::ZERO,
+                    scale_factor: 1.0,
+                    refresh_rate_millihertz: None,
+                    video_modes: Vec::new(),
+                },
+                PrimaryMonitor,
+            ))
+            .id();
+        let window = app
+            .world_mut()
+            .spawn((
+                Window {
+                    visible: false,
+                    ..default()
+                },
+                OverlayWindow,
+                NativeReady,
+            ))
+            .id();
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera {
+                    clear_color: Color::NONE.into(),
+                    is_active: false,
+                    ..default()
+                },
+                OverlayCamera,
+            ))
+            .id();
+        let image = app
+            .world()
+            .resource::<AssetServer>()
+            .load::<Image>("overlay-proof.png");
+        let fixture = app
+            .world_mut()
+            .spawn((Sprite::from_image(image.clone()), Fixture))
+            .id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.update();
+            let state = app.world().resource::<AssetServer>().load_state(&image);
+            if matches!(state, bevy::asset::LoadState::Loaded) {
+                break;
+            }
+            assert!(
+                !matches!(state, bevy::asset::LoadState::Failed(_)),
+                "proof asset failed to load"
+            );
+            assert!(Instant::now() < deadline, "proof asset loading timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Running, stopping and idle all preserve the same native surface; only
+        // real playback work keeps the event loop in continuous mode.
+        for (content_visible, busy) in [
+            (true, true),
+            (false, true),
+            (false, false),
+            (true, true),
+            (false, false),
+        ] {
+            {
+                let mut playback = app.world_mut().resource_mut::<PlaybackOverlay>();
+                playback.visible = content_visible;
+                playback.busy = busy;
+            }
+            app.update();
+            assert!(app.world().get::<Window>(window).unwrap().visible);
+            let camera = app.world().get::<Camera>(camera).unwrap();
+            assert!(camera.is_active);
+            assert!(
+                matches!(camera.clear_color, bevy::camera::ClearColorConfig::Custom(color) if color == Color::NONE)
+            );
+            assert_eq!(
+                *app.world().get::<Visibility>(fixture).unwrap(),
+                Visibility::Hidden
+            );
+            let expected = if busy {
+                WinitSettings::continuous()
+            } else {
+                idle_settings()
+            };
+            let settings = app.world().resource::<WinitSettings>();
+            assert_eq!(settings.focused_mode, expected.focused_mode);
+            assert_eq!(settings.unfocused_mode, expected.unfocused_mode);
+        }
+        app.world_mut().entity_mut(window).remove::<NativeReady>();
+        app.update();
+        assert!(!app.world().get::<Window>(window).unwrap().visible);
+        assert!(!app.world().get::<Camera>(camera).unwrap().is_active);
+        app.world_mut().entity_mut(window).insert(NativeReady);
+        // Invalid geometry must hide even when a playback occurrence is active.
+        {
+            let mut playback = app.world_mut().resource_mut::<PlaybackOverlay>();
+            playback.visible = true;
+            playback.busy = true;
+        }
+        app.world_mut()
+            .get_mut::<Monitor>(monitor)
+            .unwrap()
+            .physical_width = 0;
+        app.update();
+        assert!(!app.world().get::<Window>(window).unwrap().visible);
+        assert!(!app.world().get::<Camera>(camera).unwrap().is_active);
+        app.world_mut()
+            .get_mut::<Monitor>(monitor)
+            .unwrap()
+            .physical_width = 1920;
+        app.world_mut()
+            .get_mut::<Monitor>(monitor)
+            .unwrap()
+            .scale_factor = f64::NAN;
+        app.update();
+        assert!(!app.world().get::<Window>(window).unwrap().visible);
+        assert!(!app.world().get::<Camera>(camera).unwrap().is_active);
+    }
+
     #[test]
     fn retina_bounds_preserve_physical_pixels() {
         let (size, scale) = display_bounds(UVec2::new(3024, 1964), 2.0).unwrap();
