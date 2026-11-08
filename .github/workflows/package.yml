@@ -1,4 +1,10 @@
-name: macOS distribution checks
+name: Package
+
+# Native Apple Silicon DMG. Published GitHub releases attach the image using
+# the tag (without a leading v) so v0.1.0-playtest-001 becomes
+# Durop-0.1.0-playtest-001-macos-arm64.dmg. Push is branch-only so creating a
+# tag does not start a second run that shares a ref with `release` and cancels
+# the upload.
 on:
   release:
     types: [published]
@@ -8,6 +14,19 @@ on:
         description: 'Existing published release tag to build and attach assets to (blank for CI artifacts only)'
         required: false
         type: string
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'assets/**'
+      - 'sample-packs/**'
+      - 'fixtures/media/**'
+      - 'packaging/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/package.yml'
   pull_request:
     paths:
       - 'src/**'
@@ -20,12 +39,19 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - '.github/workflows/package.yml'
+
+concurrency:
+  group: package-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
 permissions:
   contents: read
+
 jobs:
-  package:
-    name: Build, sign and validate app bundle (macOS 15 arm64; target 14+)
+  macos:
+    name: Build, sign and validate DMG (macOS 15 arm64; target 14+)
     runs-on: macos-15
+    timeout-minutes: 180
     steps:
       - name: Verify release exists and is published
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
@@ -53,25 +79,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: native-macos-arm64-15-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - name: Test recursive Mach-O dependency validator
+      - name: Resolve artifact version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          if [[ -n "$RELEASE_TAG" ]]; then
+            version="$(GITHUB_EVENT_NAME=release GITHUB_REF_NAME="$RELEASE_TAG" packaging/macos/package.sh --print-version)"
+          else
+            version="$(packaging/macos/package.sh --print-version)"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Test packaging helpers and recursive Mach-O dependency validator
         run: python3 -m unittest discover -s packaging/macos -p 'test_*.py' -v
-      - name: Build app and validate signature, dependencies and bundled resources
+      - name: Build app and DMG, then validate signature, dependencies and bundled resources
         run: packaging/macos/package.sh --output dist/ci-${{ github.run_id }}
-      - name: Upload app archive, checksum and validation reports
+      - name: Upload DMG, checksum and validation reports
         uses: actions/upload-artifact@v4
         with:
-          name: Durop-macos-arm64-${{ github.run_id }}
+          name: durop-${{ env.VERSION }}-macos-arm64
           compression-level: 0
           if-no-files-found: error
           path: |
-            dist/ci-${{ github.run_id }}/*.zip
+            dist/ci-${{ github.run_id }}/*.dmg
             dist/ci-${{ github.run_id }}/*.sha256
             dist/ci-${{ github.run_id }}/BUILD-INFO.json
             dist/ci-${{ github.run_id }}/VALIDATION.json
 
   publish:
     name: Attach validated package to release
-    needs: package
+    needs: [macos]
     if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-24.04
     permissions:
@@ -79,14 +115,15 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: Durop-macos-arm64-${{ github.run_id }}
-          path: dist/release
-      - name: Upload app archive, checksum and validation reports
+          path: artifacts
+          pattern: durop-*
+          merge-multiple: true
+      - name: Upload DMG, checksum and validation reports
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           gh release upload --repo "$GH_REPO" --clobber -- "$RELEASE_TAG" \
-            dist/release/*.zip dist/release/*.sha256 \
-            dist/release/BUILD-INFO.json dist/release/VALIDATION.json
+            artifacts/*.dmg artifacts/*.sha256 \
+            artifacts/BUILD-INFO.json artifacts/VALIDATION.json

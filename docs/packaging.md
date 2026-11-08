@@ -33,6 +33,8 @@ small clean environment, the SDK resolved by `xcrun`, a dedicated
 `target/native-package` build directory and a locked native arm64 release build.
 Cargo's existing native build cache is reused, while every package invocation
 still runs the locked build and mandatory bundle/resource checks.
+`packaging/macos/package.sh --print-version` prints the DMG version stem without
+building. `--version` or `VERSION` overrides it.
 
 If a native rustup launcher was installed through Homebrew, select its actual
 official toolchain executable with
@@ -40,8 +42,13 @@ official toolchain executable with
 explicitly; the launcher/installer's location must not be mistaken for the
 compiler/Cargo used to build the distributable.
 
-The output directory contains the app, a versioned ZIP, its SHA-256 checksum,
-`BUILD-INFO.json` and `VALIDATION.json`. The app contains:
+The output directory contains the app, a versioned UDZO DMG with an Applications
+symlink for drag-install, its SHA-256 checksum, `BUILD-INFO.json` and
+`VALIDATION.json`. The DMG name uses the Cargo package version locally, a short
+commit suffix in CI, and the published GitHub release tag without a leading `v`.
+A tag such as `v0.1.0-playtest-001` therefore produces
+`Durop-0.1.0-playtest-001-macos-arm64.dmg`. Info.plist keeps the numeric Cargo
+version; `BUILD-INFO.json` records both. The app contains:
 
 ```text
 Contents/
@@ -85,12 +92,13 @@ audio, cache writes or Git. This establishes location-independent resource
 lookup, not Finder/GPU playback acceptance. It uses `Contents/Resources`, not the
 working directory or source checkout.
 
-Copy `Durop.app` into Applications and launch it normally. Gatekeeper may require
-the operator's normal Open confirmation for an unnotarized downloaded app; do
-not disable Gatekeeper globally. No paid signing account is a POC prerequisite.
-Screen recording/system-audio capture permissions belong to the chosen capture
-application. Tailscale's network extension enrollment is a separate installation
-and approval, not bundled setup performed by Durop.
+Open the DMG and drag `Durop.app` onto Applications, or copy `Durop.app` from the
+packaging output directory into Applications and launch it normally. Gatekeeper
+may require the operator's normal Open confirmation for an unnotarized downloaded
+app; do not disable Gatekeeper globally. No paid signing account is a POC
+prerequisite. Screen recording/system-audio capture permissions belong to the
+chosen capture application. Tailscale's network extension enrollment is a
+separate installation and approval, not bundled setup performed by Durop.
 
 Caches live in `~/Library/Caches/io.ramate.durop/packs`; nonsecret preferences
 live in `~/Library/Application Support/io.ramate.durop/preferences.json`.
@@ -127,18 +135,21 @@ must be handled before distribution.
 
 ## Release packages
 
-The workflow `.github/workflows/package.yml` builds native macOS artifacts for
-relevant pull requests, manual dispatch and published GitHub releases, including
-prereleases. Publishing a release builds its tag, runs the existing signing and
-validation checks, and attaches the ZIP, SHA-256 checksum, `BUILD-INFO.json` and
-`VALIDATION.json` to that release. All runs also retain these files as Actions
-artifacts. Only the separate release upload job has repository write permission;
-pull requests and manual runs with no release tag only produce CI artifacts.
+The workflow `.github/workflows/package.yml` builds native macOS DMGs for
+relevant pull requests, `main` pushes that touch the same paths, manual dispatch
+and published GitHub releases, including prereleases. Publishing a release
+builds its tag, runs the existing signing and validation checks, and attaches
+the DMG, SHA-256 checksum, `BUILD-INFO.json` and `VALIDATION.json` to that
+release. The DMG name uses the published tag without a leading `v`, so
+`v0.1.0-playtest-001` becomes `Durop-0.1.0-playtest-001-macos-arm64.dmg`. All
+runs also retain these files as Actions artifacts. Only the separate release
+upload job has repository write permission; pull requests and manual runs with
+no release tag only produce CI artifacts.
 
-To recover an existing published release that has no packages, run **macOS
-distribution checks** from a branch containing this workflow, such as `main`
-after merging the change, and set the optional `release_tag` input to the exact
-existing tag. For example:
+To recover an existing published release that has no packages, run **Package**
+from a branch containing this workflow, such as `main` after merging the
+change, and set the optional `release_tag` input to the exact existing tag. For
+example:
 
 ```sh
 gh workflow run package.yml --repo ramate-io/durop --ref main \
@@ -150,8 +161,9 @@ The workflow rejects missing or draft releases before building and checks out
 the selected workflow branch. Re-running an upload replaces assets with matching
 names. Older releases are not rebuilt automatically when the workflow changes;
 use this recovery input for them. Tags used for future automatic release builds
-must contain the updated workflow. The archive and app versions still come from
-Cargo.toml; the build record identifies the exact source revision.
+must contain the updated workflow. Info.plist keeps the numeric Cargo version;
+the DMG filename uses the release tag, and the build record identifies the exact
+source revision.
 
 This workflow attaches packages to an existing release; creating/publishing the
 release remains an operator action. Packages remain ad-hoc signed, without
