@@ -6,7 +6,10 @@
 use crate::{
     app::Runtime,
     catalog::Catalog,
-    commands::{CommandOutcome, Envelope, HostEvent, HostSnapshot, PlaybackCommand, Rejection},
+    commands::{
+        CommandOutcome, Envelope, HostEvent, HostSnapshot, PlaybackCommand, Rejection,
+        VisualPlacement,
+    },
     host::{CommandInbox, QueueError, command_channel},
     transport::{
         self, ControllerClient, ControllerUpdate, HostBridge, RemoteCatalog, RemoteCommand,
@@ -98,6 +101,9 @@ pub struct RemoteClip {
     pub category: String,
     /// Validated panel category: audio, video, or gif.
     pub media_type: String,
+    /// Host-resolved visual default; absent for audio clips or older projections.
+    #[serde(default)]
+    pub default_placement: Option<VisualPlacement>,
 }
 
 /// Bounded metadata projection for browsing one pinned authenticated catalog.
@@ -131,6 +137,9 @@ impl RemoteCatalogView {
                     && clip.tags.len() <= 32
                     && clip.tags.iter().all(|tag| tag.len() <= 64)
                     && ["audio", "video", "gif"].contains(&clip.media_type.as_str())
+                    && clip
+                        .default_placement
+                        .is_none_or(|placement| clip.media_type != "audio" && placement.is_valid())
             })
     }
 }
@@ -259,6 +268,7 @@ impl NetworkState {
     pub(crate) fn for_ui_test(snapshot: HostSnapshot) -> Self {
         let mut network = NetworkState::new(snapshot, &NetworkConfig::default(), Arc::new(|| {}));
         network.listener_lookup_done = true;
+        network.administration = sources::Administration::for_test();
         network
     }
 
@@ -424,6 +434,7 @@ impl NetworkState {
         } else {
             None
         };
+        self.initialize_administration();
         self.status = "Verifying local Tailscale address…".into();
         self.host_job = Some(self.runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -543,7 +554,13 @@ impl NetworkState {
         session: &str,
     ) -> Vec<CommandOutcome> {
         let mut local = Vec::new();
-        for receipt in self.inbox.drain(host) {
+        let receipts = self.inbox.drain(host);
+        // A controller may request a snapshot immediately after its outcome. Publish
+        // host authority before releasing replies, independent of the render bridge.
+        if !receipts.is_empty() {
+            self.publish_local(host.snapshot(), &[]);
+        }
+        for receipt in receipts {
             crate::diagnostics::acknowledged(session, &receipt.command_id, &receipt.outcome);
             if let Some(ticket) = receipt.ticket.filter(|ticket| *ticket != 0) {
                 if let Some(request) = self
@@ -715,7 +732,6 @@ impl NetworkState {
 
 /// Admit bounded UI intentions, apply generation-checked results, then pump host policy.
 fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
-    network.initialize_administration();
     if network.destination != runtime.destination {
         network.disable_host();
         network.destination = runtime.destination;
@@ -950,6 +966,7 @@ impl RemoteCatalogView {
                 tags: clip.metadata.tags.clone(),
                 category: clip.category.to_string_lossy().into_owned(),
                 media_type: media_type.into(),
+                default_placement: crate::host::Host::default_placement(clip),
             });
             let mut png = Vec::new();
             std::fs::File::open(&clip.icon_path)
@@ -1312,9 +1329,31 @@ mod tests {
             .unwrap();
         let address = session.address;
         let secret = SessionCredential::from_secret(session.credential.bearer().into()).unwrap();
-        let clip_id = catalog.clips[0].identity.clone();
+        let clip = catalog
+            .clips
+            .iter()
+            .find(|clip| crate::host::Host::default_placement(clip).is_some())
+            .unwrap();
+        let clip_id = clip.identity.clone();
+        let default_placement = crate::host::Host::default_placement(clip).unwrap();
+        let placement = VisualPlacement {
+            width_bps: 4200,
+            x_bps: 1234,
+            y_bps: 8765,
+            fit: durop_protocol::VisualFit::Cover,
+        };
+        let expected_defaults: BTreeMap<_, _> = catalog
+            .clips
+            .iter()
+            .map(|clip| {
+                (
+                    clip.identity.clone(),
+                    crate::host::Host::default_placement(clip),
+                )
+            })
+            .collect();
         let revision = catalog.revision.clone();
-        let (done, completed) = std::sync::mpsc::sync_channel(1);
+        let published = network.bridge.snapshot.clone();
         let task = network.runtime.spawn(async move {
             let mut client = ControllerClient::connect_loopback(address, secret)
                 .await
@@ -1322,13 +1361,28 @@ mod tests {
             let metadata = client.catalog().await.unwrap();
             assert!(metadata.get("root").is_none());
             assert!(metadata["clips"][0].get("assetPath").is_none());
+            let view: RemoteCatalogView = serde_json::from_value(metadata).unwrap();
+            assert!(view.validate());
+            for clip in view.clips {
+                assert_eq!(clip.default_placement, expected_defaults[&clip.clip_id]);
+            }
             assert!(!client.icon(&clip_id).await.unwrap().is_empty());
+            let expected = Arc::new(Mutex::new(Some(placement)));
+            let acknowledged = expected.clone();
+            client.observe_acknowledgments(move |_| {
+                assert_eq!(
+                    published.borrow().instances[0].placement,
+                    *acknowledged.lock().unwrap(),
+                    "authoritative placement must be published before its outcome"
+                );
+            });
             let accepted = client
                 .command(
                     "remote-play".into(),
                     revision.clone(),
-                    PlaybackCommand::Play {
+                    PlaybackCommand::PlayVisual {
                         clip_id: clip_id.clone(),
+                        placement,
                     },
                 )
                 .await
@@ -1338,18 +1392,42 @@ mod tests {
                 .command(
                     "remote-play".into(),
                     revision.clone(),
-                    PlaybackCommand::Play { clip_id },
+                    PlaybackCommand::PlayVisual { clip_id, placement },
                 )
                 .await
                 .unwrap();
             assert_eq!(accepted, duplicate);
+            let CommandOutcome::Accepted {
+                instance_id: Some(instance_id),
+            } = &accepted
+            else {
+                panic!("missing visual occurrence");
+            };
+            let snapshot = client.refresh_snapshot().await.unwrap();
+            assert_eq!(snapshot.instances[0].placement, Some(placement));
+            for (index, next) in [Some(default_placement), None].into_iter().enumerate() {
+                *expected.lock().unwrap() = next;
+                let outcome = client
+                    .command(
+                        format!("remote-placement-{index}"),
+                        revision.clone(),
+                        PlaybackCommand::SetVisual {
+                            instance_id: instance_id.clone(),
+                            placement: next,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(outcome, CommandOutcome::Accepted { .. }));
+                let snapshot = client.refresh_snapshot().await.unwrap();
+                assert_eq!(snapshot.instances[0].placement, next);
+            }
             let stopped = client
                 .command("remote-stop".into(), revision, PlaybackCommand::StopAll)
                 .await
                 .unwrap();
             assert!(matches!(stopped, CommandOutcome::Accepted { .. }));
             client.disconnect().await;
-            done.send(()).unwrap();
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -1359,9 +1437,9 @@ mod tests {
                 }
             }
             network.accept_pending(&mut host, "network-test");
-            let events = host.drain_events();
-            network.publish_local(host.snapshot(), &events);
-            if completed.try_recv().is_ok() {
+            // No render-bridge publication: ingress must publish the acknowledged
+            // state itself before the client can immediately refresh it.
+            if task.is_finished() {
                 break;
             }
             assert!(
@@ -1381,6 +1459,36 @@ mod tests {
             "retry must not create another occurrence"
         );
         network.runtime.block_on(session.close());
+    }
+
+    // Keep the fixture's application consumer alive while a socket actor produces
+    // updates. Bound each drain so snapshot traffic cannot hide the wait deadline.
+    fn pump_controller_updates(
+        network: &mut NetworkState,
+        host: &mut crate::host::Host,
+    ) -> (usize, usize) {
+        let mut accepted = 0;
+        let mut superseded = 0;
+        for _ in 0..32 {
+            let Ok(update) = network.updates.try_recv() else {
+                break;
+            };
+            match update {
+                Update::Remote(request) => network.admit_remote(request),
+                Update::Outcome(_, CommandOutcome::Accepted { .. }) => accepted += 1,
+                Update::Outcome(_, CommandOutcome::Rejected { reason }) => {
+                    assert_eq!(reason, Rejection::Superseded);
+                    superseded += 1;
+                }
+                _ => {}
+            }
+        }
+        network.accept_pending(host, "network-test");
+        let events = host.drain_events();
+        if !events.is_empty() {
+            network.publish_local(host.snapshot(), &events);
+        }
+        (accepted, superseded)
     }
 
     #[test]
@@ -1439,36 +1547,50 @@ mod tests {
         let mut accepted = 0;
         let mut superseded = 0;
         while accepted != 2 || superseded != 1 {
-            while let Ok(update) = network.updates.try_recv() {
-                match update {
-                    Update::Remote(request) => network.admit_remote(request),
-                    Update::Outcome(_, CommandOutcome::Accepted { .. }) => accepted += 1,
-                    Update::Outcome(
-                        _,
-                        CommandOutcome::Rejected {
-                            reason: Rejection::Superseded,
-                        },
-                    ) => superseded += 1,
-                    _ => {}
-                }
-            }
-            network.accept_pending(&mut host, "network-test");
-            let events = host.drain_events();
-            network.publish_local(host.snapshot(), &events);
+            let (new_accepted, new_superseded) = pump_controller_updates(&mut network, &mut host);
+            accepted += new_accepted;
+            superseded += new_superseded;
+            assert!(
+                accepted <= 2 && superseded <= 1,
+                "unexpected extra command outcomes"
+            );
             assert!(
                 std::time::Instant::now() < deadline,
                 "controller actor did not complete priority requests"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        // Model the scheduling race from CI: a full application mailbox can park
+        // notify() outside the actor's select, so dropping the backend alone cannot
+        // complete teardown. Keep consuming until every producer has stopped.
+        while network.update_tx.try_send(Update::CatalogReady(1)).is_ok() {}
+        assert_eq!(network.update_tx.capacity(), 0);
         drop(backend);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !actor.is_finished() {
+            let (new_accepted, new_superseded) = pump_controller_updates(&mut network, &mut host);
+            accepted += new_accepted;
+            superseded += new_superseded;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "controller actor did not finish after backend closure"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The completion check makes this join nonblocking; no detached actor is
+        // left waiting for the fixture's stopped application consumer.
         network.runtime.block_on(actor).unwrap();
+        assert_eq!((accepted, superseded), (2, 1));
         assert_eq!(host.snapshot().instances.len(), 1);
         assert_eq!(
             host.snapshot().instances[0].state,
             crate::commands::InstanceState::Preparing
         );
-        network.runtime.block_on(session.close());
+        network.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), session.close())
+                .await
+                .expect("controller fixture listener did not close");
+        });
     }
 
     #[test]
@@ -1485,6 +1607,10 @@ mod tests {
         ] {
             assert!(NetworkConfig::parse_address(invalid).is_err());
         }
+        assert_eq!(
+            NetworkConfig::parse_address("100.75.38.86").unwrap(),
+            "100.75.38.86:48732".parse().unwrap()
+        );
         let view = RemoteCatalogView {
             pack_id: "pack".into(),
             title: "Pack".into(),
@@ -1495,16 +1621,120 @@ mod tests {
                 tags: vec![],
                 category: "audio".into(),
                 media_type: "audio".into(),
+                default_placement: None,
             }],
         };
         assert!(view.validate());
+        let mut missing_default = serde_json::to_value(&view).unwrap();
+        missing_default["clips"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("defaultPlacement");
+        assert!(
+            serde_json::from_value::<RemoteCatalogView>(missing_default)
+                .unwrap()
+                .clips[0]
+                .default_placement
+                .is_none()
+        );
         let mut duplicates = view.clone();
         duplicates.clips.push(view.clips[0].clone());
         assert!(!duplicates.validate());
-        assert_eq!(
-            NetworkConfig::parse_address("100.75.38.86").unwrap(),
-            "100.75.38.86:48732".parse().unwrap()
+        let mut visual = view.clone();
+        visual.clips[0].media_type = "gif".into();
+        visual.clips[0].default_placement = Some(VisualPlacement {
+            width_bps: 3000,
+            x_bps: 5000,
+            y_bps: 5000,
+            fit: durop_protocol::VisualFit::Catalog,
+        });
+        assert!(visual.validate());
+        let serialized = serde_json::to_value(&visual).unwrap();
+        assert_eq!(serialized["clips"][0]["defaultPlacement"]["widthBps"], 3000);
+        assert!(
+            serde_json::from_value::<RemoteCatalogView>(serialized)
+                .unwrap()
+                .validate()
         );
+        visual.clips[0].default_placement.as_mut().unwrap().x_bps = 10_001;
+        assert!(!visual.validate());
+        visual.clips[0].default_placement.as_mut().unwrap().x_bps = 5000;
+        visual.clips[0].media_type = "audio".into();
+        assert!(!visual.validate());
+    }
+
+    #[test]
+    fn native_visual_commands_use_the_shared_host_path() {
+        let catalog = Arc::new(
+            crate::catalog::load_local(
+                &crate::app::resource_root().join("sample-packs/podcast-pack"),
+            )
+            .unwrap(),
+        );
+        let mut host = crate::host::Host::new("native-visual".into(), catalog.clone());
+        let mut network =
+            NetworkState::new(host.snapshot(), &NetworkConfig::default(), Arc::new(|| {}));
+        let clip = catalog
+            .clips
+            .iter()
+            .find(|clip| crate::host::Host::default_placement(clip).is_some())
+            .unwrap();
+        let placement = VisualPlacement {
+            width_bps: 4200,
+            x_bps: 1234,
+            y_bps: 8765,
+            fit: durop_protocol::VisualFit::Cover,
+        };
+        let envelope = |id: &str, command| Envelope {
+            protocol_version: crate::commands::PROTOCOL_VERSION,
+            session_id: "native-visual".into(),
+            command_id: id.into(),
+            catalog_revision: catalog.revision.clone(),
+            command,
+        };
+        network
+            .queue_local(envelope(
+                "play",
+                PlaybackCommand::PlayVisual {
+                    clip_id: clip.identity.clone(),
+                    placement,
+                },
+            ))
+            .unwrap();
+        assert!(
+            network
+                .accept_pending(&mut host, "native-visual")
+                .is_empty()
+        );
+        let snapshot = host.snapshot();
+        assert_eq!(snapshot.instances[0].placement, Some(placement));
+        let instance_id = snapshot.instances[0].instance_id.clone();
+        for (index, next) in [
+            Some(VisualPlacement {
+                width_bps: 8000,
+                ..placement
+            }),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            network
+                .queue_local(envelope(
+                    &format!("set-{index}"),
+                    PlaybackCommand::SetVisual {
+                        instance_id: instance_id.clone(),
+                        placement: next,
+                    },
+                ))
+                .unwrap();
+            assert!(
+                network
+                    .accept_pending(&mut host, "native-visual")
+                    .is_empty()
+            );
+            assert_eq!(host.snapshot().instances[0].placement, next);
+        }
     }
 
     #[test]

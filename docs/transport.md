@@ -44,8 +44,8 @@ Ending a durop session leaves Tailscale enrollment and policy intact.
 ## Wire protocol
 
 Use native WebSocket clients that can supply `Authorization: Bearer CREDENTIAL`
-and `Sec-WebSocket-Protocol: durop.v1`. The server requires exactly one of each and
-echoes `durop.v1`. The only accepted request target is `/control`, with no query.
+and `Sec-WebSocket-Protocol: durop.v2`. The server requires exactly one of each and
+echoes `durop.v2`. The only accepted request target is `/control`, with no query.
 Native clients may omit Origin; if present it must exactly match one configured
 origin. Browser JavaScript cannot set this Authorization header and is not supported
 as a controller by this adapter. Do not work around that with URL tokens.
@@ -54,7 +54,7 @@ Every connection first receives `{"type":"snapshot","snapshot":...}` using
 the canonical issue #5 `HostSnapshot`. Requests are JSON tagged by `type`:
 
 ```json
-{"type":"command","envelope":{"protocolVersion":1,"sessionId":"host-session","commandId":"unique-request","catalogRevision":"resolved-commit","command":{"type":"play","clip_id":"podcast/applause"}}}
+{"type":"command","envelope":{"protocolVersion":2,"sessionId":"host-session","commandId":"unique-request","catalogRevision":"resolved-commit","command":{"type":"play","clip_id":"podcast/applause"}}}
 ```
 
 Other requests are `{"type":"snapshot"}`, `{"type":"catalog"}`, and
@@ -114,8 +114,11 @@ the shared host policy path and skip stale requests. This includes disconnected,
 revoked, superseded, and timed-out requests. Drain the emergency lane first; a newly
 accepted StopAll must invalidate normal requests already queued across all controllers
 (use the host ingress barrier). A same-connection StopAll also closes that connection's
-pending normal reply. Return the canonical host outcome through `reply`, publish
-host events and fresh snapshots, and keep their sizes within the output bound.
+pending normal reply. Publish the resulting authoritative snapshot before returning
+the canonical host outcome through `reply`, so a direct controller's immediate
+refresh cannot observe state from before its acknowledged command. Backend-start events
+remain separate from command acceptance. Publish host events and keep snapshots
+and events within the output bound.
 
 Never persist an adapter queue or replay controller button presses on reconnection.
 Reconnection gets the current snapshot. Already accepted playback can finish after
@@ -133,7 +136,7 @@ Diagnostics are host-local, not remotely callable. They do not log session secre
 `ControllerClient::connect(SocketAddr, SessionCredential::from_secret(secret)?)`
 is the production native client. The explicit target must be a Tailscale IP and
 nonzero port; credentials never appear in URLs or Debug output. The client consumes
-the credential for the authenticated upgrade and requires `durop.v1` plus a fresh
+the credential for the authenticated upgrade and requires `durop.v2` plus a fresh
 initial typed snapshot. Only the isolated test build has a loopback connect helper.
 
 Own the mutable client in a task on the existing Tokio runtime. Use `command(id,
@@ -186,3 +189,16 @@ duplicate retries, and denied-identity access to the configured TCP port. Record
 direct versus relayed transport and controller-send, acknowledgment, and actual
 backend-start timings. A Tailscale ping alone proves neither port reachability nor
 durop authorization. No such live acceptance has been performed by these tests.
+
+## Experimental placement commands
+
+Protocol version 2 adds `play_visual` and `set_visual`; see the
+[host contract](host.md) and [editor guide](panel.md#experimental-visual-placement).
+Catalog projections include validated default placement for GIF/video entries.
+Active snapshots and `visual_changed` events carry each occurrence's current
+explicit override, including its `fit` rule (`catalog` or `cover`). Omitted fit
+uses catalog policy. Fullscreen sends cover explicitly so the host fills its display
+even for a contain-fit clip. Updates use the normal bounded authenticated command channel
+and retain session/revision checks and StopAll priority. Both peers must run the
+version 2 build; version 1 peers fail negotiation rather than silently dropping
+placement settings.

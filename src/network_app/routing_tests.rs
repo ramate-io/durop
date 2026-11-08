@@ -25,6 +25,7 @@ impl RoutingHost {
         let host = crate::host::Host::new(identity.into(), catalog.clone());
         let mut network =
             NetworkState::new(host.snapshot(), &NetworkConfig::default(), Arc::new(|| {}));
+        network.administration = sources::Administration::for_test();
         if let Some(snapshot) = advertised {
             network.destination = crate::app::Destination::Remote;
             network.snapshots.send_replace(snapshot.clone());
@@ -328,12 +329,25 @@ fn in_flight_relay_revocation_cancels_destination_queue_and_another_source_survi
     relay.route_to(&mut destination);
     let (alice_id, alice_secret) = relay.add_source("Alice");
     let (_, bob_secret) = relay.add_source("Bob");
+    let placement = VisualPlacement {
+        width_bps: 4200,
+        x_bps: 1234,
+        y_bps: 8765,
+        fit: durop_protocol::VisualFit::Catalog,
+    };
+    let visual = relay
+        .catalog
+        .clips
+        .iter()
+        .find(|clip| crate::host::Host::default_placement(clip).is_some())
+        .unwrap();
     let alice = send_command(
         &relay,
         alice_secret,
         "cancel-in-flight",
-        PlaybackCommand::Play {
-            clip_id: relay.catalog.clips[0].identity.clone(),
+        PlaybackCommand::PlayVisual {
+            clip_id: visual.identity.clone(),
+            placement,
         },
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -349,6 +363,8 @@ fn in_flight_relay_revocation_cancels_destination_queue_and_another_source_survi
         std::thread::sleep(Duration::from_millis(1));
     };
     assert!(queued_at_destination.is_active());
+    assert!(matches!(queued_at_destination.envelope.command,
+        PlaybackCommand::PlayVisual { placement: actual, .. } if actual == placement));
     relay
         .network
         .source_action(NetworkAction::RevokeController { id: alice_id });
@@ -427,4 +443,108 @@ fn relay_pushes_destination_snapshot_to_an_idle_source() {
         std::thread::sleep(Duration::from_millis(1));
     }
     relay.network.runtime.block_on(observer).unwrap();
+}
+
+#[test]
+fn relay_preserves_visual_overrides_and_reset_at_the_destination() {
+    let mut destination = RoutingHost::new("destination-visual", None);
+    let mut relay = RoutingHost::new("relay-visual", Some(destination.host.snapshot()));
+    relay.route_to(&mut destination);
+    let (_, secret) = relay.add_source("visual controller");
+    let clip_id = relay
+        .catalog
+        .clips
+        .iter()
+        .find(|clip| crate::host::Host::default_placement(clip).is_some())
+        .unwrap()
+        .identity
+        .clone();
+    let initial = VisualPlacement {
+        width_bps: 4200,
+        x_bps: 1234,
+        y_bps: 8765,
+        fit: durop_protocol::VisualFit::Catalog,
+    };
+    let changed = VisualPlacement {
+        width_bps: 7000,
+        x_bps: 8000,
+        y_bps: 2000,
+        fit: durop_protocol::VisualFit::Cover,
+    };
+    let address = relay.session.address;
+    let revision = relay.catalog.revision.clone();
+    let task = relay.network.runtime.spawn(async move {
+        let mut client = ControllerClient::connect_loopback(address, secret)
+            .await
+            .unwrap();
+        let accepted = client
+            .command(
+                "play-visual".into(),
+                revision.clone(),
+                PlaybackCommand::PlayVisual {
+                    clip_id,
+                    placement: initial,
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::Accepted {
+            instance_id: Some(instance_id),
+        } = accepted
+        else {
+            panic!("destination must accept visual playback");
+        };
+        for (index, placement) in [Some(changed), None].into_iter().enumerate() {
+            assert_eq!(
+                client
+                    .command(
+                        format!("update-{index}"),
+                        revision.clone(),
+                        PlaybackCommand::SetVisual {
+                            instance_id: instance_id.clone(),
+                            placement
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                CommandOutcome::Accepted {
+                    instance_id: Some(instance_id.clone())
+                }
+            );
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !task.is_finished() {
+        relay.pump();
+        destination.pump();
+        assert!(
+            Instant::now() < deadline,
+            "relay did not return visual outcomes"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    relay.network.runtime.block_on(task).unwrap();
+    let snapshot = destination.host.snapshot();
+    assert_eq!(snapshot.instances.len(), 1);
+    assert_eq!(snapshot.instances[0].placement, None);
+    assert_eq!(
+        snapshot.instances[0].state,
+        crate::commands::InstanceState::Preparing
+    );
+    let updates: Vec<_> = destination
+        .events
+        .iter()
+        .filter_map(|event| {
+            if let crate::commands::EventKind::VisualChanged { placement } = event.event {
+                Some(placement)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(updates, vec![Some(initial), Some(changed), None]);
+    assert!(
+        relay.host.snapshot().instances.is_empty(),
+        "visual controls must use the selected destination"
+    );
 }

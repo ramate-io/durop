@@ -57,7 +57,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 // Control frames count too, so ping traffic cannot bypass the authenticated rate limit.
 const REQUESTS_PER_SECOND: usize = 20;
 // Negotiate the version before accepting any application payload.
-const SUBPROTOCOL: &str = "durop.v1";
+const SUBPROTOCOL: &str = "durop.v2";
 
 /// Binding verification mode; only isolated tests may omit tailnet verification.
 enum BindingGuard {

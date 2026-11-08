@@ -19,6 +19,9 @@ with a 10000 ms duration limit. Retrigger values are `restart`, `ignore-if-playi
 `visual` is optional (including for audio); when present it requires `anchor`
 (`top-left`, `top-right`, `bottom-left`, `bottom-right`, `center`),
 `widthFraction` (> 0 and <= 1 of overlay width), and `fit` (`contain`, `cover`).
+These are immutable playback defaults. The experimental controller
+[placement editor](panel.md#experimental-visual-placement) sends per-occurrence
+overrides without modifying this metadata.
 
 The v1 format policy accepts WAV, MP3, OGG, FLAC, M4A, AAC, MP4, MOV, WebM and GIF
 extensions, case-insensitively. This is an authoring allowlist, not a promise of

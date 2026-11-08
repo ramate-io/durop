@@ -31,7 +31,11 @@ and cleared after submission; credentials never enter preferences, URLs or comma
 arguments. The selected remote source’s **Listener** settings configure a local listener;
 the runtime verifies the address and generates its own credential. **Revoke remote**
 closes that access. Keep the displayed host credential out of recordings/screenshots.
-Durop does not enroll machines or alter tailnet policy.
+Durop does not enroll machines or alter tailnet policy. Protected host invitation
+credentials are loaded only after adding a remote controller or enabling a valid
+Tailscale listener, or when explicitly saving/removing a token. Ordinary startup, opening From, local playback and connecting to a remote host
+do not access Keychain. An explicit `--listen-tailscale` launch starts host sharing
+and may request credentials.
 
 **Catalog** offers the bundled pack, an absolute local directory, or an HTTPS Git
 repository with a literal ref and optional pack folder. The repository example is
@@ -80,6 +84,48 @@ within that form; hidden fields and background search cannot receive editing. Es
 closes a modal/menu first, then leaves a focused editor, and otherwise stops playback.
 Space outside editing plays the first visible local tile. Bundled fonts have limited
 script coverage; missing glyphs do not discard the underlying search text.
+
+## Experimental visual placement
+
+GIF and video cards include **Edit**. The placement dialog changes the selected
+clip's scale and horizontal/vertical position for the destination host display.
+Audio cards have no placement controls.
+
+- **Scale** is the fitting area's width as a percentage of the host display
+  width, greater than 0% and at most 100%. Explicit adjustments scale both
+  display dimensions together. Ordinary adjustments retain the catalog's fitting
+  rule; Fullscreen selects cover fitting. Reset restores the original catalog
+  fitting area and rule.
+- **Horizontal** runs from 0% at the left edge to 100% at the right edge.
+- **Vertical** runs from 0% at the top edge to 100% at the bottom edge.
+
+Position percentages interpolate over the available space around the rendered
+media, keeping it on-screen: 50% centers it and 100% aligns its far edge. Values
+refer to the host's selected display, not the controller window, and accept two
+decimal places.
+
+**Fullscreen** sets scale to 100%, centers the media and selects cover fitting,
+so the entire display is filled even when the catalog uses contain. The image
+keeps its aspect ratio; excess edges are cropped symmetrically. **Top left**,
+**Top right**, **Bottom left** and **Bottom right** align the media to that corner
+while retaining the current scale and fitting rule. These shortcuts
+only edit the draft until you choose Apply or Send.
+
+**Apply** remembers the adjustment for this controller session and updates active
+occurrences of this clip without restarting their decoder or soundtrack. **Send**
+applies the adjustment and requests playback. **Reset to defaults** restores the
+catalog's scale, anchor and fitting rule in the draft; Apply or Send commits that
+reset. The renderer consumes placement changes before presenting frames, including
+the first frame of a preparing occurrence. Between plays, the configured
+click-through overlay stays transparent and available to clear its last frame,
+avoiding a native hide/reveal of the previous drawable. Idle updates remain reactive.
+**Cancel** discards the draft. New host sessions, destinations or catalog revisions
+clear remembered overrides; this experiment does not rewrite pack metadata or
+persist placement preferences to disk.
+
+Local and Tailscale controllers use the same host command policy. Invalid values,
+stale catalogs and finished/stopping occurrences cannot be updated. The wire
+protocol is version 2 (`durop.v2`); run the same build on host and controller.
 
 ## Launch and persistence
 

@@ -3,8 +3,8 @@
 
 use super::{NetworkAction, NetworkState, Update, notify};
 use crate::transport::invitations::{
-    AdminApiKey, Invitation, InvitationProvider, InvitationTarget, PlatformSecretStore,
-    SecretStore, TailscaleInvitations,
+    AdminApiKey, Invitation, InvitationError, InvitationProvider, InvitationTarget,
+    PlatformSecretStore, SecretStore, TailscaleInvitations,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -25,10 +25,13 @@ pub struct ControllerSource {
 }
 
 /// Host-side ownership, omitted from all persisted preferences and diagnostic output.
-#[derive(Default)]
 pub(super) struct Administration {
-    // Lazily start store access after the UI executor and wake path are available.
+    // Start credential access only after an explicit host-sharing workflow.
     initialized: bool,
+    // Construction is inert; blocking methods run only on the credential worker.
+    store: Arc<dyn SecretStore>,
+    // Resolve process credentials on demand and permit deterministic dependency tests.
+    environment: fn() -> Result<Option<AdminApiKey>, InvitationError>,
     // Ignore late credential loads when a newer save/remove supersedes them.
     generation: u64,
     // Serialize store reads and mutations so Save cannot complete after a later Remove.
@@ -39,6 +42,21 @@ pub(super) struct Administration {
     invitations: BTreeMap<String, (InvitationTarget, String)>,
     // Bound mutation concurrency to one operation per source.
     busy: std::collections::BTreeSet<String>,
+}
+
+impl Default for Administration {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            store: Arc::new(Self::store()),
+            environment: AdminApiKey::from_environment,
+            generation: 0,
+            credential_busy: false,
+            provider: None,
+            invitations: BTreeMap::new(),
+            busy: std::collections::BTreeSet::new(),
+        }
+    }
 }
 
 /// Results cross to the UI thread without exposing the underlying API token.
@@ -61,6 +79,16 @@ pub(super) enum SourceUpdate {
 }
 
 impl Administration {
+    #[cfg(test)]
+    // Exercise the production lazy gate without reading the test runner's credentials.
+    pub(super) fn for_test() -> Self {
+        Self {
+            store: Arc::new(TestSecretStore::default()),
+            environment: || Ok(None),
+            ..Self::default()
+        }
+    }
+
     // Keychain is preferred on macOS; other platforms use a private, dedicated file.
     fn store() -> PlatformSecretStore {
         PlatformSecretStore::new(
@@ -69,18 +97,20 @@ impl Administration {
     }
 
     // Exported credentials override saved credentials without silently overwriting them.
-    fn load() -> Result<(Option<Arc<dyn InvitationProvider>>, String), String> {
-        let (key, origin) =
-            match AdminApiKey::from_environment().map_err(|error| error.to_string())? {
-                Some(key) => (
-                    Some(key),
-                    "Using TAILSCALE_API_KEY from the host environment",
-                ),
-                None => (
-                    Self::store().load().map_err(|error| error.to_string())?,
-                    "Using securely saved host API token",
-                ),
-            };
+    fn load(
+        store: &dyn SecretStore,
+        environment: fn() -> Result<Option<AdminApiKey>, InvitationError>,
+    ) -> Result<(Option<Arc<dyn InvitationProvider>>, String), String> {
+        let (key, origin) = match environment().map_err(|error| error.to_string())? {
+            Some(key) => (
+                Some(key),
+                "Using TAILSCALE_API_KEY from the host environment",
+            ),
+            None => (
+                store.load().map_err(|error| error.to_string())?,
+                "Using securely saved host API token",
+            ),
+        };
         match key {
             Some(key) => Ok((
                 Some(Arc::new(
@@ -97,10 +127,9 @@ impl Administration {
 }
 
 impl NetworkState {
-    /// Begin one protected credential lookup off the main thread.
+    /// Load host invitation credentials once after explicit Tailscale sharing begins.
     pub(super) fn initialize_administration(&mut self) {
         if !self.administration.initialized {
-            self.administration.initialized = true;
             self.load_administration(None, false);
         }
     }
@@ -112,11 +141,14 @@ impl NetworkState {
                 "Wait for the current protected credential operation to finish".into();
             return;
         }
+        self.administration.initialized = true;
         self.administration.credential_busy = true;
         self.administration.provider = None;
         self.admin_secret_available = false;
         self.administration.generation = self.administration.generation.wrapping_add(1);
         let generation = self.administration.generation;
+        let store = self.administration.store.clone();
+        let environment = self.administration.environment;
         self.admin_status = "Checking protected host credentials…".into();
         let updates = self.update_tx.clone();
         let wake = self.wake.clone();
@@ -125,16 +157,12 @@ impl NetworkState {
                 if let Some(secret) = save {
                     let key =
                         AdminApiKey::from_secret(secret).map_err(|error| error.to_string())?;
-                    Administration::store()
-                        .save(&key)
-                        .map_err(|error| error.to_string())?;
+                    store.save(&key).map_err(|error| error.to_string())?;
                 }
                 if remove {
-                    Administration::store()
-                        .delete()
-                        .map_err(|error| error.to_string())?;
+                    store.delete().map_err(|error| error.to_string())?;
                 }
-                Administration::load()
+                Administration::load(store.as_ref(), environment)
             })
             .await
             .unwrap_or_else(|_| Err("Protected credential operation failed".into()));
@@ -169,16 +197,19 @@ impl NetworkState {
                 }
                 let id = bevy::asset::uuid::Uuid::new_v4().to_string();
                 match self.sources.issue(id.clone()) {
-                    Ok(credential) => self.controllers.push(ControllerSource {
-                        id,
-                        name: name.into(),
-                        enabled: true,
-                        pairing_secret: Some(credential.bearer().into()),
-                        invitation_url: None,
-                        invitation_status:
-                            "Share pairing with an existing network member, or create an invite"
-                                .into(),
-                    }),
+                    Ok(credential) => {
+                        self.controllers.push(ControllerSource {
+                            id,
+                            name: name.into(),
+                            enabled: true,
+                            pairing_secret: Some(credential.bearer().into()),
+                            invitation_url: None,
+                            invitation_status:
+                                "Share pairing with an existing network member, or create an invite"
+                                    .into(),
+                        });
+                        self.initialize_administration();
+                    }
                     Err(_) => self.status = "Could not create controller credential".into(),
                 }
             }
@@ -449,6 +480,42 @@ impl NetworkState {
 }
 
 #[cfg(test)]
+// Test adapters count real trait calls while keeping all native credential stores untouched.
+#[derive(Default)]
+struct TestSecretStore {
+    loads: std::sync::atomic::AtomicUsize,
+    saves: std::sync::atomic::AtomicUsize,
+    deletes: std::sync::atomic::AtomicUsize,
+    has_key: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl SecretStore for TestSecretStore {
+    fn load(&self) -> Result<Option<AdminApiKey>, InvitationError> {
+        use std::sync::atomic::Ordering;
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        self.has_key
+            .load(Ordering::SeqCst)
+            .then(|| AdminApiKey::from_secret("tskey-api-test-saved-token".into()))
+            .transpose()
+    }
+
+    fn save(&self, _key: &AdminApiKey) -> Result<(), InvitationError> {
+        use std::sync::atomic::Ordering;
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        self.has_key.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<(), InvitationError> {
+        use std::sync::atomic::Ordering;
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        self.has_key.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -461,6 +528,121 @@ mod tests {
             clips: vec![],
             instances: vec![],
         })
+    }
+
+    // Await the worker result rather than relying on sleeps or operating-system prompts.
+    fn finish_credentials(network: &mut NetworkState) {
+        let update = network.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), network.updates.recv())
+                .await
+                .expect("credential worker did not finish")
+                .expect("credential worker channel closed")
+        });
+        let Update::Sources(update @ SourceUpdate::Credentials(..)) = update else {
+            panic!("expected credential completion");
+        };
+        network.source_update(update);
+    }
+
+    #[test]
+    fn idle_startup_and_local_controls_do_not_access_credentials_before_sharing() {
+        use bevy::ecs::system::RunSystemOnce;
+        use std::sync::atomic::Ordering;
+        let mut network = network();
+        let store = Arc::new(TestSecretStore::default());
+        network.administration.store = store.clone();
+        network.administration.environment = || panic!("idle startup must not resolve credentials");
+        let runtime = crate::app::Runtime::new(&crate::app::Config {
+            mode: crate::app::Mode::Controller,
+            pack: std::path::PathBuf::new(),
+            display: None,
+            connect: None,
+            listen: None,
+            diagnostics: None,
+        })
+        .unwrap();
+        let mut world = bevy::prelude::World::new();
+        world.insert_resource(runtime);
+        world.insert_resource(network);
+        for _ in 0..2 {
+            world.run_system_once(super::super::dispatch).unwrap();
+        }
+        let catalog = world.resource::<crate::app::Runtime>().catalog.clone();
+        let mut network = world.remove_resource::<NetworkState>().unwrap();
+        network.enable_host(catalog);
+        network.source_action(NetworkAction::SetLocalEnabled(false));
+        network.source_action(NetworkAction::SetLocalEnabled(true));
+        network.source_action(NetworkAction::AddController { name: " ".into() });
+        assert!(!network.administration.initialized);
+        assert!(!network.administration.credential_busy);
+        assert_eq!(store.loads.load(Ordering::SeqCst), 0);
+        assert_eq!(network.administration.generation, 0);
+
+        network.administration.environment = || Ok(None);
+        network.source_action(NetworkAction::AddController {
+            name: "Alice".into(),
+        });
+        assert!(network.administration.initialized);
+        finish_credentials(&mut network);
+        assert_eq!(store.loads.load(Ordering::SeqCst), 1);
+        network.source_action(NetworkAction::AddController { name: "Bob".into() });
+        network.initialize_administration();
+        assert_eq!(store.loads.load(Ordering::SeqCst), 1);
+        assert_eq!(network.administration.generation, 1);
+        assert!(!network.administration.credential_busy);
+    }
+
+    #[test]
+    fn explicit_save_remove_initializes_once_and_preserves_environment_precedence() {
+        use std::sync::atomic::Ordering;
+        let mut network = network();
+        let store = Arc::new(TestSecretStore::default());
+        network.administration.store = store.clone();
+        network.source_action(NetworkAction::SaveAdminSecret {
+            secret: "tskey-api-user-saved-token".into(),
+        });
+        finish_credentials(&mut network);
+        assert_eq!(store.saves.load(Ordering::SeqCst), 1);
+        assert_eq!(store.loads.load(Ordering::SeqCst), 1);
+        assert!(network.admin_secret_available);
+        assert!(network.admin_status.contains("securely saved"));
+        network.initialize_administration();
+        assert_eq!(network.administration.generation, 1);
+
+        network.administration.environment =
+            || AdminApiKey::from_secret("tskey-api-environment-token".into()).map(Some);
+        network.source_action(NetworkAction::RemoveAdminSecret);
+        finish_credentials(&mut network);
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.loads.load(Ordering::SeqCst),
+            1,
+            "environment override must bypass saved credentials"
+        );
+        assert!(network.admin_secret_available);
+        assert!(network.admin_status.contains("TAILSCALE_API_KEY"));
+
+        network.administration.environment = || Ok(None);
+        network.source_action(NetworkAction::RemoveAdminSecret);
+        finish_credentials(&mut network);
+        assert_eq!(store.loads.load(Ordering::SeqCst), 2);
+        assert!(!network.admin_secret_available);
+        assert!(!network.administration.credential_busy);
+    }
+
+    #[test]
+    fn invalid_environment_credentials_fail_without_reading_the_secure_store() {
+        use std::sync::atomic::Ordering;
+        let mut network = network();
+        let store = Arc::new(TestSecretStore::default());
+        network.administration.store = store.clone();
+        network.administration.environment = || Err(InvitationError::InvalidInput);
+        network.initialize_administration();
+        finish_credentials(&mut network);
+        assert_eq!(store.loads.load(Ordering::SeqCst), 0);
+        assert!(!network.admin_secret_available);
+        assert!(network.administration.initialized);
+        assert!(!network.administration.credential_busy);
     }
 
     #[test]
@@ -495,6 +677,9 @@ mod tests {
         );
         assert!(network.admin_status.contains("Wait"));
         network.admin_secret_available = true;
+        network.source_update(SourceUpdate::Credentials(2, Err("stale lookup".into())));
+        assert!(network.admin_secret_available);
+        assert!(network.administration.credential_busy);
         network.source_update(SourceUpdate::Credentials(
             3,
             Err("secure storage unavailable".into()),

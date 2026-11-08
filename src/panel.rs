@@ -1,12 +1,17 @@
 //! Native controller panel with bounded virtualization and Unicode/IME editing.
 
 pub(crate) mod configuration;
+
+mod placement;
+
 mod input;
+
 #[cfg(test)]
 mod tests;
 mod theme;
 mod view;
 
+use crate::commands::{VisualFit, VisualPlacement};
 use crate::{
     app::{Action, Actions, Destination, Mode, Runtime},
     catalog::Clip,
@@ -33,6 +38,7 @@ use configuration::{
     CatalogProvider, ConfigurationContext, ConfigurationDraft, ConfigurationIntent, DisplayChoice,
     HostProvider, Provider,
 };
+use placement::{PlacementModal, PlacementPreset, PlacementScope};
 use std::{
     collections::BTreeMap,
     io::Read,
@@ -48,6 +54,8 @@ enum Field {
     Search,
     /// Provider-specific editor inside the active configuration dialog.
     Configuration(usize),
+    /// Visual placement percentage in the active isolated draft.
+    Placement(usize),
 }
 
 /// Draft mirror whose live Bevy input survives surrounding view refreshes.
@@ -80,6 +88,14 @@ struct Model {
     dropdown: Option<Dropdown>,
     /// Pending provider settings; applying is the only path to side effects.
     modal: Option<Modal>,
+    /// Experimental visual placement form, mutually exclusive with provider forms.
+    placement_modal: Option<PlacementModal>,
+    /// Exact destination lifetime owning the bounded session adjustments.
+    placement_scope: Option<PlacementScope>,
+    /// At most 256 clip adjustments; catalog metadata is never modified.
+    placements: BTreeMap<String, VisualPlacement>,
+    /// Oldest-applied order for bounded override eviction.
+    placement_order: std::collections::VecDeque<String>,
     /// Current responsive grid geometry and scroll bounds.
     layout: GridLayout,
     /// Number of filtered clips used to clamp scrolling and scrollbar position.
@@ -99,6 +115,20 @@ struct Model {
 enum UiAction {
     /// Queue an application lifecycle/playback intent.
     Runtime(Action),
+
+    /// Play with the current session adjustment.
+    Play(String),
+    /// Open the isolated visual-only placement draft.
+    EditPlacement(String),
+    /// Reset the draft to catalog values without applying it.
+    ResetPlacement,
+    /// Set a common display position in the draft without applying or sending it.
+    PresetPlacement(PlacementPreset),
+    /// Nudge one visual percentage by one point for pointer-only adjustment.
+    StepPlacement(usize, i16),
+    /// Apply placement to active occurrences, optionally sending another play.
+    ApplyPlacement(bool),
+
     /// Open or close a provider menu.
     Dropdown(Dropdown),
     /// Open a new isolated configuration draft.
@@ -370,12 +400,30 @@ struct HoverColors {
 }
 
 impl Model {
+    /// Whether either isolated form owns input and scrolling.
+    fn has_modal(&self) -> bool {
+        self.modal.is_some() || self.placement_modal.is_some()
+    }
+
+    /// Access the scroll position of the isolated form currently owning input.
+    fn modal_scroll(&mut self) -> Option<&mut f32> {
+        if let Some(modal) = &mut self.modal {
+            Some(&mut modal.scroll)
+        } else {
+            self.placement_modal.as_mut().map(|modal| &mut modal.scroll)
+        }
+    }
+
     /// Block all background actions while a modal owns interaction, retaining the safety stop.
     fn allows(&self, action: &UiAction) -> bool {
-        self.modal.is_none()
+        !self.has_modal()
             || matches!(
                 action,
                 UiAction::Apply
+                    | UiAction::ApplyPlacement(_)
+                    | UiAction::ResetPlacement
+                    | UiAction::PresetPlacement(_)
+                    | UiAction::StepPlacement(_, _)
                     | UiAction::Cancel
                     | UiAction::Cycle(_)
                     | UiAction::Network(_)
@@ -438,7 +486,10 @@ impl Model {
 
     /// Begin a new provider draft without changing playback or network ownership.
     fn open(&mut self, provider: Provider, context: &ConfigurationContext) {
+        self.placement_modal = None;
+
         self.revision = self.revision.wrapping_add(1);
+
         let draft = ConfigurationDraft::new(provider, context);
         let editors = draft
             .fields
@@ -461,6 +512,7 @@ impl Model {
 
     /// Discard modal state and transient menus; no provider intent is emitted.
     fn close(&mut self) {
+        self.placement_modal = None;
         self.revision = self.revision.wrapping_add(1);
         if let Some(Modal {
             draft: ModalDraft::Configuration(draft),
@@ -475,6 +527,7 @@ impl Model {
 
     /// Open live source controls with fresh, ephemeral name and API-key editors.
     fn open_sources(&mut self, listen_address: &str) {
+        self.placement_modal = None;
         self.revision = self.revision.wrapping_add(1);
         self.modal = Some(Modal {
             draft: ModalDraft::Sources(SourcesDraft::default()),
@@ -588,6 +641,7 @@ impl Model {
     fn editor(&mut self, field: Field) -> Option<&mut Editor> {
         match field {
             Field::Search => Some(&mut self.query),
+            Field::Placement(index) => self.placement_modal.as_mut()?.editors.get_mut(index),
             Field::Configuration(index) => {
                 let modal = self.modal.as_mut()?;
                 if let ModalDraft::Configuration(draft) = &modal.draft {
@@ -669,7 +723,7 @@ fn scrollbar(
     mut bodies: Query<&mut ScrollPosition, With<CatalogBody>>,
     mouse: Res<ButtonInput<MouseButton>>,
 ) {
-    if !mouse.pressed(MouseButton::Left) || model.modal.is_some() {
+    if !mouse.pressed(MouseButton::Left) || model.has_modal() {
         model.dragging = false;
         return;
     }
@@ -942,12 +996,46 @@ fn buttons(
     runtime: Res<Runtime>,
     monitors: Query<(Entity, &bevy::window::Monitor)>,
 ) {
+    model.sync_placements(PlacementScope::current(&runtime, &network));
     for action in &std::mem::take(&mut pending.0) {
         if !model.allows(action) {
             continue;
         }
         model.revision = model.revision.wrapping_add(1);
         match action {
+            UiAction::Play(clip_id) => {
+                model.focus = None;
+                actions.0.push_back(model.play_action(clip_id));
+            }
+            UiAction::EditPlacement(clip_id) => model.open_placement(clip_id, &runtime, &network),
+            UiAction::ResetPlacement => {
+                if let Some(modal) = &mut model.placement_modal {
+                    modal.reset();
+                }
+                model.focus = None;
+            }
+            UiAction::PresetPlacement(preset) => {
+                if let Some(modal) = &mut model.placement_modal {
+                    preset.apply(modal);
+                }
+                model.focus = None;
+            }
+            UiAction::StepPlacement(index, direction) => {
+                if let Some(modal) = &mut model.placement_modal {
+                    modal.step(*index, *direction);
+                }
+                model.focus = None;
+            }
+            UiAction::ApplyPlacement(send) => {
+                let snapshot = if runtime.destination == Destination::Remote {
+                    network.snapshot.as_ref()
+                } else {
+                    Some(&runtime.snapshot)
+                };
+                if let Some(snapshot) = snapshot {
+                    actions.0.extend(model.apply_placement(snapshot, *send));
+                }
+            }
             UiAction::Runtime(action) => {
                 model.focus = None;
                 model.dropdown = None;
@@ -1178,6 +1266,7 @@ fn buttons(
                     .push_back(crate::network_app::NetworkAction::Disconnect);
             }
         }
+
         if let Some(field) = model.focus {
             if let Some(entity) = model.editor(field).and_then(|editor| editor.entity) {
                 focus.set(entity, FocusCause::Pressed);
@@ -1222,12 +1311,12 @@ fn scroll(
         position.y = model.scroll;
     }
     // Clamp modal bounds on resize even when no wheel message arrives.
-    if let Some(modal) = &mut model.modal {
+    if let Some(scroll) = model.modal_scroll() {
         for (node, mut position) in &mut bodies {
             let maximum =
                 ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
-            modal.scroll = modal.scroll.clamp(0., maximum);
-            position.y = modal.scroll;
+            *scroll = scroll.clamp(0., maximum);
+            position.y = *scroll;
         }
     }
     for event in wheel.read() {
@@ -1238,12 +1327,12 @@ fn scroll(
             bevy::input::mouse::MouseScrollUnit::Line => event.y * 40.,
             bevy::input::mouse::MouseScrollUnit::Pixel => event.y / scale_factor,
         };
-        if let Some(modal) = &mut model.modal {
+        if let Some(scroll) = model.modal_scroll() {
             for (node, mut position) in &mut bodies {
                 let maximum =
                     ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.);
-                modal.scroll = (position.y - delta).clamp(0., maximum);
-                position.y = modal.scroll;
+                *scroll = (position.y - delta).clamp(0., maximum);
+                position.y = *scroll;
             }
         } else if delta != 0. {
             model.dropdown = None;

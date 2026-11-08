@@ -61,7 +61,7 @@ def operator_lock(state_dir: Path):
 def setup() -> None:
     """Install locked dependencies and regenerate the committed provider bindings."""
     subprocess.run(['uv', 'sync', '--locked', '--project', str(ROOT)], check=True)
-    subprocess.run(['npm', 'ci', '--ignore-scripts'], cwd=ROOT, check=True)
+    subprocess.run(['npm', 'ci', '--ignore-scripts', '--engine-strict'], cwd=ROOT, check=True)
     subprocess.run(['npm', 'exec', '--', 'cdktn', 'get'], cwd=ROOT,
                    env={**os.environ, 'TERRAFORM_BINARY_NAME': 'tofu'}, check=True)
 

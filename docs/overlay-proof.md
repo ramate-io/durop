@@ -3,7 +3,7 @@
 Run from the checkout with `nix develop --command cargo run --locked` on a
 logged-in Apple Silicon Mac. The terminal is the local safety control surface;
 keep it attached. This proof adds no media decoder, networking, or production UI.
-One Bevy App owns the normal panel and a hidden borderless overlay window. Each
+One Bevy App owns the normal panel and an initially hidden borderless overlay window. Each
 camera targets its own window and render layer. The PNG has an opaque pink square
 with a transparent center and margin. Its source dimensions are 256 × 256 pixels;
 it appears at 256 logical points before the optional pulse animation.
@@ -39,8 +39,12 @@ existing Monitor geometry, so this proof refreshes it from its native backend
 handles on window/event-loop updates.
 
 Idle rendering uses indefinite reactive low-power waits in both focus states.
-The overlay camera is disabled and its window hidden when empty. Static fixtures
-also use reactive waits. Fixture loading and the five-second animation temporarily
+Once native setup and valid display geometry are ready, the click-through overlay
+window and camera remain available between plays. An empty scene renders a
+transparent clear instead of hiding with an old drawable that could reappear on
+the next play. This does not request continuous idle frames; static fixtures
+also use reactive waits. Missing or invalid displays disable the surface.
+Fixture loading and the five-second animation temporarily
 use continuous updates in both focus states. This is redraw policy, not an idle
 power measurement; verify actual redraw/CPU behavior on the Mac.
 
@@ -75,8 +79,8 @@ scaling, game/window modes, capture application, and Git commit with the results
 Run the README formatting/check/test/clippy/build commands first.
 
 1. Launch once. Verify two application windows belong to the same `durop` process
-   in Activity Monitor, with a normal input-taking panel and initially hidden
-   overlay. Use `displays`, then `display N`, then `hold`. Confirm only the pink
+   in Activity Monitor, with a normal input-taking panel and an empty, transparent
+   overlay after native configuration. Use `displays`, then `display N`, then `hold`. Confirm only the pink
    fixture appears on the selected screen and panel text never appears there.
 2. Check both the center hole/margins and solid square: desktop pixels must show
    through transparent areas without a background rectangle. Click, drag, type,
@@ -127,7 +131,7 @@ Run the README formatting/check/test/clippy/build commands first.
    automatic clearing, and stop/reopen via terminal. Inspect the saved recording
    for correct alpha/no rectangle. Save a brief recording and attach it to the PR.
 7. With Instruments/Activity Monitor, compare empty, static `hold`, animated
-   `show`, and both windows hidden. Empty/static states should settle without
+   `show`, and the panel hidden with an empty overlay. Empty/static states should settle without
    continuous redraws; `show` should continue unfocused and return to idle.
 
 ## Validation record

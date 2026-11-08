@@ -71,7 +71,7 @@ fn prepare_editor(
         BorderColor::all(theme::RULE),
         TabIndex(match field {
             Field::Search => 0,
-            Field::Configuration(index) => index as i32,
+            Field::Configuration(index) | Field::Placement(index) => index as i32,
         }),
     ));
     if secret {
@@ -155,6 +155,24 @@ pub(super) fn prepare(
             focus.set(entity, FocusCause::Navigated);
         }
     }
+    if let Some(modal) = &mut model.placement_modal {
+        let mut first_new = None;
+        for (index, editor) in modal.editors.iter_mut().enumerate() {
+            let is_new = editor.entity.is_none();
+            let entity = prepare_editor(commands, editor, Field::Placement(index), false, fonts);
+            if is_new && first_new.is_none() {
+                first_new = Some(entity);
+            }
+            retained.push(entity);
+        }
+        if let Some(entity) = first_new
+            && !focus
+                .get()
+                .is_some_and(|entity| retained[1..].contains(&entity))
+        {
+            focus.set(entity, FocusCause::Navigated);
+        }
+    }
     for entity in existing {
         if !retained.contains(&entity) {
             // Detach first, so retirement has one owner rather than racing parent teardown.
@@ -165,7 +183,7 @@ pub(super) fn prepare(
         }
     }
     let search = model.query.entity.unwrap();
-    if model.modal.is_some() {
+    if model.has_modal() {
         commands
             .entity(search)
             .insert((InteractionDisabled, TabIndex(-1)));
@@ -259,7 +277,7 @@ pub(super) fn keyboard(
         Key::Control
     });
     if on.input.logical_key == Key::Escape {
-        if model.modal.is_some() || model.dropdown.is_some() {
+        if model.has_modal() || model.dropdown.is_some() {
             model.close();
             model.revision = model.revision.wrapping_add(1);
             focus.clear();
@@ -320,16 +338,18 @@ pub(super) fn keyboard(
         }
         return;
     }
-    if is_text || command || on.input.repeat || model.modal.is_some() || model.dropdown.is_some() {
+    if is_text || command || on.input.repeat || model.has_modal() || model.dropdown.is_some() {
         return;
     }
     if on.input.logical_key == Key::Space
         && runtime.destination == Destination::Local
         && let Some(index) = model.visible(&runtime.catalog.clips).first()
     {
+        let scope = PlacementScope::from_snapshot(false, &runtime.snapshot);
+        model.sync_placements(Some(scope));
         actions
             .0
-            .push_back(Action::Play(runtime.catalog.clips[*index].identity.clone()));
+            .push_back(model.play_action(&runtime.catalog.clips[*index].identity));
     }
 }
 
