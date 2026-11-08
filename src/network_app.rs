@@ -168,6 +168,8 @@ enum Update {
     CatalogReady(u64),
     // Admission/host outcome, distinct from backend Started or physical output.
     Outcome(u64, CommandOutcome),
+    // Retire optimistic playback only with a rejection or a fresh authoritative snapshot.
+    PlaySettled(u64, String, Option<HostSnapshot>),
     // Clear controller state and pending UI intentions for this generation only.
     Disconnected(u64, String),
 }
@@ -260,9 +262,21 @@ pub struct NetworkState {
     ticket: u64,
     // Bounded by ingress capacity; preserves each request's live guard and reply sender.
     pending: BTreeMap<u64, GuardedRequest>,
+    // Online UI plays awaiting rejection or the post-admission snapshot; bounded by transport queues.
+    queued_plays: BTreeMap<String, String>,
 }
 
 impl NetworkState {
+    /// Remote metadata and previews are still being fetched for the current connection.
+    pub(crate) fn catalog_loading(&self) -> bool {
+        self.connecting.is_some() || (self.connected && !self.remote_catalog_ready)
+    }
+
+    /// Clip identities admitted to the online queue but not yet reconciled with host state.
+    pub(crate) fn queued_remote_clips(&self) -> impl Iterator<Item = &str> {
+        self.queued_plays.values().map(String::as_str)
+    }
+
     #[cfg(test)]
     /// Construct the same bounded orchestration without a native window event loop.
     pub(crate) fn for_ui_test(snapshot: HostSnapshot) -> Self {
@@ -387,6 +401,7 @@ impl NetworkState {
             job.abort();
         }
         self.connected = false;
+        self.queued_plays.clear();
         self.snapshot = None;
         self.remote_catalog = None;
         self.remote_icons.clear();
@@ -726,6 +741,7 @@ impl NetworkState {
             client_generation: 0,
             ticket: 0,
             pending: BTreeMap::new(),
+            queued_plays: BTreeMap::new(),
         }
     }
 }
@@ -794,12 +810,25 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
                     network.status = "Remote unavailable; command not sent".into();
                     continue;
                 }
-                if network
+                let clip = match &command {
+                    PlaybackCommand::Play { clip_id }
+                    | PlaybackCommand::PlayVisual { clip_id, .. } => Some(clip_id.clone()),
+                    _ => None,
+                };
+                match network
                     .controller
                     .as_mut()
-                    .is_none_or(|controller| controller.submit_command(command).is_err())
+                    .ok_or(ControllerAdmissionError::Unavailable)
+                    .and_then(|controller| controller.submit_command(command))
                 {
-                    network.status = "Remote busy or disconnected; command not queued".into();
+                    Ok(id) => {
+                        if let Some(clip) = clip {
+                            network.queued_plays.insert(id, clip);
+                        }
+                    }
+                    Err(_) => {
+                        network.status = "Remote busy or disconnected; command not queued".into()
+                    }
                 }
             }
             action => network.source_action(action),
@@ -895,6 +924,17 @@ fn dispatch(mut network: ResMut<NetworkState>, mut runtime: ResMut<Runtime>) {
                         format!("Remote command rejected: {reason:?}")
                     }
                 }
+            }
+            Update::PlaySettled(generation, id, snapshot)
+                if generation == network.client_generation =>
+            {
+                if let Some(snapshot) = snapshot {
+                    if runtime.destination == crate::app::Destination::Remote {
+                        network.snapshots.send_replace(snapshot.clone());
+                    }
+                    network.snapshot = Some(snapshot);
+                }
+                network.queued_plays.remove(&id);
             }
             Update::Disconnected(generation, error) if generation == network.client_generation => {
                 network.disconnect();
@@ -1143,6 +1183,11 @@ async fn controller_connected(
         if !request.is_active() {
             continue;
         }
+        let command_id = request.envelope.command_id.clone();
+        let play = matches!(
+            request.envelope.command,
+            PlaybackCommand::Play { .. } | PlaybackCommand::PlayVisual { .. }
+        );
         if request.epoch < cutoff {
             request.reply(CommandOutcome::Rejected {
                 reason: Rejection::Superseded,
@@ -1161,6 +1206,15 @@ async fn controller_connected(
             {
                 break;
             }
+            if !notify(
+                updates,
+                wake,
+                Update::PlaySettled(generation, command_id, None),
+            )
+            .await
+            {
+                break;
+            }
             continue;
         }
         let stop = matches!(request.envelope.command, PlaybackCommand::StopAll);
@@ -1174,8 +1228,31 @@ async fn controller_connected(
                     cutoff = cutoff.max(request.epoch);
                 }
                 refresh = true;
+                let accepted = matches!(outcome, CommandOutcome::Accepted { .. });
                 if !notify(updates, wake, Update::Outcome(generation, outcome)).await {
                     break;
+                }
+                if play {
+                    // Keep queued feedback until the host snapshot can replace it in the same UI update.
+                    let snapshot = if accepted {
+                        Some(
+                            client
+                                .refresh_snapshot()
+                                .await
+                                .map_err(|error| error.to_string())?,
+                        )
+                    } else {
+                        None
+                    };
+                    if !notify(
+                        updates,
+                        wake,
+                        Update::PlaySettled(generation, command_id, snapshot),
+                    )
+                    .await
+                    {
+                        break;
+                    }
                 }
             }
             Ok(None) => continue,
@@ -1197,6 +1274,15 @@ async fn controller_connected(
                 {
                     break;
                 }
+                if !notify(
+                    updates,
+                    wake,
+                    Update::PlaySettled(generation, command_id, None),
+                )
+                .await
+                {
+                    break;
+                }
             }
             Err(error) => return Err(error.to_string()),
         }
@@ -1209,6 +1295,121 @@ async fn controller_connected(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Admission feedback survives the asynchronous host roundtrip and is isolated by command and connection.
+    #[test]
+    fn queued_play_feedback_reconciles_rejection_snapshot_and_disconnect() {
+        let config = crate::app::Config::parse(["--mode".into(), "controller".into()]).unwrap();
+        let mut runtime = Runtime::new(&config).unwrap();
+        runtime.destination = crate::app::Destination::Remote;
+        let mut network = NetworkState::for_ui_test(runtime.snapshot.clone());
+        let mut snapshot = runtime.snapshot.clone();
+        snapshot.session_id = "remote-feedback".into();
+        let (connecting, mut mailbox) =
+            TailscaleControllerBackend::new().begin_connect("feedback".into());
+        network.controller = Some(connecting.connected(&snapshot));
+        network.snapshot = Some(snapshot.clone());
+        network.connected = true;
+        for _ in 0..2 {
+            network
+                .actions
+                .push_back(NetworkAction::RemoteCommand(PlaybackCommand::Play {
+                    clip_id: "pack/clip".into(),
+                }));
+        }
+        let mut app = App::new();
+        app.insert_resource(runtime)
+            .insert_resource(network)
+            .add_systems(bevy::prelude::Update, dispatch);
+        app.update();
+        let first = mailbox.normal.try_recv().unwrap().envelope.command_id;
+        let second = mailbox.normal.try_recv().unwrap().envelope.command_id;
+        assert_eq!(
+            app.world()
+                .resource::<NetworkState>()
+                .queued_remote_clips()
+                .count(),
+            2
+        );
+        let updates = app.world().resource::<NetworkState>().update_tx.clone();
+        updates
+            .try_send(super::Update::PlaySettled(99, first.clone(), None))
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<NetworkState>()
+                .queued_remote_clips()
+                .count(),
+            2,
+            "stale connection cannot clear a live request"
+        );
+        updates
+            .try_send(super::Update::PlaySettled(0, first, None))
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<NetworkState>()
+                .queued_remote_clips()
+                .count(),
+            1,
+            "reject only the corresponding request"
+        );
+        snapshot.sequence += 1;
+        snapshot.instances.push(crate::commands::InstanceSnapshot {
+            instance_id: "accepted-play".into(),
+            clip_id: "pack/clip".into(),
+            generation: 1,
+            state: crate::commands::InstanceState::Preparing,
+            placement: None,
+        });
+        updates
+            .try_send(super::Update::PlaySettled(
+                0,
+                second,
+                Some(snapshot.clone()),
+            ))
+            .unwrap();
+        app.update();
+        let network = app.world().resource::<NetworkState>();
+        assert_eq!(network.queued_remote_clips().count(), 0);
+        assert_eq!(
+            network.snapshot.as_ref().unwrap().instances,
+            snapshot.instances
+        );
+        assert_eq!(
+            network.snapshot.as_ref().unwrap().sequence,
+            snapshot.sequence,
+            "publish authority in the same update as retiring queue feedback"
+        );
+        app.world_mut()
+            .resource_mut::<NetworkState>()
+            .actions
+            .push_back(NetworkAction::RemoteCommand(PlaybackCommand::Play {
+                clip_id: "pack/clip".into(),
+            }));
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<NetworkState>()
+                .queued_remote_clips()
+                .count(),
+            1
+        );
+        app.world_mut()
+            .resource_mut::<NetworkState>()
+            .actions
+            .push_back(NetworkAction::Disconnect);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<NetworkState>()
+                .queued_remote_clips()
+                .count(),
+            0
+        );
+    }
 
     #[test]
     #[ignore = "explicit local timing capture; set DUROP_ACCEPTANCE_OUTPUT to a new private JSONL path"]

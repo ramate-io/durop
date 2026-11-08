@@ -3528,3 +3528,129 @@ fn measured_compact_placement_form_keeps_footer_and_last_content_visible() {
         }
     }
 }
+
+/// Hover darkens idle and active tiles without touching geometry, then restores the active surface.
+#[test]
+fn tile_feedback_darkens_surface_without_layout_changes() {
+    let mut app = App::new();
+    app.init_resource::<Model>()
+        .add_systems(Update, card_feedback);
+    let node = Node {
+        width: px(200),
+        height: px(240),
+        ..default()
+    };
+    let tile = app
+        .world_mut()
+        .spawn((
+            node.clone(),
+            Hovered(true),
+            CardFeedback { playing: false },
+            BackgroundColor(theme::PAPER),
+            BoxShadow::default(),
+        ))
+        .id();
+    app.update();
+    assert_eq!(
+        app.world().get::<BackgroundColor>(tile).unwrap().0,
+        theme::HOVER_PAPER
+    );
+    assert_eq!(app.world().get::<Node>(tile).unwrap(), &node);
+    app.world_mut()
+        .entity_mut(tile)
+        .insert(CardFeedback { playing: true });
+    app.update();
+    assert_eq!(
+        app.world().get::<BackgroundColor>(tile).unwrap().0,
+        theme::PLAYING_HOVER
+    );
+    app.world_mut().entity_mut(tile).insert(Hovered(false));
+    app.update();
+    assert_eq!(
+        app.world().get::<BackgroundColor>(tile).unwrap().0,
+        theme::PLAYING_PAPER
+    );
+    assert_eq!(app.world().get::<Node>(tile).unwrap(), &node);
+}
+
+/// Production cards remain orange during preparation and restore idle paint at terminal states.
+#[test]
+fn rendered_cards_highlight_preparation_and_expose_pointer_controls() {
+    let (mut app, _) = input_app();
+    let clip_id = {
+        let mut runtime = app.world_mut().resource_mut::<Runtime>();
+        runtime.destination = Destination::Local;
+        runtime.catalog = std::sync::Arc::new(
+            crate::catalog::load_local(&crate::app::resource_root().join("sample-packs/reactions"))
+                .unwrap(),
+        );
+        runtime.catalog.clips[0].identity.clone()
+    };
+    for state in [
+        crate::commands::InstanceState::Preparing,
+        crate::commands::InstanceState::Playing,
+        crate::commands::InstanceState::Failed,
+        crate::commands::InstanceState::Stopped,
+    ] {
+        {
+            let mut runtime = app.world_mut().resource_mut::<Runtime>();
+            runtime.snapshot.sequence += 1;
+            runtime.snapshot.instances = vec![crate::commands::InstanceSnapshot {
+                instance_id: "feedback-instance".into(),
+                clip_id: clip_id.clone(),
+                generation: 1,
+                state,
+                placement: None,
+            }];
+        }
+        app.update();
+        let active = app
+            .world_mut()
+            .query::<&CardFeedback>()
+            .iter(app.world())
+            .filter(|card| card.playing)
+            .count();
+        assert_eq!(active, usize::from(!state.is_terminal()));
+    }
+    let mut controls = app.world_mut().query::<(&UiAction, &EntityCursor)>();
+    assert!(controls.iter(app.world()).any(
+        |(action, cursor)| matches!(action, UiAction::Play(id) if id == &clip_id)
+            && *cursor == EntityCursor::System(SystemCursorIcon::Pointer)
+    ));
+}
+
+/// Loading remains visible with an existing collection and clears without replacing its viewport.
+#[test]
+fn catalog_loading_indicators_survive_existing_tiles_and_clear_on_completion() {
+    let (mut app, _) = input_app();
+    {
+        let mut runtime = app.world_mut().resource_mut::<Runtime>();
+        runtime.destination = Destination::Local;
+        runtime.catalog = std::sync::Arc::new(
+            crate::catalog::load_local(&crate::app::resource_root().join("sample-packs/reactions"))
+                .unwrap(),
+        );
+    }
+    app.update();
+    let body = app
+        .world_mut()
+        .query_filtered::<Entity, With<CatalogBody>>()
+        .single(app.world())
+        .unwrap();
+    for loading in [true, false] {
+        app.world_mut().resource_mut::<Runtime>().loading = loading;
+        app.update();
+        let mut texts = app.world_mut().query::<&Text>();
+        for label in ["Loading…", "LOADING CATALOG…"] {
+            assert_eq!(texts.iter(app.world()).any(|text| text.0 == label), loading);
+        }
+        assert!(
+            app.world_mut()
+                .query::<&CardFeedback>()
+                .iter(app.world())
+                .count()
+                > 0
+        );
+        assert!(app.world().get::<CatalogBody>(body).is_some());
+    }
+}

@@ -146,6 +146,7 @@ impl View<'_> {
                 .commands()
                 .spawn((
                     TextInput,
+                    EntityCursor::System(SystemCursorIcon::Text),
                     EditableText {
                         visible_lines: None,
                         allow_newlines: true,
@@ -240,6 +241,7 @@ impl View<'_> {
             .spawn((
                 Button,
                 ActivateOnPress,
+                EntityCursor::System(SystemCursorIcon::Pointer),
                 Hovered::default(),
                 action,
                 Node {
@@ -283,6 +285,7 @@ impl View<'_> {
                     .spawn((
                         Button,
                         ActivateOnPress,
+                        EntityCursor::System(SystemCursorIcon::Pointer),
                         Hovered::default(),
                         UiAction::Dropdown(menu),
                         Node {
@@ -395,8 +398,10 @@ impl View<'_> {
         layout: GridLayout,
         status: &str,
         stop: Option<&str>,
+        playing: bool,
         editable: bool,
     ) {
+        let feedback = CardFeedback { playing };
         parent
             .spawn((
                 Node {
@@ -410,17 +415,17 @@ impl View<'_> {
                     overflow: Overflow::clip(),
                     ..default()
                 },
-                BackgroundColor(PAPER),
-                BorderColor::all(RULE),
-                HoverColors {
-                    resting: PAPER,
-                    hovered: Color::srgb(0.969, 0.941, 0.871),
-                },
+                BackgroundColor(feedback.background(false)),
+                BorderColor::all(if playing { PLAYING_RULE } else { RULE }),
+                feedback.shadow(false),
+                feedback,
+                Hovered::default(),
             ))
             .with_children(|card| {
                 card.spawn((
                     Button,
                     ActivateOnPress,
+                    EntityCursor::System(SystemCursorIcon::Pointer),
                     Hovered::default(),
                     UiAction::Play(clip.identity.clone()),
                     Node {
@@ -484,6 +489,7 @@ impl View<'_> {
                         row.spawn((
                             Button,
                             ActivateOnPress,
+                            EntityCursor::System(SystemCursorIcon::Pointer),
                             Hovered::default(),
                             UiAction::Runtime(Action::Stop(instance.to_owned())),
                             Node {
@@ -524,6 +530,7 @@ impl View<'_> {
             .spawn((
                 Button,
                 ActivateOnPress,
+                EntityCursor::System(SystemCursorIcon::Pointer),
                 Hovered::default(),
                 action,
                 Node {
@@ -595,6 +602,7 @@ impl View<'_> {
                         row.spawn((
                             Button,
                             ActivateOnPress,
+                            EntityCursor::System(SystemCursorIcon::Pointer),
                             Hovered::default(),
                             action,
                             node,
@@ -1022,7 +1030,8 @@ impl View<'_> {
             GlobalZIndex(100), Pickable::default(),
         )).with_children(|backdrop| {
             // The cancel target is a sibling, so editor and control events never cancel the form.
-            backdrop.spawn((Button, ActivateOnPress, UiAction::Cancel, Node {
+            backdrop.spawn((Button, ActivateOnPress,
+                EntityCursor::System(SystemCursorIcon::Pointer), UiAction::Cancel, Node {
                 position_type: PositionType::Absolute, width: percent(100), height: percent(100), ..default()
             }));
             backdrop.spawn((GlobalZIndex(101), TabGroup::modal(), Node {
@@ -1154,6 +1163,7 @@ impl View<'_> {
             backdrop.spawn((
                 Button,
                 ActivateOnPress,
+                EntityCursor::System(SystemCursorIcon::Pointer),
                 UiAction::Cancel,
                 Node { position_type: PositionType::Absolute, width: percent(100), height: percent(100), ..default() },
             ));
@@ -1640,6 +1650,11 @@ pub(super) fn render(
     model.reconcile_sources(&network);
 
     let remote = runtime.destination == Destination::Remote;
+    let catalog_loading = if remote {
+        network.catalog_loading()
+    } else {
+        runtime.loading
+    };
     let compact = primary.width() < 840.;
     // Three minimum-width selectors need another row below a 534-pixel window.
     let toolbar_height = GridLayout::toolbar_height(primary.width());
@@ -1711,7 +1726,7 @@ pub(super) fn render(
     let brand_signature = format!("{}", primary.width() >= 620.);
     let header_signature = |model: &Model| {
         format!(
-            "{:?}|{}|{}|{}|{}|{}|{:?}",
+            "{:?}|{}|{}|{}|{}|{}|{:?}|{catalog_loading}",
             model.dropdown,
             primary.width(),
             remote,
@@ -1728,7 +1743,7 @@ pub(super) fn render(
             model.query.entity
         )
     };
-    let section_signature = format!("{remote}|{}", model.matches);
+    let section_signature = format!("{remote}|{}|{catalog_loading}", model.matches);
     let collection_signature = format!(
         "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
         model.query.text,
@@ -1745,7 +1760,11 @@ pub(super) fn render(
         runtime.loading,
         runtime.errors.keys().collect::<Vec<_>>()
     );
-    let collection_signature = format!("{collection_signature}|{remote}|{}", network.connected);
+    let collection_signature = format!(
+        "{collection_signature}|{remote}|{}|{:?}|{catalog_loading}",
+        network.connected,
+        network.queued_remote_clips().collect::<Vec<_>>()
+    );
     let footer_signature = format!(
         "{remote}|{}|{}|{}",
         runtime.status, network.status, network.connected
@@ -1860,7 +1879,9 @@ pub(super) fn render(
                 model.dropdown == Some(Dropdown::To),
                 if compact { provider_width } else { 170. },
             );
-            let catalog_label = if remote {
+            let catalog_label = if catalog_loading {
+                "Loading…"
+            } else if remote {
                 "Remote catalog"
             } else if runtime.pack_input.starts_with("https://") {
                 "Git repository"
@@ -1919,16 +1940,31 @@ pub(super) fn render(
         &mut focus,
         section_signature.clone(),
         |view, section| {
-            view.label(
-                section,
-                if remote {
-                    "REMOTE COLLECTION"
-                } else {
-                    "YOUR COLLECTION"
-                },
-                10.,
-                PURPLE,
-            );
+            if catalog_loading {
+                section
+                    .spawn((
+                        Node {
+                            height: px(22),
+                            padding: UiRect::horizontal(px(8)),
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(px(4)),
+                            ..default()
+                        },
+                        BackgroundColor(YELLOW.with_alpha(0.30)),
+                    ))
+                    .with_children(|badge| view.label(badge, "LOADING CATALOG…", 10., INK));
+            } else {
+                view.label(
+                    section,
+                    if remote {
+                        "REMOTE COLLECTION"
+                    } else {
+                        "YOUR COLLECTION"
+                    },
+                    10.,
+                    PURPLE,
+                );
+            }
             view.label(section, format!("{} REACTIONS", model.matches), 10., MUTED);
         },
     );
@@ -1953,7 +1989,7 @@ pub(super) fn render(
                 .with_children(|empty| {
                     view.title(
                         empty,
-                        if runtime.loading {
+                        if catalog_loading {
                             "Gathering your collection…"
                         } else if remote && !network.connected {
                             "Connect your host"
@@ -1965,7 +2001,9 @@ pub(super) fn render(
                     );
                     view.label(
                         empty,
-                        if remote && !network.connected {
+                        if catalog_loading {
+                            "Fetching media and previews. This may take a moment."
+                        } else if remote && !network.connected {
                             "Choose To → Remote host to enter its IP and Durop pairing token."
                         } else {
                             "Try another search or choose a catalog above."
@@ -2033,6 +2071,18 @@ pub(super) fn render(
                             model.layout,
                             status,
                             active.map(|instance| instance.instance_id.as_str()),
+                            (!remote || network.connected)
+                                && (snapshot.instances.iter().any(|instance| {
+                                    instance.clip_id == clip.identity
+                                        && matches!(
+                                            instance.state,
+                                            crate::commands::InstanceState::Preparing
+                                                | crate::commands::InstanceState::Playing
+                                        )
+                                }) || (remote
+                                    && network
+                                        .queued_remote_clips()
+                                        .any(|id| id == clip.identity))),
                             if remote {
                                 network
                                     .remote_catalog

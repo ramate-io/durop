@@ -222,11 +222,11 @@ impl TailscaleControllerBackend<Connected> {
         }
     }
 
-    /// Create a fresh online command identity and admit it through the shared trait.
+    /// Admit through the shared trait and return the command identity for queue feedback correlation.
     pub(super) fn submit_command(
         &mut self,
         command: PlaybackCommand,
-    ) -> Result<(), ControllerAdmissionError> {
+    ) -> Result<String, ControllerAdmissionError> {
         self.state.next_command = self
             .state
             .next_command
@@ -242,7 +242,9 @@ impl TailscaleControllerBackend<Connected> {
             catalog_revision: self.state.catalog_revision.clone(),
             command,
         };
-        self.submit(envelope)
+        let command_id = envelope.command_id.clone();
+        self.submit(envelope)?;
+        Ok(command_id)
     }
 
     /// End admission and revoke the lease on already queued work before dropping lanes.

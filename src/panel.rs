@@ -27,12 +27,15 @@ use bevy::{
         FocusCause, FocusedInput, InputFocus,
         tab_navigation::{TabGroup, TabIndex, TabNavigationPlugin},
     },
-    picking::hover::Hovered,
+    picking::{
+        cursor::{CursorIconPlugin, EntityCursor},
+        hover::Hovered,
+    },
     prelude::*,
     text::{EditableText, EditableTextFilter, EditableTextSystems, TextCursorStyle},
     ui::{InteractionDisabled, Pressed},
     ui_widgets::{Activate, ActivateOnPress, Button, TextInput},
-    window::{PrimaryWindow, WindowRef},
+    window::{PrimaryWindow, SystemCursorIcon, WindowRef},
 };
 use configuration::{
     CatalogProvider, ConfigurationContext, ConfigurationDraft, ConfigurationIntent, DisplayChoice,
@@ -397,6 +400,42 @@ struct HoverColors {
     resting: Color,
     /// Accent used for hovered and pressed surfaces.
     hovered: Color,
+}
+
+/// Card-level feedback follows queued/preparing playback and descendant pointer hover.
+#[derive(Component)]
+struct CardFeedback {
+    /// True while playback is queued, preparing or playing at the selected destination.
+    playing: bool,
+}
+
+impl CardFeedback {
+    /// Choose a warm surface independently of pointer position so playback stays visible.
+    fn background(&self, hovered: bool) -> Color {
+        match (self.playing, hovered) {
+            (true, true) => theme::PLAYING_HOVER,
+            (true, false) => theme::PLAYING_PAPER,
+            (false, true) => theme::HOVER_PAPER,
+            (false, false) => theme::PAPER,
+        }
+    }
+
+    /// Shadows change paint only; no size or position changes can disturb scrolling or text.
+    fn shadow(&self, hovered: bool) -> BoxShadow {
+        if self.playing {
+            BoxShadow::new(
+                theme::PLAYING_GLOW,
+                px(0),
+                px(0),
+                px(1),
+                px(if hovered { 12 } else { 8 }),
+            )
+        } else if hovered {
+            BoxShadow::new(theme::HOVER_SHADOW, px(0), px(3), px(0), px(10))
+        } else {
+            BoxShadow::default()
+        }
+    }
 }
 
 impl Model {
@@ -786,6 +825,29 @@ fn hover(mut widgets: Query<(&Hovered, Has<Pressed>, &HoverColors, &mut Backgrou
     }
 }
 
+/// Paint whole-card hover feedback, including previews, selectable titles and controls.
+fn card_feedback(
+    model: Res<Model>,
+    mut cards: Query<(
+        &Hovered,
+        &CardFeedback,
+        &mut BoxShadow,
+        &mut BackgroundColor,
+    )>,
+) {
+    for (hovered, feedback, mut shadow, mut background) in &mut cards {
+        let hovered = hovered.get() && !model.has_modal();
+        let color = feedback.background(hovered);
+        if background.0 != color {
+            background.0 = color;
+        }
+        let desired = feedback.shadow(hovered);
+        if *shadow != desired {
+            *shadow = desired;
+        }
+    }
+}
+
 /// Cache decoded thumbnail handles and failed loads by clip identity.
 #[derive(Resource, Default)]
 struct Icons(BTreeMap<String, Option<Handle<Image>>>);
@@ -840,7 +902,7 @@ struct PanelCamera(Entity);
 pub struct PanelPlugin;
 impl Plugin for PanelPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(TabNavigationPlugin)
+        app.add_plugins((TabNavigationPlugin, CursorIconPlugin))
             .add_observer(input::activate)
             .add_observer(input::keyboard)
             .init_resource::<input::PendingActions>()
@@ -857,7 +919,14 @@ impl Plugin for PanelPlugin {
             )
             .add_systems(
                 Update,
-                (scroll, scrollbar, scroll_thumb, hover, terminal)
+                (
+                    scroll,
+                    scrollbar,
+                    scroll_thumb,
+                    hover,
+                    card_feedback,
+                    terminal,
+                )
                     .chain()
                     .before(crate::app::actions),
             )
