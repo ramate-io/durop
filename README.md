@@ -3,9 +3,10 @@
 Durop plays local media drops through a transparent macOS overlay, with a searchable
 pack catalog and optional authenticated remote control over Tailscale.
 
-The POC targets Apple Silicon macOS 14+. Normal desktop playback is supported;
-native fullscreen overlays remain unsupported. See the [acceptance record](docs/acceptance.md)
-for remaining audio, recording, input-focus and two-Mac qualification.
+The POC targets Apple Silicon macOS 14+. A native macOS panel presents overlays
+above the Dock and across fullscreen Spaces. This is verified with TextEdit on
+macOS 27.0.1; games and mixed displays still need qualification. See the
+[overlay proof](docs/overlay-proof.md) and [acceptance record](docs/acceptance.md).
 
 ## Run
 

@@ -138,7 +138,9 @@ impl Plugin for OverlayPlugin {
                 (read_controls, apply_controls, sync_overlay).chain(),
             );
         #[cfg(target_os = "macos")]
-        app.add_systems(PreUpdate, macos::configure);
+        app.init_non_send::<macos::NativeOverlay>()
+            .add_systems(PreUpdate, macos::configure)
+            .add_systems(Update, macos::synchronize.after(sync_overlay));
         #[cfg(not(target_os = "macos"))]
         app.add_systems(PreUpdate, mark_ready);
     }
@@ -422,8 +424,10 @@ pub(crate) fn sync_overlay(
     // An active camera instead clears removed sprites with Color::NONE, while
     // reactive idle settings still avoid continuous rendering between inputs.
     let visible = display_ready && window.1;
-    if window.0.visible != visible {
-        window.0.visible = visible;
+    // macOS renders into its own NSPanel; the winit event/size owner stays hidden.
+    let owner_visible = visible && !cfg!(target_os = "macos");
+    if window.0.visible != owner_visible {
+        window.0.visible = owner_visible;
     }
     if camera.is_active != visible {
         camera.is_active = visible;
@@ -558,7 +562,8 @@ mod tests {
         }
         app.update();
         let bounds = app.world().get::<Window>(window).unwrap();
-        assert!(bounds.visible);
+        assert_eq!(bounds.visible, !cfg!(target_os = "macos"));
+        assert!(app.world().get::<Camera>(camera).unwrap().is_active);
         assert_eq!(bounds.resolution.physical_width(), 3024);
         assert_eq!(bounds.resolution.width(), 1512.0);
         assert_eq!(bounds.position, WindowPosition::At(IVec2::new(-3024, 0)));
@@ -667,7 +672,11 @@ mod tests {
                 playback.busy = busy;
             }
             app.update();
-            assert!(app.world().get::<Window>(window).unwrap().visible);
+            // macOS presents a separate NSPanel while retaining a hidden winit owner.
+            assert_eq!(
+                app.world().get::<Window>(window).unwrap().visible,
+                !cfg!(target_os = "macos")
+            );
             let camera = app.world().get::<Camera>(camera).unwrap();
             assert!(camera.is_active);
             assert!(

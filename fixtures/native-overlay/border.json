@@ -1,0 +1,15 @@
+{
+  "id": "border",
+  "title": "Transparent border proof",
+  "asset": "border.gif",
+  "playback": {
+    "retrigger": "restart",
+    "loop": true,
+    "maxDurationMs": 600000
+  },
+  "visual": {
+    "anchor": "center",
+    "widthFraction": 1.0,
+    "fit": "cover"
+  }
+}
