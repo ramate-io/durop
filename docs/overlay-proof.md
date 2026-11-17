@@ -2,8 +2,9 @@
 
 Run from the checkout with `nix develop --command cargo run --locked` on a
 logged-in Apple Silicon Mac. The terminal is the local safety control surface;
-keep it attached. This proof adds no media decoder, networking, or production UI.
-One Bevy App owns the normal panel and an initially hidden borderless overlay window. Each
+keep it attached. The application includes media, networking and the normal controller UI.
+One Bevy App owns the normal panel and overlay; macOS renders the latter through
+a separate nonactivating native panel backed by a hidden winit event window. Each
 camera targets its own window and render layer. The PNG has an opaque pink square
 with a transparent center and margin. Its source dimensions are 256 × 256 pixels;
 it appears at 256 logical points before the optional pulse animation.
@@ -14,7 +15,7 @@ it appears at 256 logical points before the optional pulse animation.
 | --- | --- | --- |
 | Space | `show` | Pulse the fixture for five seconds, including while unfocused |
 | — | `hold` | Keep a static fixture visible until stopped |
-| Escape | `stop` | Hide overlay and disable its camera |
+| Escape | `stop` | Clear playback/fixture to transparency |
 | D | `next` | Cycle the selected display |
 | — | `displays` | Print current display indexes, pixel bounds, and scales |
 | — | `display N` | Select an index from the latest display listing |
@@ -50,27 +51,33 @@ power measurement; verify actual redraw/CPU behavior on the Mac.
 
 ## macOS boundary
 
-`src/overlay_macos.rs` configures only the overlay, on the AppKit main thread,
-before allowing it to become visible. Three method adapters on `WinitWindow`
-check a per-instance associated marker: overlays refuse key/main-window status
-and map `makeKeyAndOrderFront:` to `orderFront:`; unmarked panel windows forward
-to the original implementations. Inherited methods are overridden only on
-`WinitWindow`, leaving `NSWindow` itself unchanged. The adapter preserves every
-window's original class (ISA): replacing the class of an initialized AppKit
-window caused a computed-property assertion on macOS 27.0.1. A native Objective-C
-dispatch regression checks marked/unmarked instances, inherited method isolation
-and unchanged classes; desktop acceptance must additionally exercise real windows.
-It also disables mouse handling and shadows and requests all Spaces,
-stationary/fullscreen-auxiliary behavior. The overlay uses a transparent clear
-color and macOS post-multiplied surface alpha.
+`src/overlay_macos.rs` creates a genuine borderless, nonactivating `NSPanel`
+with a plain render `NSView`. It redirects Bevy's overlay surface handle before
+first extraction, retaining the hidden winit window for ownership, dimensions
+and event-loop updates. The normal controller window is unchanged. See the
+[ownership contract](architecture.md#macos-overlay-surface).
 
-These flags do not prove support for native fullscreen games, exclusive display
-modes, or every Spaces configuration. The adapter is coupled to winit 0.30.13's
-NSWindow policy: review it when upgrading Bevy/winit. Linux checks cannot prove
-macOS focus, compositing, controller routing, capture, or fullscreen behavior.
-The backend itself documents a possible monitor-unplug panic on some platforms;
-the application handles removal once the backend reports it, but cannot catch a
-backend event-loop crash. Record any reproduction as unsupported.
+The panel's subclass is registered **before allocation**. It refuses key/main
+window status and prevents AppKit from constraining its frame to the visible
+work area. No initialized window changes class; no winit class is swizzled.
+The panel ignores mouse events, stays visible when the app deactivates, and uses
+`orderFrontRegardless` without activation or key-window calls. `NSScreen.frame`
+is selected by native display ID, with AppKit's logical coordinates. The public
+status-window level is above the Dock (observed 25 vs. 20), without changing
+Dock preferences or application-wide presentation options. Transparent pixels
+naturally reveal underlying content; opaque pixels can cover the Dock/menu bar.
+
+`CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary` now apply
+to this native panel. They were insufficient on the previous winit NSWindow.
+The implementation preserves transparent clear and post-multiplied surface alpha.
+API references: [NSPanel](https://developer.apple.com/documentation/appkit/nspanel),
+[fullscreen auxiliary](https://developer.apple.com/documentation/appkit/nswindow/collectionbehavior-swift.struct/fullscreenauxiliary),
+[window levels](https://developer.apple.com/documentation/coregraphics/cgwindowlevel).
+
+These contracts are not a promise about every game, exclusive display mode or
+macOS version. Native evidence below qualifies one environment. Linux tests cannot
+prove AppKit compositing/focus. Recheck surface creation/ownership on Bevy/winit
+upgrades, and physical display removal on the actual hardware.
 
 ## Manual acceptance procedure (Mac required)
 
@@ -78,9 +85,8 @@ Record the macOS version, Mac/GPU, display arrangement, physical resolutions,
 scaling, game/window modes, capture application, and Git commit with the results.
 Run the README formatting/check/test/clippy/build commands first.
 
-1. Launch once. Verify two application windows belong to the same `durop` process
-   in Activity Monitor, with a normal input-taking panel and an empty, transparent
-   overlay after native configuration. Use `displays`, then `display N`, then `hold`. Confirm only the pink
+1. Launch once. Verify one `durop` process owns the normal input-taking controller,
+   hidden winit overlay owner and separate transparent native overlay panel. Use `displays`, then `display N`, then `hold`. Confirm only the pink
    fixture appears on the selected screen and panel text never appears there.
 2. Check both the center hole/margins and solid square: desktop pixels must show
    through transparent areas without a background rectangle. Click, drag, type,
@@ -134,7 +140,7 @@ Run the README formatting/check/test/clippy/build commands first.
    `show`, and the panel hidden with an empty overlay. Empty/static states should settle without
    continuous redraws; `show` should continue unfocused and return to idle.
 
-## Validation record
+## Historical validation record (previous NSWindow implementation)
 
 Cloud Linux (Rust 1.95.0) passed `cargo fmt --all -- --check`,
 `cargo check --locked`, `cargo test --locked` (five tests),
@@ -199,9 +205,9 @@ the public
 flag on the same native-fullscreen TextEdit Space. Frames at 3, 10, 20 and 30
 seconds again showed no fixture; an independent NSWorkspace query reported
 `com.apple.TextEdit` frontmost during `hold`. The ineffective candidate flag was
-removed. Native-fullscreen presentation is unsupported in this observed
-configuration; the retained implementation is the `6929aef` ISA fix and original
-collection behavior flags.
+removed. Native-fullscreen presentation was unsupported with that NSWindow implementation.
+The new NSPanel result below supersedes this limitation for the tested TextEdit
+configuration; the failed experiment remains useful evidence against flags alone.
 
 Beyond normal-desktop compositing, pulse/clearing and local safety controls,
 click/keyboard/controller passthrough, focus retention under an unfocused
@@ -211,3 +217,75 @@ Game/controller cases were not exercised; only one non-Retina display was
 available to this run. Compilation and
 logic checks do not satisfy those runtime acceptance items. Record the remaining
 device results before declaring #2 complete.
+
+## Native panel validation (2026-11-11)
+
+Environment: macOS **27.0.1 (26A434)**; Mac mini **Mac16,11**, M4 Pro,
+12 CPU/16 GPU cores, 48 GB RAM; one **MSI MP161 E2, 1920 × 1080 at 60 Hz**,
+scale 1, origin (0,0). Target application: system TextEdit, normal desktop,
+maximized window and native fullscreen Space. No game/controller or second
+monitor was available to this run.
+
+Source: `codex/macos-native-overlay` based on `04a01f1`. The exercised debug
+executable SHA-256 was
+`011f082eeac9467fce85203c1d60f0ad04fa4003aa378c0236af844279775d1b`.
+A temporary `.app` wrapper supplied identity/resources for desktop automation;
+it ran the one Durop binary and was not distribution-package validation.
+The committed [probe pack](../fixtures/native-overlay) is the exact GIF/metadata
+used, with an opaque magenta border and transparent center. Reproduce with:
+
+```sh
+nix develop --command cargo run --locked -- --pack fixtures/native-overlay
+# Attached terminal:
+hide
+play native-proof/border
+stop
+play native-proof/border
+displays
+display 0
+panel
+quit
+```
+
+Trigger through the attached terminal/remote controller while TextEdit remains
+frontmost. Inspect whole-display screenshots, not TextEdit-only screenshots:
+app-window captures omit the overlay. The fixture loops for at most ten minutes.
+Screenshots are retained locally, excluded from the published branch because
+they contain desktop content. The published window audits contain only the
+selected display geometry and TextEdit/Durop/Dock window metadata, without
+document titles or contents. Rendering observations below were made from the
+local screenshots; the audit text alone does not prove rendered pixels.
+
+| Case | Observed result |
+| --- | --- |
+| Normal desktop | Opaque border reaches every screen edge; transparent center shows underlying windows. Raw desktop captures remain local because unrelated windows were visible. |
+| Maximized TextEdit and Dock | Locally reviewed active/cleared screenshots: the opaque bottom border covers the Dock, which reappears after stop. Full 1920 × 1080 panel at level 25; Dock level 20. |
+| TextEdit native fullscreen Space | Locally reviewed active/cleared screenshots: actual border rendering, transparent center and clearing. The fullscreen document occupies the separate Space, without desktop window chrome. |
+| Unfocused terminal trigger | `NSWorkspace.frontmostApplication` reported TextEdit immediately before and after the fullscreen play command, without intervening UI input. [Window audit](evidence/native-panel-2026-11-11/fullscreen-windows.txt) and [desktop audit](evidence/native-panel-2026-11-11/desktop-windows.txt) preserve post-trigger observations. These are samples, not continuous focus telemetry. |
+| Enter/exit fullscreen | Entered fullscreen while Durop was running; played there, stopped/replayed, then exited fullscreen during active playback. The border remained rendered on the desktop afterward. |
+| Repeated playback and clearing | Terminal stop removed the border; a second play rendered it again while TextEdit stayed fullscreen. |
+| Keyboard/mouse automation | Targeted click/text entry reached TextEdit during playback. Targeted automation can bypass ordinary hit testing or reactivate its target, so this does **not** establish physical mouse/keyboard/controller passthrough. |
+| Panel and shutdown | Terminal `panel` reopened the normal controller after hidden playback; accessibility reported its standard window/buttons. Terminal `quit` exited status 0 with no crash. |
+| Monitor selection | `displays` reported the one monitor, and `display 0` was accepted. No physical multi-monitor or hotplug claim. |
+
+The Control-Left/Right automation did not produce an observable Space change;
+independent switching between existing Spaces remains **unverified**. Dock
+accessibility timed out, so **Dock-click reopening and normal panel interaction**
+still need a manual regression check, despite terminal reopening succeeding.
+Desktop automation also intermittently reported a locked session/stalled; results
+above use the subsequently unlocked, observable TextEdit session. No Dock settings,
+macOS protections or user activation policies were changed.
+
+Unverified: physical click/drag/scroll and keyboard passthrough, real game or
+controller input, exclusive fullscreen, other apps/macOS versions, multiple
+Spaces switching, mixed DPI/negative-position monitors, hotplug, recording/video
+smoothness, long-running resource use, and production `.app` signing/packaging.
+For an unqualified game, use its windowed/maximized mode as the best verified
+presentation fallback, and perform the physical-input checks before relying on it.
+
+Native workspace fmt/check/test/clippy (`-D warnings`), rustdoc (`-D warnings`),
+build and Python checks passed. Rust: **199 passed, 3 explicit probes ignored**;
+Python: **14 passed**. The updated display-removal and stop/replay tests verify
+that the macOS winit owner stays hidden while the camera remains active, and
+invalid geometry disables presentation. These tests do not substitute for
+actual native screenshots or the outstanding input/hardware checks.

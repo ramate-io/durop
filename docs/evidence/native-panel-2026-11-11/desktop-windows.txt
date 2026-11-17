@@ -1,0 +1,98 @@
+frontmost=com.apple.TextEdit pid=67521
+screens=["MSI MP161 E2:(0.0, 0.0, 1920.0, 1080.0) scale=1.0"]
+["owner": TextEdit, "id": 8217, "bounds": {
+    Height = 20;
+    Width = 66;
+    X = 6;
+    Y = 36;
+}, "level": 0, "onscreen": 1]
+["owner": Durop Native Overlay Preview, "id": 8157, "bounds": {
+    Height = 1080;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 25, "onscreen": 1]
+["owner": Durop Native Overlay Preview, "id": 8156, "bounds": {
+    Height = 1080;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 3, "onscreen": false]
+["owner": Durop Native Overlay Preview, "id": 8154, "bounds": {
+    Height = 500;
+    Width = 500;
+    X = 0;
+    Y = 580;
+}, "level": 0, "onscreen": false]
+["owner": Durop Native Overlay Preview, "id": 8151, "bounds": {
+    Height = 30;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 0, "onscreen": false]
+["owner": Durop Native Overlay Preview, "id": 8150, "bounds": {
+    Height = 30;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 0, "onscreen": false]
+["owner": Durop Native Overlay Preview, "id": 8149, "bounds": {
+    Height = 848;
+    Width = 1160;
+    X = 380;
+    Y = 61;
+}, "level": 0, "onscreen": false]
+["owner": TextEdit, "id": 8144, "bounds": {
+    Height = 971;
+    Width = 1920;
+    X = 0;
+    Y = 30;
+}, "level": 0, "onscreen": 1]
+["owner": TextEdit, "id": 8107, "bounds": {
+    Height = 30;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 0, "onscreen": false]
+["owner": TextEdit, "id": 8105, "bounds": {
+    Height = 30;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 0, "onscreen": false]
+["owner": TextEdit, "id": 8103, "bounds": {
+    Height = 30;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 0, "onscreen": false]
+["owner": Durop Native Overlay Preview, "id": 8153, "bounds": {
+    Height = 30;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 0, "onscreen": false]
+["owner": Durop Native Overlay Preview, "id": 8152, "bounds": {
+    Height = 30;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 0, "onscreen": false]
+["owner": TextEdit, "id": 2325, "bounds": {
+    Height = 77;
+    Width = 84;
+    X = 107;
+    Y = 921;
+}, "level": 3, "onscreen": false]
+["owner": TextEdit, "id": 8101, "bounds": {
+    Height = 30;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 0, "onscreen": false]
+["owner": Dock, "id": 18, "bounds": {
+    Height = 1080;
+    Width = 1920;
+    X = 0;
+    Y = 0;
+}, "level": 20, "onscreen": 1]

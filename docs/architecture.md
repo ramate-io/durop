@@ -100,3 +100,29 @@ uses `target/release/durop`.
 Application resources resolve from the source root in development and from the
 bundle's `Contents/Resources` after packaging. Library fixtures resolve relative
 to their crate's location; runtime library APIs receive explicit resource paths.
+
+## macOS overlay surface
+
+The normal controller remains a winit window in the single Durop process.
+`overlay_macos.rs` creates a separate nonactivating `NSPanel` and plain `NSView`
+on the main thread. Before Bevy's first surface extraction, it redirects only
+the overlay's `RawHandleWrapper` (and holder) to that view. The original winit
+window stays hidden and supplies render dimensions/event-loop ownership. No
+initialized object's class changes; no winit class methods are swizzled and no
+winit view is reparented.
+
+A retaining association on the original native window owns the panel for as long
+as Bevy's retained winit handle can back an in-flight GPU surface. A non-send
+resource owns main-thread presentation state; its teardown orders the panel out
+without closing a view that may still be used by the renderer. This bridge depends
+on Bevy 0.20.1/winit 0.30.13 surface creation and raw-handle ownership. Review it
+on upgrades: redirection must precede the first extraction, not replace a live
+surface afterward. The application supports one overlay entity/surface.
+
+The native display ID selects `NSScreen.frame`, including the Dock/menu region.
+The panel refuses key/main status, ignores mouse events, and orders in without
+activating the app at the public status-window level (above the Dock). All-Spaces
+and fullscreen-auxiliary behavior applies to this genuine panel. Empty playback
+still clears transparently; invalid/missing geometry hides the panel and disables
+the camera. Actual qualifications and input-testing limits are in
+[overlay proof](overlay-proof.md).

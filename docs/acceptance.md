@@ -9,6 +9,11 @@ game input. See [packaging](packaging.md), [the panel](panel.md),
 
 ## Available local evidence
 
+The [November 11 native-panel proof](overlay-proof.md#native-panel-validation-2026-11-11)
+records actual desktop/Dock and native-fullscreen rendering, stop/replay and
+independent frontmost-application observations. Its locally retained screenshots do not establish
+physical controller passthrough, game compatibility, or mixed-display behavior.
+
 At source `78e643506f4478bdc32fdab463fe5cd9e07869cd`, the explicit policy/loopback probe
 ran on Mac16,11, 48 GiB RAM, arm64, macOS 27.0.1. It used a debug test executable,
 an empty host receiving StopAll, 30 samples per origin, and a 1 ms simulated main-loop

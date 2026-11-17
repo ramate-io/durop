@@ -1,252 +1,252 @@
-//! AppKit focus policy without changing an initialized NSWindow's class.
+//! A fresh nonactivating NSPanel owns the overlay surface; winit keeps its hidden event window.
 //!
-//! Winit's class-wide method adapters dispatch only marked overlay instances;
-//! ordinary panel windows retain the original implementations and window ISA.
-use super::{NativeReady, OverlayWindow};
-use bevy::{ecs::system::NonSendMarker, prelude::*, window::RawHandleWrapper};
+//! Never reclass or reparent winit's initialized NSWindow/NSView. Its callbacks assume
+//! their original concrete classes. Only the renderer's raw view handle is redirected.
+use super::{NativeReady, OverlayCamera, OverlayState, OverlayWindow};
+use bevy::{
+    prelude::*,
+    window::{RawHandleWrapper, RawHandleWrapperHolder},
+    winit::WinitMonitors,
+};
 use objc2::{
     msg_send,
-    runtime::{AnyClass, AnyObject, Bool, Imp, Method, Sel},
+    rc::{Allocated, Retained},
+    runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel},
     sel,
 };
-use raw_window_handle::RawWindowHandle;
-use std::{ffi::c_char, sync::OnceLock};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use raw_window_handle::{AppKitWindowHandle, RawWindowHandle};
+use std::{ptr::NonNull, sync::OnceLock};
+use winit::platform::macos::MonitorHandleExtMacOS;
 
 #[link(name = "objc")]
 unsafe extern "C" {
-    /// Declare the Objective-C runtime entry for a class-local selector override.
-    fn class_replaceMethod(
-        class: &AnyClass,
-        selector: Sel,
-        implementation: Imp,
-        types: *const c_char,
-    ) -> Option<Imp>;
-
-    /// Read the original method ABI encoding before installing an adapter.
-    fn method_getTypeEncoding(method: &Method) -> *const c_char;
-
-    /// Associate a non-retaining marker with a live Objective-C window.
+    /// Attach panel ownership to the original window retained by Bevy's render handle.
     fn objc_setAssociatedObject(
         object: &AnyObject,
         key: *const u8,
         value: &AnyObject,
         policy: usize,
     );
-
-    /// Read the adapter-owned marker from a live Objective-C window.
-    fn objc_getAssociatedObject(object: &AnyObject, key: *const u8) -> *mut AnyObject;
 }
 
-/// Unique stable address identifying windows owned by this overlay adapter.
-static OVERLAY_KEY: u8 = 0;
-
-/// Preserve native selector implementations for ordinary, unmarked windows.
-struct Originals {
-    /// Original canBecomeKeyWindow implementation.
-    key: Imp,
-    /// Original canBecomeMainWindow implementation.
-    main: Imp,
-    /// Original makeKeyAndOrderFront implementation.
-    show: Imp,
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    /// Resolve public system levels rather than relying on their current numeric values.
+    fn CGWindowLevelForKey(key: i32) -> i32;
 }
 
-/// Publish original implementations before installing replacement callbacks.
-static ORIGINALS: OnceLock<Originals> = OnceLock::new();
+/// Retaining association keeps the panel/view alive through pipelined GPU surface teardown.
+static PANEL_KEY: u8 = 0;
 
-/// Ensure class-wide selector adapters are installed once on the main thread.
-static INSTALLED: OnceLock<()> = OnceLock::new();
+/// Register the subclass before allocation; initialized AppKit objects never change class.
+static PANEL_CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
 
-/// Recognize only windows explicitly marked by this adapter.
-fn is_overlay(window: &AnyObject) -> bool {
-    // SAFETY: The stable key belongs exclusively to this adapter. An assign
-    // association stores the live window itself, without retaining it in a cycle.
-    unsafe { std::ptr::eq(objc_getAssociatedObject(window, &OVERLAY_KEY), window) }
+/// AppKit must never give overlay content keyboard or application-main status.
+extern "C-unwind" fn refuses_focus(_: &AnyObject, _: Sel) -> Bool {
+    Bool::NO
 }
 
-/// Mark a live overlay without changing its class or creating a retain cycle.
-unsafe fn mark_overlay(window: &AnyObject) {
-    // SAFETY: Both object and value are this live window; policy 0 is ASSIGN.
-    unsafe { objc_setAssociatedObject(window, &OVERLAY_KEY, window, 0) };
+/// Full display coverage deliberately includes the Dock/menu area, unlike the visible work area.
+extern "C-unwind" fn unconstrained_frame(
+    _: &AnyObject,
+    _: Sel,
+    frame: NSRect,
+    _: *mut AnyObject,
+) -> NSRect {
+    frame
 }
 
-/// Deny key-window status only for marked overlays.
-extern "C-unwind" fn can_become_key(window: &AnyObject, selector: Sel) -> Bool {
-    focus_policy(window, selector, ORIGINALS.get().unwrap().key)
+/// Main-thread ownership and presentation state for the single selected display.
+#[derive(Default)]
+pub(super) struct NativeOverlay {
+    /// An additional retain for main-thread operations; the raw handle owner also retains this panel.
+    panel: Option<Retained<AnyObject>>,
+    /// Last applied full-screen frame avoids redundant AppKit resizing each render tick.
+    frame: Option<NSRect>,
+    /// Whether the native panel is currently ordered in.
+    visible: bool,
 }
 
-/// Deny main-window status only for marked overlays.
-extern "C-unwind" fn can_become_main(window: &AnyObject, selector: Sel) -> Bool {
-    focus_policy(window, selector, ORIGINALS.get().unwrap().main)
-}
-
-/// Apply the overlay focus exception or forward to the original selector.
-fn focus_policy(window: &AnyObject, selector: Sel, original: Imp) -> Bool {
-    if is_overlay(window) {
-        Bool::NO
-    } else {
-        // SAFETY: Saved from the same BOOL-returning NSWindow selector; preserve
-        // the receiver and selector, including ordinary panel behavior.
-        let original: unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool =
-            unsafe { std::mem::transmute(original) };
-        unsafe { original(window, selector) }
-    }
-}
-
-/// Order overlays without focus while preserving normal panel window behavior.
-extern "C-unwind" fn show(window: &AnyObject, selector: Sel, sender: *mut AnyObject) {
-    if is_overlay(window) {
-        // SAFETY: orderFront: preserves NSWindow ordering without taking focus.
-        unsafe {
-            let _: () = msg_send![window, orderFront: sender];
-        }
-    } else {
-        // SAFETY: The saved implementation has the same selector ABI.
-        let original: unsafe extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject) =
-            unsafe { std::mem::transmute(ORIGINALS.get().unwrap().show) };
-        unsafe { original(window, selector, sender) }
-    }
-}
-
-/// Install ABI-compatible adapters on WinitWindow while preserving inherited NSWindow behavior.
-unsafe fn install(class: &AnyClass) {
-    INSTALLED.get_or_init(|| {
-        let key = class.instance_method(sel!(canBecomeKeyWindow)).unwrap();
-        let main = class.instance_method(sel!(canBecomeMainWindow)).unwrap();
-        let order = class.instance_method(sel!(makeKeyAndOrderFront:)).unwrap();
-        ORIGINALS.set(Originals {
-            key: key.implementation(),
-            main: main.implementation(),
-            show: order.implementation(),
-        }).unwrap_or_else(|_| panic!("window adapters already initialized"));
-        // SAFETY: Each replacement has its selector's original ABI. Add an
-        // override on WinitWindow itself even when the original is inherited:
-        // changing NSWindow's inherited method would affect unrelated windows.
-        // Publish originals before installing any callback, on the main thread.
-        unsafe {
-            for (selector, implementation, method) in [
-                (sel!(canBecomeKeyWindow), std::mem::transmute::<extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(can_become_key), key),
-                (sel!(canBecomeMainWindow), std::mem::transmute::<extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(can_become_main), main),
-                (sel!(makeKeyAndOrderFront:), std::mem::transmute::<extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject), Imp>(show), order),
-            ] {
-                class_replaceMethod(class, selector, implementation, method_getTypeEncoding(method));
+impl NativeOverlay {
+    /// Construct a genuine nonactivating panel and plain render view on the AppKit thread.
+    unsafe fn create(owner: &AnyObject) -> Result<(Self, NonNull<std::ffi::c_void>), &'static str> {
+        let parent = AnyClass::get(c"NSPanel").ok_or("NSPanel unavailable")?;
+        let class = PANEL_CLASS.get_or_init(|| {
+            let mut builder =
+                ClassBuilder::new(c"DuropOverlayPanel", parent).expect("unique overlay class");
+            // SAFETY: The methods exactly match their inherited NSWindow selector ABIs.
+            unsafe {
+                builder.add_method(
+                    sel!(canBecomeKeyWindow),
+                    refuses_focus as extern "C-unwind" fn(_, _) -> _,
+                );
+                builder.add_method(
+                    sel!(canBecomeMainWindow),
+                    refuses_focus as extern "C-unwind" fn(_, _) -> _,
+                );
+                builder.add_method(
+                    sel!(constrainFrameRect:toScreen:),
+                    unconstrained_frame as extern "C-unwind" fn(_, _, _, _) -> _,
+                );
             }
+            builder.register()
+        });
+        let rect = NSRect::new(NSPoint::new(0., 0.), NSSize::new(1., 1.));
+        // SAFETY: Allocate the final class with NonactivatingPanel (1<<7) from the outset.
+        // The borderless panel owns a plain NSView, never winit's NSView subclass.
+        unsafe {
+            let allocated: Allocated<AnyObject> = msg_send![*class, alloc];
+            let panel: Retained<AnyObject> = msg_send![allocated, initWithContentRect: rect, styleMask: 1_usize << 7, backing: 2_usize, defer: Bool::NO];
+            let view_class = AnyClass::get(c"NSView").ok_or("NSView unavailable")?;
+            let allocated: Allocated<AnyObject> = msg_send![view_class, alloc];
+            let view: Retained<AnyObject> = msg_send![allocated, initWithFrame: rect];
+            let _: () = msg_send![&*view, setWantsLayer: Bool::YES];
+            let _: () = msg_send![&*panel, setContentView: &*view];
+            let _: () = msg_send![&*panel, setReleasedWhenClosed: Bool::NO];
+            let _: () = msg_send![&*panel, setOpaque: Bool::NO];
+            let color_class = AnyClass::get(c"NSColor").ok_or("NSColor unavailable")?;
+            let clear: *mut AnyObject = msg_send![color_class, clearColor];
+            let _: () = msg_send![&*panel, setBackgroundColor: clear];
+            let _: () = msg_send![&*panel, setIgnoresMouseEvents: Bool::YES];
+            let _: () = msg_send![&*panel, setHasShadow: Bool::NO];
+            let _: () = msg_send![&*panel, setHidesOnDeactivate: Bool::NO];
+            let _: () = msg_send![&*panel, setFloatingPanel: Bool::YES];
+            let _: () = msg_send![&*panel, setBecomesKeyOnlyIfNeeded: Bool::YES];
+            let _: () = msg_send![&*panel, setAnimationBehavior: 2_isize]; // NSWindowAnimationBehaviorNone
+            // CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary.
+            let _: () = msg_send![&*panel, setCollectionBehavior: (1_usize | 16 | 64 | 256)];
+            let level = CGWindowLevelForKey(9); // kCGStatusWindowLevelKey, above the Dock.
+            let _: () = msg_send![&*panel, setLevel: level as isize];
+            let title = NSString::from_str("Durop native overlay");
+            let _: () = msg_send![&*panel, setTitle: &*title];
+            // RETAIN_NONATOMIC: winit releases its native owner on the main thread;
+            // RawHandleWrapper retains winit through all extracted render references.
+            objc_setAssociatedObject(owner, &PANEL_KEY, &panel, 1);
+            let pointer = NonNull::from(&*view).cast();
+            eprintln!("Native overlay: nonactivating NSPanel, window level {level}");
+            Ok((
+                Self {
+                    panel: Some(panel),
+                    ..default()
+                },
+                pointer,
+            ))
         }
-    });
+    }
+
+    /// Hide without closing/releasing a view that an in-flight surface may still reference.
+    fn hide(&mut self) {
+        if self.visible {
+            if let Some(panel) = &self.panel {
+                // SAFETY: NativeOverlay is a NonSend resource, accessed/dropped on the main thread.
+                unsafe {
+                    let _: () = msg_send![&**panel, orderOut: std::ptr::null_mut::<AnyObject>()];
+                }
+            }
+            self.visible = false;
+        }
+    }
 }
 
-/// Apply click-through, nonactivating AppKit policy to newly created overlay windows.
+impl Drop for NativeOverlay {
+    fn drop(&mut self) {
+        self.hide();
+    }
+}
+
+/// Redirect the render handle before the first surface extraction; keep winit's owner hidden.
 #[expect(
     clippy::type_complexity,
-    reason = "Bevy query filters keep the native window boundary explicit"
+    reason = "Native boundary selects only unconfigured overlay handles"
 )]
 pub(super) fn configure(
     mut commands: Commands,
-    windows: Query<(Entity, &RawHandleWrapper), (With<OverlayWindow>, Without<NativeReady>)>,
-    _main_thread: NonSendMarker,
+    mut windows: Query<
+        (
+            Entity,
+            &mut RawHandleWrapper,
+            Option<&RawHandleWrapperHolder>,
+        ),
+        (With<OverlayWindow>, Without<NativeReady>),
+    >,
+    mut native: NonSendMut<NativeOverlay>,
 ) {
-    for (entity, handle) in &windows {
-        let RawWindowHandle::AppKit(handle) = handle.get_window_handle() else {
+    for (entity, mut handle, holder) in &mut windows {
+        let RawWindowHandle::AppKit(original) = handle.get_window_handle() else {
             continue;
         };
-        // SAFETY: Bevy owns the live view, and NonSendMarker keeps this on the
-        // AppKit thread. Preserve the existing ISA and AppKit computed-property
-        // metadata; replacing an initialized window's class crashes on macOS 27.
+        // SAFETY: This runs on the AppKit thread. The original raw handle retains its
+        // winit owner, which retains the new panel via association for the surface lifetime.
         unsafe {
-            let view = handle.ns_view.as_ptr().cast::<AnyObject>();
-            let window: *mut AnyObject = msg_send![view, window];
-            let Some(window) = window.as_ref() else {
+            let view = original.ns_view.as_ptr().cast::<AnyObject>();
+            let owner: *mut AnyObject = msg_send![view, window];
+            let Some(owner) = owner.as_ref() else {
                 continue;
             };
-            let class = AnyClass::get(c"WinitWindow").expect("winit 0.30 window class");
-            let compatible: Bool = msg_send![window, isKindOfClass: class];
-            assert!(
-                compatible.as_bool(),
-                "review native adapter after winit class changes"
-            );
-            install(class);
-            mark_overlay(window);
-            let _: () = msg_send![window, setIgnoresMouseEvents: Bool::YES];
-            let _: () = msg_send![window, setHasShadow: Bool::NO];
-            let _: () = msg_send![window, setHidesOnDeactivate: Bool::NO];
-            // CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary.
-            let _: () = msg_send![window, setCollectionBehavior: (1_usize | 16 | 64 | 256)];
+            match NativeOverlay::create(owner) {
+                Ok((panel, view)) => {
+                    handle
+                        .set_window_handle(RawWindowHandle::AppKit(AppKitWindowHandle::new(view)));
+                    if let Some(holder) = holder {
+                        *holder.0.lock().unwrap() = Some(handle.clone());
+                    }
+                    *native = panel;
+                    commands.entity(entity).insert(NativeReady);
+                }
+                Err(message) => eprintln!("Native overlay unavailable: {message}"),
+            }
         }
-        commands.entity(entity).insert(NativeReady);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use objc2::{rc::Retained, runtime::ClassBuilder};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static ORIGINAL_SHOWS: AtomicUsize = AtomicUsize::new(0);
-    static NONACTIVATING_SHOWS: AtomicUsize = AtomicUsize::new(0);
-
-    extern "C-unwind" fn original_focus(_: &AnyObject, _: Sel) -> Bool {
-        Bool::YES
-    }
-    extern "C-unwind" fn original_show(_: &AnyObject, _: Sel, _: *mut AnyObject) {
-        ORIGINAL_SHOWS.fetch_add(1, Ordering::Relaxed);
-    }
-    extern "C-unwind" fn order_front(_: &AnyObject, _: Sel, _: *mut AnyObject) {
-        NONACTIVATING_SHOWS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn marked_overlay_preserves_isa_and_ordinary_window_dispatch() {
-        // NSObject probes exercise Objective-C method lookup and association
-        // dispatch without requiring an AppKit event loop on the test thread.
-        // Put originals on the parent to catch accidentally replacing inherited
-        // NSWindow methods instead of adding overrides on WinitWindow itself.
+/// Follow the selected NSScreen's full bounds without moving focus or activating the application.
+pub(super) fn synchronize(
+    state: Res<OverlayState>,
+    monitors: Res<WinitMonitors>,
+    camera: Single<&Camera, With<OverlayCamera>>,
+    mut native: NonSendMut<NativeOverlay>,
+) {
+    let display = state
+        .target
+        .and_then(|entity| monitors.find_entity(entity))
+        .map(|monitor| monitor.native_id());
+    let frame = display.and_then(|display| {
+        // SAFETY: NSScreen/NSArray/NSDictionary access is on the AppKit thread;
+        // deviceDescription's NSScreenNumber is the public CGDirectDisplayID bridge.
         unsafe {
-            let mut parent = ClassBuilder::new(
-                c"DuropFocusPolicyProbeParent",
-                AnyClass::get(c"NSObject").unwrap(),
-            )
-            .unwrap();
-            parent.add_method(
-                sel!(canBecomeKeyWindow),
-                original_focus as extern "C-unwind" fn(_, _) -> _,
-            );
-            parent.add_method(
-                sel!(canBecomeMainWindow),
-                original_focus as extern "C-unwind" fn(_, _) -> _,
-            );
-            parent.add_method(
-                sel!(makeKeyAndOrderFront:),
-                original_show as extern "C-unwind" fn(_, _, _),
-            );
-            parent.add_method(
-                sel!(orderFront:),
-                order_front as extern "C-unwind" fn(_, _, _),
-            );
-            let parent = parent.register();
-            let class = ClassBuilder::new(c"DuropFocusPolicyProbe", parent)
-                .unwrap()
-                .register();
-            let ordinary: Retained<AnyObject> = msg_send![class, new];
-            let overlay: Retained<AnyObject> = msg_send![class, new];
-            let unrelated: Retained<AnyObject> = msg_send![parent, new];
-            install(class);
-            mark_overlay(&overlay);
-            assert!(std::ptr::eq(overlay.class(), class));
-            assert!(std::ptr::eq(ordinary.class(), class));
-            for object in [&*ordinary, &*unrelated] {
-                let key: Bool = msg_send![object, canBecomeKeyWindow];
-                let main: Bool = msg_send![object, canBecomeMainWindow];
-                assert!(key.as_bool() && main.as_bool());
-                let _: () =
-                    msg_send![object, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+            let screens: *mut AnyObject = msg_send![AnyClass::get(c"NSScreen")?, screens];
+            let count: usize = msg_send![screens, count];
+            let key = NSString::from_str("NSScreenNumber");
+            for index in 0..count {
+                let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
+                let description: *mut AnyObject = msg_send![screen, deviceDescription];
+                let number: *mut AnyObject = msg_send![description, objectForKey: &*key];
+                let id: u32 = msg_send![number, unsignedIntValue];
+                if id == display {
+                    return Some(msg_send![screen, frame]);
+                }
             }
-            let key: Bool = msg_send![&*overlay, canBecomeKeyWindow];
-            let main: Bool = msg_send![&*overlay, canBecomeMainWindow];
-            assert!(!key.as_bool() && !main.as_bool());
-            let _: () =
-                msg_send![&*overlay, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
-            assert_eq!(ORIGINAL_SHOWS.load(Ordering::Relaxed), 2);
-            assert_eq!(NONACTIVATING_SHOWS.load(Ordering::Relaxed), 1);
+            None
+        }
+    });
+    if !camera.is_active || frame.is_none() {
+        native.hide();
+        return;
+    }
+    let Some(panel) = native.panel.as_ref() else {
+        return;
+    };
+    let frame = frame.unwrap();
+    // SAFETY: Never use makeKey*, activate*, or application-wide presentation options.
+    unsafe {
+        if native.frame != Some(frame) {
+            let _: () = msg_send![&**panel, setFrame: frame, display: Bool::YES];
+        }
+        if !native.visible {
+            let _: () = msg_send![&**panel, orderFrontRegardless];
         }
     }
+    native.frame = Some(frame);
+    native.visible = true;
 }
